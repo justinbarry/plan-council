@@ -1,0 +1,79 @@
+{
+	"name": "plan-council",
+	"author": "Justin Barry",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/justinbarry/plan-council.git"
+	},
+	"homepage": "https://github.com/justinbarry/plan-council#readme",
+	"bugs": {
+		"url": "https://github.com/justinbarry/plan-council/issues"
+	},
+	"version": "0.1.0",
+	"description": "Multi-model plan review, critique, cross-model debate, and consensus synthesis plugin for OMP",
+	"type": "module",
+	"files": ["src", "types", "README.md"],
+	"scripts": {
+		"test": "bun test",
+		"check:types": "bun run --bun tsc --noEmit"
+	},
+	"peerDependencies": {
+		"@oh-my-pi/pi-coding-agent": ">=18.0.0",
+		"@oh-my-pi/pi-ai": ">=18.0.0",
+		"@oh-my-pi/pi-tui": ">=18.0.0",
+		"@oh-my-pi/pi-utils": ">=18.0.0"
+	},
+	"devDependencies": {
+		"@types/bun": "latest",
+		"typescript": "^5.0.0"
+	},
+	"omp": {
+		"extensions": ["./src/index.ts"],
+		"settings": {
+			"autoStart": {
+				"type": "boolean",
+				"default": false,
+				"description": "Automatically open Plan Council when a plan review opens"
+			},
+			"autoProceed": {
+				"type": "boolean",
+				"default": false,
+				"description": "Automatically run critiques, debate disagreements, synthesize, and refine without manual steps"
+			},
+			"autoDebate": {
+				"type": "boolean",
+				"default": true,
+				"description": "Automatically trigger Round 2 debate when peer critiques disagree or request revisions"
+			},
+			"reviewerModels": {
+				"type": "string",
+				"default": "",
+				"description": "Comma-separated model selectors or role names for council reviewers (empty auto-selects diverse models)"
+			},
+			"maxReviewers": {
+				"type": "number",
+				"default": 3,
+				"min": 1,
+				"max": 6,
+				"step": 1,
+				"description": "Maximum auto-selected reviewer models when reviewerModels is empty"
+			},
+			"synthesizerModel": {
+				"type": "string",
+				"default": "",
+				"description": "Model selector or role name used to synthesize discussion into Refine feedback (empty uses slow role, then session model)"
+			},
+			"shortcut": {
+				"type": "string",
+				"default": "ctrl+n",
+				"description": "Keybinding to open Plan Council while Plan Review is open"
+			},
+			"includeSessionContext": {
+				"type": "boolean",
+				"default": true,
+				"description": "Include user prompts from the active session branch alongside the plan markdown"
+			}
+		}
+	}
+}
