@@ -19,10 +19,10 @@
 		"check:types": "bun run --bun tsc --noEmit"
 	},
 	"peerDependencies": {
-		"@oh-my-pi/pi-coding-agent": ">=18.0.0",
-		"@oh-my-pi/pi-ai": ">=18.0.0",
-		"@oh-my-pi/pi-tui": ">=18.0.0",
-		"@oh-my-pi/pi-utils": ">=18.0.0"
+		"@oh-my-pi/pi-coding-agent": ">=18.10.4",
+		"@oh-my-pi/pi-ai": ">=18.10.4",
+		"@oh-my-pi/pi-tui": ">=18.10.4",
+		"@oh-my-pi/pi-utils": ">=18.10.4"
 	},
 	"devDependencies": {
 		"@types/bun": "latest",
