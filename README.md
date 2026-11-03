@@ -119,6 +119,26 @@ omp plugin config plan-council maxReviewers 2
 omp plugin config plan-council shortcut "ctrl+p"
 ```
 
+### Per-Reviewer Reasoning
+
+Append a thinking suffix to each `reviewerModels` selector to choose reasoning
+independently for each reviewer. For example, set `reviewerModels` to:
+
+```text
+openai-codex/gpt-6.1-sol:xhigh, anthropic/claude-opus-5-5:high
+```
+
+An explicit suffix also works with a role selector, such as `council1:xhigh` or
+`@advisor:high`. Put the suffix in `reviewerModels`; OMP's model-query API does
+not expose the thinking level stored inside a role definition.
+
+The chosen setting applies to initial critiques, debate rounds, and operator
+questions, including targeted replies and reviewers toggled in the Models tab.
+The selected effort follows OMP's normal adjustment to the model's supported
+reasoning levels. Use `:off` to request that reasoning be disabled. Selectors
+without a suffix keep the existing request defaults. Synthesis keeps its
+existing behavior.
+
 ### Custom Model Roles
 
 You can define custom council roles in `~/.omp/agent/config.yml`:
