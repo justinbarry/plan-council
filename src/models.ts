@@ -1,5 +1,7 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionModelQuery } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { MAX_THINKING_SUFFIX_OPTIONS, splitThinkingSuffix } from "@oh-my-pi/pi-tui/overlays/model-selector";
+import { concreteThinkingLevel, resolveThinkingLevelForModel, type ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { PlanCouncilSettings } from "./settings";
 
 export interface ReviewerMember {
@@ -7,6 +9,7 @@ export interface ReviewerMember {
 	label: string; // `${model.id} (${model.provider})`
 	family: string;
 	model: Model;
+	thinkingLevel?: ConfiguredThinkingLevel;
 }
 
 export interface ResolvedCouncilRoster {
@@ -36,9 +39,11 @@ export const COUNCIL_ROLE_CHAINS = {
 	synthesizer: ["@council_synthesizer", "@council-synth", "@plan", "@slow", "@default"],
 };
 
+/** resolve a council role through its existing model fallback chain */
 export function resolveRoleWithBackup(models: ExtensionModelQuery, roleName: string): Model | undefined {
 	const normalized = roleName.startsWith("@") ? roleName.slice(1) : roleName;
-	const chain = (COUNCIL_ROLE_CHAINS as Record<string, string[]>)[normalized];
+	const roleChains: Readonly<Record<string, readonly string[] | undefined>> = COUNCIL_ROLE_CHAINS;
+	const chain = roleChains[normalized];
 	if (chain) {
 		for (const candidate of chain) {
 			const resolved = resolveModelSpec(models, candidate);
@@ -53,6 +58,7 @@ const CANDIDATE_ROLES = [
 	...COUNCIL_ROLE_CHAINS.council2,
 	...COUNCIL_ROLE_CHAINS.council3,
 ];
+/** select reviewers while retaining explicit per reviewer thinking settings */
 export function resolveCouncilRoster(models: ExtensionModelQuery, settings: PlanCouncilSettings): ResolvedCouncilRoster {
 	const warnings: string[] = [];
 	const availableList = models.list();
@@ -82,7 +88,10 @@ export function resolveCouncilRoster(models: ExtensionModelQuery, settings: Plan
 	if (settings.reviewerModels.length > 0) {
 		const resolvedMap = new Map<string, ReviewerMember>();
 		for (const spec of settings.reviewerModels) {
-			const resolved = resolveRoleWithBackup(models, spec);
+			const trimmed = spec.trim();
+			const { base, level } = splitThinkingSuffix(trimmed, -1, MAX_THINKING_SUFFIX_OPTIONS);
+			// try the full selector first so literal model ids keep their existing meaning
+			const resolved = resolveRoleWithBackup(models, trimmed) ?? (level ? resolveRoleWithBackup(models, base) : undefined);
 			if (!resolved) {
 				warnings.push(`Unknown or unauthenticated reviewer model: "${spec}"`);
 				continue;
@@ -90,15 +99,17 @@ export function resolveCouncilRoster(models: ExtensionModelQuery, settings: Plan
 			const key = modelKey(resolved);
 			if (!resolvedMap.has(key)) {
 				const existing = availableMap.get(key);
-				resolvedMap.set(
+				const reviewer: ReviewerMember = existing ?? {
 					key,
-					existing ?? {
-						key,
-						label: `${resolved.id} (${resolved.provider})`,
-						family: models.family(resolved),
-						model: resolved,
-					},
-				);
+					label: `${resolved.id} (${resolved.provider})`,
+					family: models.family(resolved),
+					model: resolved,
+				};
+				if (trimmed !== resolved.id && trimmed !== key) {
+					reviewer.thinkingLevel = resolveThinkingLevelForModel(resolved, concreteThinkingLevel(level));
+				}
+				// keep the same reviewer object for model toggles and targeted replies
+				resolvedMap.set(key, reviewer);
 			}
 		}
 

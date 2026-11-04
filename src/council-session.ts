@@ -1,7 +1,8 @@
-import type { ApiKey, AssistantMessage, AssistantMessageEvent, Context, Message, Model } from "@oh-my-pi/pi-ai";
+import type { ApiKey, AssistantMessage, AssistantMessageEvent, Context, Message, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { streamSimple } from "@oh-my-pi/pi-ai";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent";
 import { replaceTabs } from "@oh-my-pi/pi-tui";
+import { concreteThinkingLevel, shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ReviewerMember } from "./models";
 import {
 	renderCritiqueRound,
@@ -65,7 +66,7 @@ function createUserMessage(content: string): Message {
 export type ModelStreamFn = (
 	model: Model,
 	context: Context,
-	options: { signal: AbortSignal; apiKey?: ApiKey },
+	options: Pick<SimpleStreamOptions, "apiKey" | "reasoning" | "disableReasoning"> & { signal: AbortSignal },
 ) => AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> };
 
 export interface CouncilSessionOptions {
@@ -135,6 +136,7 @@ export class CouncilSession {
 	#getApiKey?: (model: Model) => ApiKey | Promise<ApiKey | undefined> | undefined;
 	#sessionId?: string;
 
+	/** preserve reviewer request options when forwarding to the native model stream */
 	constructor(options: CouncilSessionOptions) {
 		this.#planTitle = options.planTitle;
 		this.#planFilePath = options.planFilePath;
@@ -149,8 +151,7 @@ export class CouncilSession {
 			options.streamFn ??
 			((model, context, opts) =>
 				streamSimple(model, context, {
-					signal: opts.signal,
-					apiKey: opts.apiKey,
+					...opts,
 					sessionId: this.#sessionId,
 				}));
 	}
@@ -217,6 +218,7 @@ export class CouncilSession {
 		this.#emitChange();
 	}
 
+	/** request initial critiques using each selected reviewer and its thinking level */
 	async startInitialCritiques(): Promise<void> {
 		if (this.#busy) {
 			throw new Error("Council is busy.");
@@ -272,7 +274,13 @@ export class CouncilSession {
 					messages: [createUserMessage(userPrompt)],
 				};
 
-				const stream = this.#streamFn(reviewer.model, context, { signal: combinedSignal, apiKey });
+				const level = concreteThinkingLevel(reviewer.thinkingLevel);
+				const stream = this.#streamFn(reviewer.model, context, {
+					signal: combinedSignal,
+					apiKey,
+					reasoning: toReasoningEffort(level),
+					disableReasoning: shouldDisableReasoning(level),
+				});
 				for await (const event of stream) {
 					if (event.type === "text_delta") {
 						entry.text += event.delta;
@@ -324,6 +332,7 @@ export class CouncilSession {
 		}
 	}
 
+	/** debate peer critiques with the same thinking levels used for initial review */
 	async runDebateRound(): Promise<void> {
 		if (this.#busy) {
 			throw new Error("Council is busy.");
@@ -430,7 +439,13 @@ export class CouncilSession {
 					messages: [...history, createUserMessage(promptText)],
 				};
 
-				const stream = this.#streamFn(reviewer.model, context, { signal: combinedSignal, apiKey });
+				const level = concreteThinkingLevel(reviewer.thinkingLevel);
+				const stream = this.#streamFn(reviewer.model, context, {
+					signal: combinedSignal,
+					apiKey,
+					reasoning: toReasoningEffort(level),
+					disableReasoning: shouldDisableReasoning(level),
+				});
 				for await (const event of stream) {
 					if (event.type === "text_delta") {
 						entry.text += event.delta;
@@ -477,6 +492,7 @@ export class CouncilSession {
 		}
 	}
 
+	/** send operator questions without losing the targeted reviewers thinking settings */
 	async askCouncil(rawInput: string, defaultTargetKey?: string): Promise<void> {
 		if (this.#busy) {
 			throw new Error("Council is busy.");
@@ -592,7 +608,13 @@ export class CouncilSession {
 					messages: [...history, createUserMessage(promptText)],
 				};
 
-				const stream = this.#streamFn(reviewer.model, context, { signal: combinedSignal, apiKey });
+				const level = concreteThinkingLevel(reviewer.thinkingLevel);
+				const stream = this.#streamFn(reviewer.model, context, {
+					signal: combinedSignal,
+					apiKey,
+					reasoning: toReasoningEffort(level),
+					disableReasoning: shouldDisableReasoning(level),
+				});
 				for await (const event of stream) {
 					if (event.type === "text_delta") {
 						entry.text += event.delta;
