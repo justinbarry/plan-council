@@ -20,6 +20,8 @@ import { theme } from "@oh-my-pi/pi-tui/theme";
 import { getAgentDir, getPluginsDir, removeSyncWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { CouncilSession, type ModelStreamFn } from "../src/council-session";
 import planCouncilExtension from "../src/index";
+import * as reviewerAgents from "../src/reviewer-agent";
+import * as councilSettings from "../src/settings";
 import type { ReviewerMember } from "../src/models";
 import { type CouncilOverlayOutcome, PlanCouncilOverlay } from "../src/overlay";
 
@@ -393,7 +395,13 @@ describe("PlanCouncilOverlay UI component", () => {
 describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 	const claude = makeFakeModel("anthropic", "claude-3-7-sonnet");
 
-	it("registers command, event listeners, and intercepts shortcut to resolve plan review", async () => {
+	// inspect mode must reach the native factory while explicit off keeps the old path
+	it.each([true, false])("registers lifecycle and shortcut wiring with code inspection %s", async codeInspection => {
+		using settingsSpy = spyOn(councilSettings, "loadPlanCouncilSettings").mockResolvedValue(councilSettings.parsePlanCouncilSettings({ codeInspection }));
+		using factorySpy = spyOn(reviewerAgents, "createNativeReviewerAgentFactory").mockReturnValue(async () => ({
+			async runTurn() { return { status: "done", text: "Inspected source", inspection: { attempted: 1, failed: 0 } }; },
+			async dispose() {},
+		}));
 		const handlers = new Map<string, ExtensionHandler<unknown, unknown>>();
 		const commands = new Map<string, unknown>();
 		let terminalInputListener: ((data: string) => { consume?: boolean } | undefined) | undefined;
@@ -500,6 +508,8 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 			await delay(5);
 		}
 		expect(customOverlayMounted).toBe(true);
+		expect(factorySpy).toHaveBeenCalledTimes(codeInspection ? 1 : 0);
+		if (codeInspection) expect(factorySpy.mock.calls[0]?.[0].cwd).toBe(process.cwd());
 		expect(resolvedReviewId).toBe("rev-123");
 		expect(resolvedChoice).toBe("refine");
 		expect(resolvedFeedback).toContain("Synthesized feedback from mock");

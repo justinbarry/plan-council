@@ -2,8 +2,10 @@ import type { ApiKey, AssistantMessage, AssistantMessageEvent, Context, Message,
 import { streamSimple } from "@oh-my-pi/pi-ai";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent";
 import { replaceTabs } from "@oh-my-pi/pi-tui";
+import { logger } from "@oh-my-pi/pi-utils";
 import { concreteThinkingLevel, shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ReviewerMember } from "./models";
+import type { InspectionActivity, ReviewerAgent, ReviewerAgentFactory } from "./reviewer-agent";
 import {
 	renderCritiqueRound,
 	renderCritiqueSystem,
@@ -22,6 +24,7 @@ export type CouncilTurnEntry =
 			round: number;
 			reviewerKey: string;
 			reviewerLabel: string;
+			inspection?: InspectionActivity;
 			status: EntryStatus;
 			text: string;
 			errorMessage?: string;
@@ -79,6 +82,7 @@ export interface CouncilSessionOptions {
 	streamFn?: ModelStreamFn;
 	getApiKey?: (model: Model) => ApiKey | Promise<ApiKey | undefined> | undefined;
 	sessionId?: string;
+	reviewerAgentFactory?: ReviewerAgentFactory;
 }
 
 export function extractSessionGoalContext(entries: readonly SessionEntry[], maxChars = 2000): string | undefined {
@@ -135,6 +139,9 @@ export class CouncilSession {
 	#streamFn: ModelStreamFn;
 	#getApiKey?: (model: Model) => ApiKey | Promise<ApiKey | undefined> | undefined;
 	#sessionId?: string;
+	#reviewerAgentFactory?: ReviewerAgentFactory;
+	#agents = new Map<string, ReviewerAgent>();
+	#disposed = false;
 
 	/** preserve reviewer request options when forwarding to the native model stream */
 	constructor(options: CouncilSessionOptions) {
@@ -146,6 +153,7 @@ export class CouncilSession {
 		this.#activeReviewers = [...options.initialReviewers];
 		this.#getApiKey = options.getApiKey;
 		this.#sessionId = options.sessionId;
+		this.#reviewerAgentFactory = options.reviewerAgentFactory;
 
 		this.#streamFn =
 			options.streamFn ??
@@ -218,8 +226,62 @@ export class CouncilSession {
 		this.#emitChange();
 	}
 
-	/** request initial critiques using each selected reviewer and its thinking level */
+	/** retain each reviewers native evidence through critique debate and operator questions */
+	async #runInspectedTurn(reviewer: ReviewerMember, entry: ReviewerTurnEntry, prompt: string, signal: AbortSignal): Promise<void> {
+		const factory = this.#reviewerAgentFactory;
+		if (!factory) throw new Error("Code inspection runner is unavailable");
+		let agent = this.#agents.get(reviewer.key);
+		if (!agent) {
+			agent = await factory(reviewer);
+			if (this.#disposed) {
+				await agent.dispose();
+				return;
+			}
+			this.#agents.set(reviewer.key, agent);
+			// reviewers joining after round one still need the complete plan before their first turn
+			if (entry.kind !== "critique") {
+				const plan = renderCritiqueRound({
+					round: 1,
+					planTitle: this.#planTitle,
+					planFilePath: this.#planFilePath,
+					planContent: this.#planContent,
+					sessionContext: this.#sessionContext,
+				});
+				prompt = `${plan}\n\n---\n\n${prompt}`;
+			}
+		}
+
+		try {
+			// stream progress only into the still active entry and retain the final answer separately
+			const result = await agent.runTurn(prompt, signal, delta => {
+				if (!this.#disposed && entry.status === "streaming") {
+					entry.text += delta;
+					this.#emitChange();
+				}
+			});
+			entry.inspection = result.inspection;
+			if (entry.status === "streaming") {
+				entry.status = result.status;
+				// retain streamed diagnostic text when an interrupted turn has no final answer
+				if (result.status === "done" || result.text) entry.text = result.text;
+				if (result.status === "error") entry.errorMessage = result.errorMessage;
+			}
+			const reason: unknown = signal.reason;
+			if (signal.aborted && reason instanceof Error && reason.name === "TimeoutError") {
+				entry.errorMessage = "Code inspection exceeded the 120 second time limit";
+			}
+		} finally {
+			// retry a failed initial critique with a fresh native transcript
+			if (entry.kind === "critique" && entry.status !== "done") {
+				this.#agents.delete(reviewer.key);
+				await agent.dispose();
+			}
+		}
+	}
+
+	/** request initial critiques through the selected native or plain reviewer path */
 	async startInitialCritiques(): Promise<void> {
+		if (this.#disposed) throw new Error("Council has been disposed.");
 		if (this.#busy) {
 			throw new Error("Council is busy.");
 		}
@@ -268,6 +330,10 @@ export class CouncilSession {
 			const combinedSignal = AbortSignal.any([this.#roundAbortController!.signal, timeoutSignal]);
 
 			try {
+				if (this.#reviewerAgentFactory) {
+					await this.#runInspectedTurn(reviewer, entry, userPrompt, combinedSignal);
+					return;
+				}
 				const apiKey = this.#getApiKey ? await this.#getApiKey(reviewer.model) : undefined;
 				const context: Context = {
 					systemPrompt: [systemPrompt],
@@ -332,8 +398,9 @@ export class CouncilSession {
 		}
 	}
 
-	/** debate peer critiques with the same thinking levels used for initial review */
+	/** debate peer critiques while retaining each reviewers own source evidence */
 	async runDebateRound(): Promise<void> {
+		if (this.#disposed) throw new Error("Council has been disposed.");
 		if (this.#busy) {
 			throw new Error("Council is busy.");
 		}
@@ -433,6 +500,10 @@ export class CouncilSession {
 			const combinedSignal = AbortSignal.any([this.#roundAbortController!.signal, timeoutSignal]);
 
 			try {
+				if (this.#reviewerAgentFactory) {
+					await this.#runInspectedTurn(reviewer, entry, promptText, combinedSignal);
+					return;
+				}
 				const apiKey = this.#getApiKey ? await this.#getApiKey(reviewer.model) : undefined;
 				const context: Context = {
 					systemPrompt: [renderCritiqueSystem()],
@@ -492,8 +563,9 @@ export class CouncilSession {
 		}
 	}
 
-	/** send operator questions without losing the targeted reviewers thinking settings */
+	/** send operator questions through each reviewers existing discussion and source history */
 	async askCouncil(rawInput: string, defaultTargetKey?: string): Promise<void> {
+		if (this.#disposed) throw new Error("Council has been disposed.");
 		if (this.#busy) {
 			throw new Error("Council is busy.");
 		}
@@ -602,6 +674,10 @@ export class CouncilSession {
 			const combinedSignal = AbortSignal.any([this.#roundAbortController!.signal, timeoutSignal]);
 
 			try {
+				if (this.#reviewerAgentFactory) {
+					await this.#runInspectedTurn(reviewer, entry, promptText, combinedSignal);
+					return;
+				}
 				const apiKey = this.#getApiKey ? await this.#getApiKey(reviewer.model) : undefined;
 				const context: Context = {
 					systemPrompt: [renderCritiqueSystem()],
@@ -661,7 +737,9 @@ export class CouncilSession {
 		}
 	}
 
+	/** combine reviewer findings while keeping code inspection activity and missing reviews visible */
 	async synthesizeFeedback(synthesizerModel: Model | undefined): Promise<CouncilTurnEntry & { kind: "synthesis" }> {
+		if (this.#disposed) throw new Error("Council has been disposed.");
 		if (this.#busy) {
 			throw new Error("Council is busy.");
 		}
@@ -680,6 +758,15 @@ export class CouncilSession {
 		this.#roundAbortController = new AbortController();
 
 		const historyLines: string[] = [];
+		if (this.#reviewerAgentFactory) {
+			historyLines.push("Code inspection tool counts describe attempts only and do not establish complete verification. Preserve each reviewer's Inspected and Not inspected or limits section.");
+			for (const reviewer of this.#activeReviewers) {
+				const latest = this.#entries.findLast(e => isReviewerTurnEntry(e) && e.reviewerKey === reviewer.key);
+				if (!latest || (isReviewerTurnEntry(latest) && latest.status !== "done")) {
+					historyLines.push(`### ${reviewer.label}: no completed latest review (${latest && isReviewerTurnEntry(latest) ? latest.status : "not started"})`);
+				}
+			}
+		}
 		for (const e of this.#entries) {
 			if (e.kind === "user") {
 				historyLines.push(`### Operator [To ${e.targetLabel ?? "Council"}]:\n${e.text}\n`);
@@ -687,7 +774,8 @@ export class CouncilSession {
 				// Don't include previous synthesis drafts in new synthesis
 				continue;
 			} else if (e.status === "done" && e.text.trim()) {
-				historyLines.push(`### ${e.reviewerLabel} (Round ${e.round} ${e.kind}):\n${e.text}\n`);
+				const activity = e.inspection ? `; source tool calls attempted ${e.inspection.attempted}, failed ${e.inspection.failed}` : "";
+				historyLines.push(`### ${e.reviewerLabel} (Round ${e.round} ${e.kind}${activity}):\n${e.text}\n`);
 			}
 		}
 
@@ -814,6 +902,7 @@ export class CouncilSession {
 		return await this.synthesizeFeedback(synthesizerModel);
 	}
 
+	/** request cancellation while retaining ownership until the active round has settled */
 	abortActiveRound(): void {
 		if (this.#roundAbortController) {
 			this.#roundAbortController.abort();
@@ -824,12 +913,19 @@ export class CouncilSession {
 				entry.finishedAt = Date.now();
 			}
 		}
-		this.#busy = false;
 		this.#emitChange();
 	}
 
+	/** stop the council and release native reviewers including any that finish starting later */
 	dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
 		this.abortActiveRound();
+		// report asynchronous cleanup failures through the existing logger
+		for (const [reviewer, agent] of this.#agents) {
+			void agent.dispose().catch(error => logger.warn("Council reviewer cleanup failed", { reviewer, error }));
+		}
+		this.#agents.clear();
 		this.#listeners.clear();
 	}
 }

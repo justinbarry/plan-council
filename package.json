@@ -73,6 +73,11 @@
 				"type": "boolean",
 				"default": true,
 				"description": "Include user prompts from the active session branch alongside the plan markdown"
+			},
+			"codeInspection": {
+				"type": "boolean",
+				"default": true,
+				"description": "Allow each reviewer to inspect checkout code using read, grep, and glob"
 			}
 		}
 	}

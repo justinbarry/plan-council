@@ -139,6 +139,28 @@ reasoning levels. Use `:off` to request that reasoning be disabled. Selectors
 without a suffix keep the existing request defaults. Synthesis keeps its
 existing behavior.
 
+### Code Inspection
+
+Each reviewer can inspect relevant checkout code with OMP's native `read`,
+`grep`, and `glob` tools. This is enabled by default. Each reviewer keeps its
+own source and discussion history through critiques, debate, and questions.
+The synthesizer combines those reviews without its own code-reading session.
+
+Reviewers cite source locations and report what they inspected and what remains
+unverified. Tool activity counts include failed attempts and do not prove
+complete code coverage. Incomplete reviewer turns remain visible in synthesis.
+
+Code inspection uses the existing reviewer model and thinking selection, with
+the existing 120-second limit per turn. It can use more tokens and take longer
+than reviewing supplied text alone. Reviewers cannot edit files, execute shell
+commands, or invoke other agents. No extra search service or MCP setup is needed.
+
+To use the original plan-text-only review:
+
+```bash
+omp plugin config plan-council codeInspection false
+```
+
 ### Custom Model Roles
 
 You can define custom council roles in `~/.omp/agent/config.yml`:

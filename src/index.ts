@@ -8,6 +8,7 @@ import { matchesKey, type KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import { CouncilSession, extractSessionGoalContext } from "./council-session";
 import { resolveCouncilRoster, resolveSynthesizerModel } from "./models";
+import { createNativeReviewerAgentFactory } from "./reviewer-agent";
 import { type CouncilOverlayOutcome, PlanCouncilOverlay } from "./overlay";
 import { DEFAULT_PLAN_COUNCIL_SETTINGS, loadPlanCouncilSettings, type PlanCouncilSettings } from "./settings";
 
@@ -40,6 +41,7 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 		});
 	}
 
+	/** open the council with the current text review or native code inspection mode */
 	async function launchCouncilOverlay(
 		ctx: ExtensionContext | ExtensionCommandContext,
 		review: PlanReviewRequestedEvent,
@@ -57,7 +59,7 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 			const roster = resolveCouncilRoster(ctx.models, currentSettings);
 			const synthModel = resolveSynthesizerModel(ctx.models, currentSettings, roster.reviewers);
 
-			const sessionCacheKey = `${review.sessionId}:${review.planFilePath}:${Bun.hash(review.planContent)}`;
+			const sessionCacheKey = `${review.sessionId}:${review.planFilePath}:${Bun.hash(review.planContent)}:${currentSettings.codeInspection}`;
 			let session: CouncilSession;
 
 			if (cachedCouncil && cachedCouncil.key === sessionCacheKey) {
@@ -80,6 +82,13 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 					availableReviewers: roster.available,
 					initialReviewers: roster.reviewers,
 					sessionId: review.sessionId,
+					reviewerAgentFactory: currentSettings.codeInspection
+						? createNativeReviewerAgentFactory({
+							cwd: ctx.cwd,
+							modelRegistry: ctx.modelRegistry,
+							getApiKey: model => ctx.modelRegistry?.resolver(model, review.sessionId),
+						})
+						: undefined,
 					getApiKey: model =>
 						ctx.modelRegistry?.resolver ? ctx.modelRegistry.resolver(model, review.sessionId) : undefined,
 				});

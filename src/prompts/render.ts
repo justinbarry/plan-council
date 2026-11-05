@@ -1,6 +1,7 @@
 import { prompt } from "@oh-my-pi/pi-utils";
 import critiqueRoundTemplate from "./critique-round.md" with { type: "text" };
 import critiqueSystemTemplate from "./critique-system.md" with { type: "text" };
+import inspectionAddendumTemplate from "./inspection-addendum.md" with { type: "text" };
 import debateRebuttalTemplate from "./debate-rebuttal.md" with { type: "text" };
 import synthesizeSystemTemplate from "./synthesize-system.md" with { type: "text" };
 import synthesizeUserTemplate from "./synthesize-user.md" with { type: "text" };
@@ -27,6 +28,11 @@ function restoreExactValues(rendered: string, replacements: readonly (readonly [
 
 export function renderCritiqueSystem(): string {
 	return prompt.render(critiqueSystemTemplate, {});
+}
+
+/** describe source inspection and its evidence limits for native reviewer sessions */
+export function renderInspectionAddendum(): string {
+	return prompt.render(inspectionAddendumTemplate, {});
 }
 
 export interface RenderCritiqueRoundOptions {

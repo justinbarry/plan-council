@@ -12,6 +12,7 @@ export interface PlanCouncilSettings {
 	synthesizerModel: string | undefined;
 	shortcut: string;
 	includeSessionContext: boolean;
+	codeInspection: boolean;
 }
 
 export const DEFAULT_PLAN_COUNCIL_SETTINGS: PlanCouncilSettings = {
@@ -23,8 +24,10 @@ export const DEFAULT_PLAN_COUNCIL_SETTINGS: PlanCouncilSettings = {
 	synthesizerModel: undefined,
 	shortcut: "ctrl+n",
 	includeSessionContext: true,
+	codeInspection: true,
 };
 
+/** parse council settings while keeping code inspection enabled unless explicitly disabled */
 export function parsePlanCouncilSettings(raw: Record<string, unknown>): PlanCouncilSettings {
 	const autoStart = typeof raw.autoStart === "boolean" ? raw.autoStart : DEFAULT_PLAN_COUNCIL_SETTINGS.autoStart;
 	const autoProceed = typeof raw.autoProceed === "boolean" ? raw.autoProceed : DEFAULT_PLAN_COUNCIL_SETTINGS.autoProceed;
@@ -76,6 +79,7 @@ export function parsePlanCouncilSettings(raw: Record<string, unknown>): PlanCoun
 		synthesizerModel,
 		shortcut,
 		includeSessionContext,
+		codeInspection: typeof raw.codeInspection === "boolean" ? raw.codeInspection : DEFAULT_PLAN_COUNCIL_SETTINGS.codeInspection,
 	};
 }
 
