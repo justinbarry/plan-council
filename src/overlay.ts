@@ -12,6 +12,7 @@ import {
 	truncateToWidth,
 } from "@oh-my-pi/pi-tui";
 import { getMarkdownTheme, theme } from "@oh-my-pi/pi-tui/theme";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { CouncilSession, isReviewerTurnEntry, type ReviewerTurnEntry } from "./council-session";
 
 export type CouncilOverlayOutcome =
@@ -22,6 +23,7 @@ export type CouncilOverlayOutcome =
 export interface PlanCouncilOverlayOptions {
 	reviewOptions: PlanReviewOption[];
 	synthesizerModel: Model | undefined;
+	synthesizerThinkingLevel?: ConfiguredThinkingLevel;
 	warnings?: string[];
 	autoProceed?: boolean;
 	autoDebate?: boolean;
@@ -37,6 +39,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 	#session: CouncilSession;
 	#reviewOptions: PlanReviewOption[];
 	#synthesizerModel: Model | undefined;
+	#synthesizerThinkingLevel: ConfiguredThinkingLevel | undefined;
 	#warnings: string[];
 	#done: (result: CouncilOverlayOutcome) => void;
 	#autoProceed: boolean;
@@ -65,6 +68,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		this.#session = session;
 		this.#reviewOptions = options.reviewOptions;
 		this.#synthesizerModel = options.synthesizerModel;
+		this.#synthesizerThinkingLevel = options.synthesizerThinkingLevel;
 		this.#warnings = options.warnings ?? [];
 		this.#autoProceed = options.autoProceed ?? false;
 		this.#autoDebate = options.autoDebate ?? true;
@@ -385,6 +389,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		return [titleLine, tabLine, topDivider, ...bodyLines, statusLine, inputLine, hintLine];
 	}
 
+	/** dispatch council controls with the configured synthesizer model and thinking level */
 	handleInput(data: string): void {
 		// SGR mouse scroll support
 		if (data.startsWith("\x1b[<")) {
@@ -572,7 +577,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		if (data === "s") {
 			this.#tabBar.selectTab("synthesis");
 			void this.#session
-				.synthesizeFeedback(this.#synthesizerModel)
+				.synthesizeFeedback(this.#synthesizerModel, this.#synthesizerThinkingLevel)
 				.then(() => {
 					this.#statusBanner = undefined;
 					this.#tui.requestRender();
@@ -618,6 +623,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		}
 	}
 
+	/** apply synthesis using the configured thinking level when a request is needed */
 	async #refineWithSynthesis(): Promise<void> {
 		if (this.#session.latestSynthesis?.status === "done" && this.#session.latestSynthesis.text.trim()) {
 			this.#done({ action: "refine", feedback: this.#session.latestSynthesis.text.trim() });
@@ -628,7 +634,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			this.#tabBar.selectTab("synthesis");
 			this.#tui.requestRender();
 			try {
-				const synth = await this.#session.synthesizeFeedback(this.#synthesizerModel);
+				const synth = await this.#session.synthesizeFeedback(this.#synthesizerModel, this.#synthesizerThinkingLevel);
 				if (synth.status === "done" && synth.text.trim()) {
 					this.#done({ action: "refine", feedback: synth.text.trim() });
 				}
@@ -642,6 +648,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		}
 	}
 
+	/** retain the synthesizer thinking setting through automatic review and refinement */
 	async #runAutoPipeline(autoApplyRefine: boolean): Promise<void> {
 		if (this.#session.isBusy()) return;
 		this.#autoStage = "Starting...";
@@ -651,6 +658,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		try {
 			const synth = await this.#session.runAutoPipeline(this.#synthesizerModel, {
 				autoDebate: this.#autoDebate,
+				synthesizerThinkingLevel: this.#synthesizerThinkingLevel,
 				onStageChange: stage => {
 					this.#autoStage = stage;
 					this.#tui.requestRender();

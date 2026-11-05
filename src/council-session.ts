@@ -2,7 +2,7 @@ import type { ApiKey, AssistantMessage, AssistantMessageEvent, Context, Message,
 import { streamSimple } from "@oh-my-pi/pi-ai";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent";
 import { replaceTabs } from "@oh-my-pi/pi-tui";
-import { concreteThinkingLevel, shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
+import { concreteThinkingLevel, shouldDisableReasoning, toReasoningEffort, type ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { ReviewerMember } from "./models";
 import {
 	renderCritiqueRound,
@@ -661,7 +661,11 @@ export class CouncilSession {
 		}
 	}
 
-	async synthesizeFeedback(synthesizerModel: Model | undefined): Promise<CouncilTurnEntry & { kind: "synthesis" }> {
+	/** synthesize discussion with the selected model and optional thinking level */
+	async synthesizeFeedback(
+		synthesizerModel: Model | undefined,
+		synthesizerThinkingLevel?: ConfiguredThinkingLevel,
+	): Promise<CouncilTurnEntry & { kind: "synthesis" }> {
 		if (this.#busy) {
 			throw new Error("Council is busy.");
 		}
@@ -721,7 +725,13 @@ export class CouncilSession {
 				messages: [createUserMessage(synthUserPrompt)],
 			};
 
-			const stream = this.#streamFn(synthesizerModel, context, { signal: combinedSignal, apiKey });
+			const level = concreteThinkingLevel(synthesizerThinkingLevel);
+			const stream = this.#streamFn(synthesizerModel, context, {
+				signal: combinedSignal,
+				apiKey,
+				reasoning: toReasoningEffort(level),
+				disableReasoning: shouldDisableReasoning(level),
+			});
 			for await (const event of stream) {
 				if (event.type === "text_delta") {
 					entry.text += event.delta;
@@ -780,10 +790,12 @@ export class CouncilSession {
 		return false;
 	}
 
+	/** run the council stages while retaining the synthesizer thinking selection */
 	async runAutoPipeline(
 		synthesizerModel: Model | undefined,
 		options: {
 			autoDebate?: boolean;
+			synthesizerThinkingLevel?: ConfiguredThinkingLevel;
 			onStageChange?: (stage: string) => void;
 		} = {},
 	): Promise<CouncilTurnEntry & { kind: "synthesis" }> {
@@ -811,7 +823,7 @@ export class CouncilSession {
 		}
 
 		options.onStageChange?.("Synthesizing Consensus");
-		return await this.synthesizeFeedback(synthesizerModel);
+		return await this.synthesizeFeedback(synthesizerModel, options.synthesizerThinkingLevel);
 	}
 
 	abortActiveRound(): void {

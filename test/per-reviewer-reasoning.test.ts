@@ -3,9 +3,9 @@ import * as ai from "@oh-my-pi/pi-ai";
 import type { AssistantMessage, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import type { ExtensionModelQuery } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
-import { parseEffort } from "@oh-my-pi/pi-tui/thinking";
+import { parseEffort, parseThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { CouncilSession } from "../src/council-session";
-import { modelKey, resolveCouncilRoster, resolveSynthesizerModel } from "../src/models";
+import { modelKey, resolveCouncilRoster, resolveSynthesizer, resolveSynthesizerModel } from "../src/models";
 import { parsePlanCouncilSettings } from "../src/settings";
 
 // native effort values keep the fixtures reasoning capabilities checked by the library types
@@ -115,11 +115,91 @@ describe("per-reviewer reasoning selection", () => {
 		expect(roster.reviewers.map(reviewer => [reviewer.key, reviewer.thinkingLevel])).toEqual([[modelKey(literal), undefined]]);
 	});
 
-	// reviewer suffix handling must not change which model synthesis selects
-	it("preserves the existing synthesizer lookup when an explicit selector has no match", () => {
+	// synthesis now supports the same explicit role suffixes as reviewers
+	it("selects the configured synthesizer role when it includes a thinking suffix", () => {
 		const query = makeModelQuery({ plan: modelKey(sol), smol: modelKey(opus) });
 		const model = resolveSynthesizerModel(query, parsePlanCouncilSettings({ synthesizerModel: "council2:high" }), []);
-		expect(model).toBe(sol);
+		expect(model).toBe(opus);
+	});
+});
+
+// the requested synthesizer effort must reach the native model request
+describe("synthesizer reasoning requests", () => {
+	// explicit off and lower effort must override the providers normal defaults
+	it.each([
+		["xhigh", "xhigh", false],
+		["medium", "medium", false],
+		["off", undefined, true],
+		[undefined, undefined, false],
+	] as const)("forwards synthesizer thinking %s", async (level, expectedEffort, disabled) => {
+		const calls: Array<{ model: Model; options: SimpleStreamOptions | undefined }> = [];
+		// capture the real session request without calling a provider
+		const stream = spyOn(ai, "streamSimple").mockImplementation((model, _context, options) => {
+			calls.push({ model, options });
+			return completedStream(model);
+		});
+		const roster = resolveCouncilRoster(makeModelQuery(), parsePlanCouncilSettings({ reviewerModels: modelKey(sol) }));
+		const session = new CouncilSession({
+			planTitle: "Review plan",
+			planFilePath: "plan.md",
+			planContent: "Check the proposed change",
+			availableReviewers: roster.available,
+			initialReviewers: roster.reviewers,
+			sessionId: "synthesizer-reasoning-test",
+		});
+
+		try {
+			await session.startInitialCritiques();
+			const result = await session.synthesizeFeedback(opus, parseThinkingLevel(level));
+			expect(result.status).toBe("done");
+			expect(calls).toHaveLength(2);
+			expect(calls.at(-1)?.model).toBe(opus);
+			expect(calls.at(-1)?.options?.reasoning?.toString()).toBe(expectedEffort);
+			expect(Boolean(calls.at(-1)?.options?.disableReasoning)).toBe(disabled);
+			expect(calls.at(-1)?.options?.sessionId).toBe("synthesizer-reasoning-test");
+		} finally {
+			session.dispose();
+			stream.mockRestore();
+		}
+	});
+});
+
+// selectors must preserve the chosen model and supported effort together
+describe("synthesizer reasoning selection", () => {
+	// use the real omp resolver for model switches role aliases and effort limits
+	it.each([
+		["anthropic/claude-opus-5-5", opus, undefined],
+		["openai-codex/gpt-6.1-sol:xhigh", sol, "xhigh"],
+		["council2:medium", opus, "medium"],
+		["@advisor:high", opus, "high"],
+		["openai-codex/gpt-6.1-sol:off", sol, "off"],
+		["openai-codex/limited-reasoning-model:xhigh", limited, "high"],
+		["missing-model:xhigh", sol, undefined],
+		["", sol, undefined],
+	] as const)("resolves %s without losing the model or effort", (selector, expectedModel, expectedEffort) => {
+		const query = makeModelQuery({ plan: modelKey(sol), smol: modelKey(opus), advisor: modelKey(opus) }, [sol, opus, limited]);
+		const selection = resolveSynthesizer(query, parsePlanCouncilSettings({ synthesizerModel: selector }), []);
+		expect(selection?.model).toBe(expectedModel);
+		expect(selection?.thinkingLevel?.toString()).toBe(expectedEffort);
+		expect(resolveSynthesizerModel(query, parsePlanCouncilSettings({ synthesizerModel: selector }), [])).toBe(expectedModel);
+	});
+
+	// literal suffixes keep their model identity with no explicit reasoning override
+	it.each(["openai-codex/example:max", "openai-codex/EXAMPLE:max"])("preserves literal model ids for %s", selector => {
+		const literal: Model = { ...sol, id: "example:max" };
+		const selection = resolveSynthesizer(makeModelQuery({}, [literal]), parsePlanCouncilSettings({ synthesizerModel: selector }), []);
+		expect(selection?.model).toBe(literal);
+		expect(selection?.thinkingLevel).toBeUndefined();
+	});
+
+	// a reviewer effort must not leak into an automatic synthesizer fallback
+	it("falls back to the first reviewer without inheriting its effort", () => {
+		const query: ExtensionModelQuery = { ...makeModelQuery({}, []), current: () => undefined };
+		const roster = resolveCouncilRoster(makeModelQuery(), parsePlanCouncilSettings({ reviewerModels: "openai-codex/gpt-6.1-sol:xhigh" }));
+		const selection = resolveSynthesizer(query, parsePlanCouncilSettings({}), roster.reviewers);
+		expect(selection?.model).toBe(sol);
+		expect(selection?.thinkingLevel).toBeUndefined();
+		expect(resolveSynthesizer(query, parsePlanCouncilSettings({}), [])).toBeUndefined();
 	});
 });
 

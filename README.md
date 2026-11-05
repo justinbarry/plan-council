@@ -136,8 +136,28 @@ The chosen setting applies to initial critiques, debate rounds, and operator
 questions, including targeted replies and reviewers toggled in the Models tab.
 The selected effort follows OMP's normal adjustment to the model's supported
 reasoning levels. Use `:off` to request that reasoning be disabled. Selectors
-without a suffix keep the existing request defaults. Synthesis keeps its
-existing behavior.
+without a suffix keep the existing request defaults.
+
+### Synthesizer Model and Reasoning
+
+Set `synthesizerModel` to choose a different model for synthesis and append a
+thinking suffix to set its reasoning level independently of the reviewers:
+
+```bash
+omp plugin config plan-council synthesizerModel "openai-codex/gpt-6.1-sol:xhigh"
+```
+
+Role selectors also accept a suffix, such as `@council_synthesizer:high`.
+The chosen effort applies to manual synthesis, Refine Plan, and the automatic
+pipeline. It follows OMP's adjustment to the model's supported levels; `:off`
+disables reasoning. A selector without a suffix keeps the existing request
+defaults. Put the suffix in this plugin setting because OMP's model-query API
+does not expose thinking levels stored inside role definitions.
+
+An empty or unresolved selector keeps the existing fallback order:
+`@council_synthesizer`, `@council-synth`, `@plan`, `@slow`, `@default`, then the
+session model or first active reviewer. Fallback models keep their request
+defaults rather than inheriting a suffix from an unresolved selector.
 
 ### Custom Model Roles
 
