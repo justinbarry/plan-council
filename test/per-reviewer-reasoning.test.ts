@@ -52,11 +52,14 @@ function makeModelQuery(roles: Record<string, string> = {}, available: Model[] =
 	};
 }
 
-/** complete a model request without calling a provider */
+/** complete a model request, reporting an approving position, without calling a provider */
 function completedStream(model: Model): ReturnType<typeof ai.createAssistantMessageEventStream> {
 	const message: AssistantMessage = {
 		role: "assistant",
-		content: [{ type: "text", text: "Approve with no blocking issues" }],
+		content: [
+			{ type: "text", text: "Approve with no blocking issues" },
+			{ type: "toolCall", id: "call-0", name: "report_position", arguments: { verdict: "APPROVE", revisions: [], positions: [] } },
+		],
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
@@ -68,11 +71,11 @@ function completedStream(model: Model): ReturnType<typeof ai.createAssistantMess
 			totalTokens: 0,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
-		stopReason: "stop",
+		stopReason: "toolUse",
 		timestamp: Date.now(),
 	};
 	const stream = ai.createAssistantMessageEventStream();
-	stream.push({ type: "done", reason: "stop", message });
+	stream.push({ type: "done", reason: "toolUse", message });
 	return stream;
 }
 

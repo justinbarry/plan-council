@@ -15,3 +15,5 @@ Numbered list of concrete, fatal flaws that will cause failure or regressions. I
 
 ### Concrete Improvements
 Numbered list of actionable, high-leverage adjustments to strengthen the plan (specific file paths, invariants, or edge-case tests).
+
+Every reply that states a verdict must end with a call to the `report_position` tool, made exactly once after your written review. This is a tool call, not a section of your text: do not add a heading for it or describe it in prose. `verdict` repeats your Verdict. `revisions` lists every change you require in the plan, one entry each, in the order they appear in your review; leave it empty if you require none. `positions` gives a stance for every peer revision ID listed in the prompt: `agree` if you accept it as a required change, `dispute` with a reason if you reject it or require it to change materially. Leave `positions` empty when no peer IDs are listed.

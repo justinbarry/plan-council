@@ -5,9 +5,22 @@ import { replaceTabs } from "@oh-my-pi/pi-tui";
 import { concreteThinkingLevel, shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ReviewerMember } from "./models";
 import {
+	computeConvergence,
+	type ConvergenceReport,
+	formatConvergence,
+	formatReportedPositions,
+	parseReviewerPosition,
+	REPORT_POSITION_TOOL,
+	REPORT_POSITION_TOOL_NAME,
+	type ReviewerPosition,
+	type RevisionItem,
+	shouldStartDebate,
+} from "./position";
+import {
 	renderCritiqueRound,
 	renderCritiqueSystem,
 	renderDebateRebuttal,
+	renderPositionFollowup,
 	renderSynthesizeSystem,
 	renderSynthesizeUser,
 	renderUserFollowup,
@@ -25,6 +38,8 @@ export type CouncilTurnEntry =
 			status: EntryStatus;
 			text: string;
 			errorMessage?: string;
+			position?: ReviewerPosition;
+			positionError?: string;
 			startedAt: number;
 			finishedAt?: number;
 	  }
@@ -66,7 +81,7 @@ function createUserMessage(content: string): Message {
 export type ModelStreamFn = (
 	model: Model,
 	context: Context,
-	options: Pick<SimpleStreamOptions, "apiKey" | "reasoning" | "disableReasoning"> & { signal: AbortSignal },
+	options: Pick<SimpleStreamOptions, "apiKey" | "reasoning" | "disableReasoning" | "toolChoice"> & { signal: AbortSignal },
 ) => AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> };
 
 export interface CouncilSessionOptions {
@@ -135,6 +150,8 @@ export class CouncilSession {
 	#streamFn: ModelStreamFn;
 	#getApiKey?: (model: Model) => ApiKey | Promise<ApiKey | undefined> | undefined;
 	#sessionId?: string;
+	/** the running auto pipeline; abortActiveRound stops it so it cannot continue after the overlay closes */
+	#autoRun?: { stopped: boolean };
 
 	/** preserve reviewer request options when forwarding to the native model stream */
 	constructor(options: CouncilSessionOptions) {
@@ -237,8 +254,7 @@ export class CouncilSession {
 			return;
 		}
 
-		this.#busy = true;
-		this.#roundAbortController = new AbortController();
+		const controller = this.#beginRound();
 		this.#emitChange();
 
 		const systemPrompt = renderCritiqueSystem();
@@ -265,13 +281,14 @@ export class CouncilSession {
 			this.#emitChange();
 
 			const timeoutSignal = AbortSignal.timeout(120_000);
-			const combinedSignal = AbortSignal.any([this.#roundAbortController!.signal, timeoutSignal]);
+			const combinedSignal = AbortSignal.any([controller.signal, timeoutSignal]);
 
 			try {
 				const apiKey = this.#getApiKey ? await this.#getApiKey(reviewer.model) : undefined;
 				const context: Context = {
 					systemPrompt: [systemPrompt],
 					messages: [createUserMessage(userPrompt)],
+					tools: [REPORT_POSITION_TOOL],
 				};
 
 				const level = concreteThinkingLevel(reviewer.thinkingLevel);
@@ -295,20 +312,29 @@ export class CouncilSession {
 					entry.status = "error";
 					entry.errorMessage = msg.errorMessage || "Model request failed";
 				} else {
-					entry.status = "done";
 					if (!entry.text && msg.content) {
 						entry.text = msg.content
 							.filter(c => c.type === "text")
 							.map(c => c.text)
 							.join("");
 					}
-					let history = this.#histories.get(reviewer.key);
-					if (!history) {
-						history = [];
-						this.#histories.set(reviewer.key, history);
+					const report = await this.#collectPosition(reviewer, context, msg, [], {
+						signal: combinedSignal,
+						apiKey,
+						force: true,
+					});
+					// abortActiveRound marks streaming entries aborted while a report follow-up runs
+					if (entry.status === "streaming") {
+						entry.status = "done";
+						entry.position = report.position;
+						entry.positionError = report.positionError;
+						let history = this.#histories.get(reviewer.key);
+						if (!history) {
+							history = [];
+							this.#histories.set(reviewer.key, history);
+						}
+						history.push(createUserMessage(userPrompt), ...report.messages);
 					}
-					history.push(createUserMessage(userPrompt));
-					history.push(msg);
 				}
 			} catch (err) {
 				if (combinedSignal.aborted) {
@@ -326,8 +352,7 @@ export class CouncilSession {
 		try {
 			await Promise.allSettled(tasks);
 		} finally {
-			this.#busy = false;
-			this.#roundAbortController = null;
+			this.#endRound(controller);
 			this.#emitChange();
 		}
 	}
@@ -353,8 +378,7 @@ export class CouncilSession {
 		}
 
 		this.#round++;
-		this.#busy = true;
-		this.#roundAbortController = new AbortController();
+		const controller = this.#beginRound();
 		this.#emitChange();
 
 		const roundNum = this.#round;
@@ -394,9 +418,12 @@ export class CouncilSession {
 					.join("\n\n");
 			}
 
+			const peerItems = this.#peerItems(reviewer.key);
+			const promptedItemIds = peerItems.map(i => i.id);
 			const promptText = renderDebateRebuttal({
 				round: roundNum,
 				peerCritiques,
+				peerItems,
 				operatorNotes,
 			});
 
@@ -430,13 +457,14 @@ export class CouncilSession {
 			this.#emitChange();
 
 			const timeoutSignal = AbortSignal.timeout(120_000);
-			const combinedSignal = AbortSignal.any([this.#roundAbortController!.signal, timeoutSignal]);
+			const combinedSignal = AbortSignal.any([controller.signal, timeoutSignal]);
 
 			try {
 				const apiKey = this.#getApiKey ? await this.#getApiKey(reviewer.model) : undefined;
 				const context: Context = {
 					systemPrompt: [renderCritiqueSystem()],
 					messages: [...history, createUserMessage(promptText)],
+					tools: [REPORT_POSITION_TOOL],
 				};
 
 				const level = concreteThinkingLevel(reviewer.thinkingLevel);
@@ -460,15 +488,24 @@ export class CouncilSession {
 					entry.status = "error";
 					entry.errorMessage = msg.errorMessage || "Model request failed";
 				} else {
-					entry.status = "done";
 					if (!entry.text && msg.content) {
 						entry.text = msg.content
 							.filter(c => c.type === "text")
 							.map(c => c.text)
 							.join("");
 					}
-					history.push(createUserMessage(promptText));
-					history.push(msg);
+					const report = await this.#collectPosition(reviewer, context, msg, promptedItemIds, {
+						signal: combinedSignal,
+						apiKey,
+						force: true,
+					});
+					// abortActiveRound marks streaming entries aborted while a report follow-up runs
+					if (entry.status === "streaming") {
+						entry.status = "done";
+						entry.position = report.position;
+						entry.positionError = report.positionError;
+						history.push(createUserMessage(promptText), ...report.messages);
+					}
 				}
 			} catch (err) {
 				if (combinedSignal.aborted) {
@@ -486,8 +523,7 @@ export class CouncilSession {
 		try {
 			await Promise.allSettled(tasks);
 		} finally {
-			this.#busy = false;
-			this.#roundAbortController = null;
+			this.#endRound(controller);
 			this.#emitChange();
 		}
 	}
@@ -564,13 +600,14 @@ export class CouncilSession {
 			createdAt: Date.now(),
 		};
 		this.#entries.push(userEntry);
-		this.#busy = true;
-		this.#roundAbortController = new AbortController();
+		const controller = this.#beginRound();
 		this.#emitChange();
 
-		const promptText = renderUserFollowup({ userMessage: userText });
-
 		const tasks = reviewersToStream.map(async reviewer => {
+			const peerItems = this.#peerItems(reviewer.key);
+			const promptedItemIds = peerItems.map(i => i.id);
+			const promptText = renderUserFollowup({ userMessage: userText, peerItems });
+
 			let history = this.#histories.get(reviewer.key);
 			if (!history) {
 				history = [];
@@ -599,13 +636,14 @@ export class CouncilSession {
 			this.#emitChange();
 
 			const timeoutSignal = AbortSignal.timeout(120_000);
-			const combinedSignal = AbortSignal.any([this.#roundAbortController!.signal, timeoutSignal]);
+			const combinedSignal = AbortSignal.any([controller.signal, timeoutSignal]);
 
 			try {
 				const apiKey = this.#getApiKey ? await this.#getApiKey(reviewer.model) : undefined;
 				const context: Context = {
 					systemPrompt: [renderCritiqueSystem()],
 					messages: [...history, createUserMessage(promptText)],
+					tools: [REPORT_POSITION_TOOL],
 				};
 
 				const level = concreteThinkingLevel(reviewer.thinkingLevel);
@@ -636,8 +674,15 @@ export class CouncilSession {
 							.map(c => c.text)
 							.join("");
 					}
-					history.push(createUserMessage(promptText));
-					history.push(msg);
+					// replies report only when something changed, so a missing report is not forced
+					const report = await this.#collectPosition(reviewer, context, msg, promptedItemIds, {
+						signal: combinedSignal,
+						apiKey,
+						force: false,
+					});
+					entry.position = report.position;
+					entry.positionError = report.positionError;
+					history.push(createUserMessage(promptText), ...report.messages);
 				}
 			} catch (err) {
 				if (combinedSignal.aborted) {
@@ -655,8 +700,7 @@ export class CouncilSession {
 		try {
 			await Promise.allSettled(tasks);
 		} finally {
-			this.#busy = false;
-			this.#roundAbortController = null;
+			this.#endRound(controller);
 			this.#emitChange();
 		}
 	}
@@ -676,8 +720,7 @@ export class CouncilSession {
 			throw new Error("Run at least one critique or message before synthesizing.");
 		}
 
-		this.#busy = true;
-		this.#roundAbortController = new AbortController();
+		const controller = this.#beginRound();
 
 		const historyLines: string[] = [];
 		for (const e of this.#entries) {
@@ -690,6 +733,10 @@ export class CouncilSession {
 				historyLines.push(`### ${e.reviewerLabel} (Round ${e.round} ${e.kind}):\n${e.text}\n`);
 			}
 		}
+		const reviewerPositions = this.#reviewerPositions();
+		const convergence = computeConvergence(reviewerPositions);
+		historyLines.push(`### Reported Positions\n${formatReportedPositions(reviewerPositions)}\n`);
+		historyLines.push(`### Convergence\n${formatConvergence(convergence, convergence.items)}\n`);
 
 		const synthUserPrompt = renderSynthesizeUser({
 			planTitle: this.#planTitle,
@@ -712,7 +759,7 @@ export class CouncilSession {
 		this.#emitChange();
 
 		const timeoutSignal = AbortSignal.timeout(120_000);
-		const combinedSignal = AbortSignal.any([this.#roundAbortController.signal, timeoutSignal]);
+		const combinedSignal = AbortSignal.any([controller.signal, timeoutSignal]);
 
 		try {
 			const apiKey = this.#getApiKey ? await this.#getApiKey(synthesizerModel) : undefined;
@@ -753,37 +800,106 @@ export class CouncilSession {
 			}
 		} finally {
 			entry.finishedAt = Date.now();
-			this.#busy = false;
-			this.#roundAbortController = null;
+			this.#endRound(controller);
 			this.#emitChange();
 		}
 
 		return entry;
 	}
 
-	hasCritiqueDisagreements(): boolean {
-		const critiques = this.#entries.filter(
-			(e): e is ReviewerTurnEntry => isReviewerTurnEntry(e) && e.kind === "critique" && e.round === 1 && e.status === "done",
-		);
-		if (critiques.length < 2) return false;
-
-		for (const c of critiques) {
-			const upper = c.text.toUpperCase();
-			if (upper.includes("NEEDS REVISION") || upper.includes("BLOCK")) {
-				return true;
-			}
-			const lower = c.text.toLowerCase();
-			if (lower.includes("### blocking issues") && !lower.includes("no blocking issues")) {
-				return true;
-			}
+	/**
+	 * parse the turn's report; when `force` is set and it is missing or invalid, ask once more on the same history
+	 * with report_position forced, since some models write the review but skip or malform the call.
+	 * Returns the assistant/tool messages to append to the reviewer history after the turn's prompt.
+	 */
+	async #collectPosition(
+		reviewer: ReviewerMember,
+		context: Context,
+		msg: AssistantMessage,
+		promptedItemIds: string[],
+		request: { signal: AbortSignal; apiKey: ApiKey | undefined; force: boolean },
+	): Promise<{ position?: ReviewerPosition; positionError?: string; messages: Message[] }> {
+		const first = parseReviewerPosition(msg, reviewer.key, promptedItemIds);
+		const messages: Message[] = [msg, ...first.toolResults];
+		if (first.position || !request.force || request.signal.aborted) {
+			return { position: first.position, positionError: first.positionError, messages };
 		}
-		return false;
+
+		const followUpPrompt = createUserMessage(renderPositionFollowup());
+		const level = concreteThinkingLevel(reviewer.thinkingLevel);
+		try {
+			const stream = this.#streamFn(
+				reviewer.model,
+				{ ...context, messages: [...context.messages, ...messages, followUpPrompt] },
+				{
+					signal: request.signal,
+					apiKey: request.apiKey,
+					reasoning: toReasoningEffort(level),
+					disableReasoning: shouldDisableReasoning(level),
+					toolChoice: { type: "function", name: REPORT_POSITION_TOOL_NAME },
+				},
+			);
+			// the forced report is bookkeeping, not part of the visible review text
+			for await (const _event of stream) {
+			}
+			const followUp = await stream.result();
+			if (followUp.stopReason === "error" || followUp.stopReason === "aborted") {
+				return { positionError: first.positionError, messages };
+			}
+			const second = parseReviewerPosition(followUp, reviewer.key, promptedItemIds);
+			return {
+				position: second.position,
+				positionError: second.positionError,
+				messages: [...messages, followUpPrompt, followUp, ...second.toolResults],
+			};
+		} catch {
+			return { positionError: first.positionError, messages };
+		}
+	}
+
+	/**
+	 * position of the reviewer's latest completed turn; a critique or rebuttal without a valid report clears it,
+	 * while an operator reply (whose prompt makes the report optional) without one keeps the previous position
+	 */
+	#latestPosition(reviewerKey: string): ReviewerPosition | undefined {
+		for (let i = this.#entries.length - 1; i >= 0; i--) {
+			const e = this.#entries[i];
+			if (!isReviewerTurnEntry(e) || e.reviewerKey !== reviewerKey || e.status !== "done") continue;
+			if (e.kind === "reply" && !e.position) continue;
+			return e.position;
+		}
+		return undefined;
+	}
+
+	/** required revisions currently held by every other active reviewer, in roster order */
+	#peerItems(reviewerKey: string): RevisionItem[] {
+		return this.#activeReviewers
+			.filter(r => r.key !== reviewerKey)
+			.flatMap(r => this.#latestPosition(r.key)?.revisions ?? []);
+	}
+
+	#completedReviewerCount(): number {
+		const completedKeys = new Set(
+			this.#entries
+				.filter((e): e is ReviewerTurnEntry => isReviewerTurnEntry(e) && e.status === "done")
+				.map(e => e.reviewerKey),
+		);
+		return completedKeys.size;
+	}
+
+	#reviewerPositions(): { label: string; position?: ReviewerPosition }[] {
+		return this.#activeReviewers.map(r => ({ label: r.label, position: this.#latestPosition(r.key) }));
+	}
+
+	getConvergence(): ConvergenceReport {
+		return computeConvergence(this.#reviewerPositions());
 	}
 
 	async runAutoPipeline(
 		synthesizerModel: Model | undefined,
 		options: {
 			autoDebate?: boolean;
+			maxDebateRounds?: number;
 			onStageChange?: (stage: string) => void;
 		} = {},
 	): Promise<CouncilTurnEntry & { kind: "synthesis" }> {
@@ -791,30 +907,59 @@ export class CouncilSession {
 			throw new Error("Council is busy.");
 		}
 
-		options.onStageChange?.("Round 1 Critiques");
-		await this.startInitialCritiques();
+		const run = { stopped: false };
+		this.#autoRun = run;
+		const stage = (name: string) => {
+			if (run.stopped) throw new Error("Auto council stopped.");
+			options.onStageChange?.(name);
+		};
 
-		const completedKeys = new Set(
-			this.#entries
-				.filter((e): e is ReviewerTurnEntry => isReviewerTurnEntry(e) && e.status === "done")
-				.map(e => e.reviewerKey),
-		);
+		try {
+			stage("Round 1 Critiques");
+			await this.startInitialCritiques();
 
-		const shouldDebate =
-			options.autoDebate !== false &&
-			completedKeys.size >= 2 &&
-			(options.autoDebate === true || this.hasCritiqueDisagreements());
+			const maxDebateRounds = options.maxDebateRounds ?? 3;
+			if (options.autoDebate !== false) {
+				const verdicts = this.#activeReviewers.map(r => this.#latestPosition(r.key)?.verdict);
+				if (shouldStartDebate(this.getConvergence(), verdicts)) {
+					for (let i = 0; i < maxDebateRounds; i++) {
+						if (this.#completedReviewerCount() < 2) break;
+						stage(`Round ${this.#round + 1} Debate`);
+						await this.runDebateRound();
+						if (this.getConvergence().converged) break;
+					}
+				}
+			}
 
-		if (shouldDebate) {
-			options.onStageChange?.("Round 2 Debate");
-			await this.runDebateRound();
+			stage("Synthesizing Consensus");
+			return await this.synthesizeFeedback(synthesizerModel);
+		} finally {
+			if (this.#autoRun === run) this.#autoRun = undefined;
 		}
+	}
 
-		options.onStageChange?.("Synthesizing Consensus");
-		return await this.synthesizeFeedback(synthesizerModel);
+	/** claim the session for one round; the returned controller identifies the round to #endRound */
+	#beginRound(): AbortController {
+		const controller = new AbortController();
+		this.#busy = true;
+		this.#roundAbortController = controller;
+		return controller;
+	}
+
+	/**
+	 * abortActiveRound frees the session immediately, so an aborted round can settle after a newer one started;
+	 * only the current round may release the session and its controller
+	 */
+	#endRound(controller: AbortController): void {
+		if (this.#roundAbortController !== controller) return;
+		this.#busy = false;
+		this.#roundAbortController = null;
 	}
 
 	abortActiveRound(): void {
+		if (this.#autoRun) {
+			this.#autoRun.stopped = true;
+		}
 		if (this.#roundAbortController) {
 			this.#roundAbortController.abort();
 		}

@@ -14,6 +14,14 @@ Peer reviewers have reviewed the plan. Examine their assessments below:
 {{{operatorNotes}}}
 
 {{/if}}
+{{#if peerItems}}
+---
+### Peer required revisions
+{{#each peerItems}}
+- `{{id}}`: {{{summary}}}
+{{/each}}
+
+{{/if}}
 ---
 ### Instructions for Rebuttal
 1. Compare your earlier review with the peer critiques above.
@@ -22,3 +30,4 @@ Peer reviewers have reviewed the plan. Examine their assessments below:
 4. Conclude with your updated assessment:
    - State whether your verdict is still `APPROVE`, `NEEDS REVISION`, or `BLOCK`.
    - List your finalized required plan revisions.
+5. Call `report_position` with your updated verdict, your full current revision list, and a stance for every peer ID listed above.

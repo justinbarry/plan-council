@@ -78,6 +78,14 @@ describe("settings parser", () => {
 		expect(parsePlanCouncilSettings({ maxReviewers: "invalid" }).maxReviewers).toBe(3);
 	});
 
+	it("parses and clamps maxDebateRounds", () => {
+		expect(parsePlanCouncilSettings({}).maxDebateRounds).toBe(3);
+		expect(parsePlanCouncilSettings({ maxDebateRounds: "7" }).maxDebateRounds).toBe(5);
+		expect(parsePlanCouncilSettings({ maxDebateRounds: 0 }).maxDebateRounds).toBe(1);
+		expect(parsePlanCouncilSettings({ maxDebateRounds: 2.4 }).maxDebateRounds).toBe(2);
+		expect(parsePlanCouncilSettings({ maxDebateRounds: "invalid" }).maxDebateRounds).toBe(3);
+	});
+
 	it("splits CSV reviewerModels and trims whitespace", () => {
 		const parsed = parsePlanCouncilSettings({ reviewerModels: " anthropic/claude-3-5-sonnet, , openai/gpt-4o " });
 		expect(parsed.reviewerModels).toEqual(["anthropic/claude-3-5-sonnet", "openai/gpt-4o"]);
@@ -278,6 +286,23 @@ describe("prompt renderers", () => {
 
 		expect(followup).toContain("What about Windows path separators `\\` vs `/`?");
 		expect(followup).toContain("We should use `path.normalize`.");
+	});
+
+	it("lists peer revision IDs and model-written summaries verbatim in debate and follow-up prompts", () => {
+		const peerItems = [
+			{ id: "anthropic/claude-3-7-sonnet#1", summary: "Guard `a < b` & keep {{raw}} \"quoted\"" },
+			{ id: "openai/gpt-4o#2", summary: "Add rollback step" },
+		];
+		const expected = [
+			"- `anthropic/claude-3-7-sonnet#1`: Guard `a < b` & keep {{raw}} \"quoted\"",
+			"- `openai/gpt-4o#2`: Add rollback step",
+		].join("\n");
+
+		const rebuttal = renderDebateRebuttal({ round: 2, peerCritiques: [], peerItems });
+		expect(rebuttal).toContain(`### Peer required revisions\n${expected}`);
+		expect(renderUserFollowup({ userMessage: "Why?", peerItems })).toContain(`### Peer required revisions\n${expected}`);
+
+		expect(renderDebateRebuttal({ round: 2, peerCritiques: [], peerItems: [] })).not.toContain("Peer required revisions");
 	});
 
 	it("renders synthesize system and user prompt with verbatim history", () => {

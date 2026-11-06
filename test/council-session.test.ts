@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import type { AssistantMessage, AssistantMessageEvent, Context, Model } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, AssistantMessageEvent, Context, Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent";
 import { CouncilSession, extractSessionGoalContext, isReviewerTurnEntry, type ModelStreamFn, type ReviewerTurnEntry } from "../src/council-session";
+import { computeConvergence } from "../src/position";
 import type { ReviewerMember } from "../src/models";
 
 function makeFakeReviewer(provider: string, id: string, family: string): ReviewerMember {
@@ -29,20 +30,16 @@ function makeFakeReviewer(provider: string, id: string, family: string): Reviewe
 	};
 }
 
+type MockToolCall = { name: string; arguments: Record<string, unknown> };
+type MockResponse = { text: string; stopReason?: "stop" | "error" | "aborted"; error?: string; toolCalls?: MockToolCall[] };
+
 function makeMockStreamFn(
-	responder: (
-		model: Model,
-		context: Context,
-	) => { text: string; stopReason?: "stop" | "error" | "aborted"; error?: string } | Promise<{
-		text: string;
-		stopReason?: "stop" | "error" | "aborted";
-		error?: string;
-	}>,
-): { streamFn: ModelStreamFn; calls: Array<{ model: Model; context: Context }> } {
-	const calls: Array<{ model: Model; context: Context }> = [];
+	responder: (model: Model, context: Context) => MockResponse | Promise<MockResponse>,
+): { streamFn: ModelStreamFn; calls: Array<{ model: Model; context: Context; options: Parameters<ModelStreamFn>[2] }> } {
+	const calls: Array<{ model: Model; context: Context; options: Parameters<ModelStreamFn>[2] }> = [];
 
 	const streamFn: ModelStreamFn = (model, context, options) => {
-		calls.push({ model, context });
+		calls.push({ model, context, options });
 
 		async function* generate(): AsyncIterable<AssistantMessageEvent> {
 			const res = await responder(model, context);
@@ -82,16 +79,68 @@ function makeMockStreamFn(
 						errorMessage: res.error || "Simulated failure",
 					} as unknown as AssistantMessage;
 				}
+				const toolCalls = (res.toolCalls ?? []).map((call, i) => ({
+					type: "toolCall",
+					id: `call-${i}`,
+					name: call.name,
+					arguments: call.arguments,
+				}));
 				return {
 					role: "assistant",
-					content: [{ type: "text", text: res.text }],
-					stopReason: "stop",
+					content: [{ type: "text", text: res.text }, ...toolCalls],
+					stopReason: toolCalls.length > 0 ? "toolUse" : "stop",
 				} as unknown as AssistantMessage;
 			},
 		};
 	};
 
 	return { streamFn, calls };
+}
+
+type Stance = { id: string; stance: "agree" | "dispute"; reason?: string };
+
+function reportPosition(verdict: string, revisions: string[] = [], positions: Stance[] = []): MockToolCall {
+	return {
+		name: "report_position",
+		arguments: {
+			verdict,
+			revisions: revisions.map(summary => ({ summary })),
+			positions: positions.map(p => ({ reason: "", ...p })),
+		},
+	};
+}
+
+function lastPrompt(context: Context): string {
+	const last = context.messages[context.messages.length - 1];
+	return last.role === "user" && typeof last.content === "string" ? last.content : "";
+}
+
+function isSynthesis(context: Context): boolean {
+	return (context.systemPrompt?.[0] ?? "").includes("Synthesizer");
+}
+
+interface ScriptedTurn {
+	/** 1 for critiques and operator replies, N for "Council Debate: Round N" */
+	round: number;
+	peerIds: string[];
+	prompt: string;
+}
+
+/** reviewer turns answer with prose plus the scripted tool calls; synthesis answers with fixed revisions */
+function scriptedCouncil(turn: (model: Model, t: ScriptedTurn) => MockToolCall[]): (model: Model, context: Context) => MockResponse {
+	return (model, context) => {
+		if (isSynthesis(context)) {
+			return { text: "## Required Plan Revisions\n1. Synthesized result" };
+		}
+		const prompt = lastPrompt(context);
+		const round = Number(prompt.match(/# Council Debate: Round (\d+)/)?.[1] ?? 1);
+		const peerIds = [...prompt.matchAll(/^- `([^`]+)`: /gm)].map(m => m[1]);
+		return { text: `Review from ${model.id} for round ${round}`, toolCalls: turn(model, { round, peerIds, prompt }) };
+	};
+}
+
+function toolResultsIn(context: Context): ToolResultMessage[] {
+	return context.messages.filter((m): m is ToolResultMessage => m.role === "toolResult");
 }
 
 describe("extractSessionGoalContext", () => {
@@ -213,7 +262,7 @@ describe("CouncilSession", () => {
 			if (model.id === "gpt-4o" && gptFailedOnce) {
 				return { text: "", stopReason: "error", error: "Flaky network" };
 			}
-			return { text: `Done by ${model.id}` };
+			return { text: `Done by ${model.id}`, toolCalls: [reportPosition("APPROVE")] };
 		});
 
 		const session = new CouncilSession({
@@ -245,7 +294,10 @@ describe("CouncilSession", () => {
 		const { streamFn, calls } = makeMockStreamFn((model, context) => {
 			const userMsg = context.messages[context.messages.length - 1];
 			const content = typeof userMsg.content === "string" ? userMsg.content : "";
-			return { text: `Rebuttal from ${model.id} replying to: ${content.includes("Council Debate") ? "debate" : "critique"}` };
+			return {
+				text: `Rebuttal from ${model.id} replying to: ${content.includes("Council Debate") ? "debate" : "critique"}`,
+				toolCalls: [reportPosition("APPROVE")],
+			};
 		});
 
 		const session = new CouncilSession({
@@ -264,17 +316,13 @@ describe("CouncilSession", () => {
 		expect(session.round).toBe(2);
 
 		// Check the debate call for Claude
-		const claudeDebateCall = calls.find(
-			(c) => c.model.id === "claude-3-7-sonnet" && c.context.messages.length === 3,
-		);
+		const claudeDebateCall = calls.find(c => c.model.id === "claude-3-7-sonnet" && lastPrompt(c.context).includes("Council Debate"));
 		expect(claudeDebateCall).toBeDefined();
 
-		// Context has Round 1 user prompt, Round 1 Claude critique, and Round 2 debate prompt
-		expect(claudeDebateCall?.context.messages[0].role).toBe("user");
-		expect(claudeDebateCall?.context.messages[1].role).toBe("assistant");
-		expect(claudeDebateCall?.context.messages[2].role).toBe("user");
+		// Context has Round 1 user prompt, Round 1 Claude critique and its tool result, and Round 2 debate prompt
+		expect(claudeDebateCall?.context.messages.map(m => m.role)).toEqual(["user", "assistant", "toolResult", "user"]);
 
-		const debatePrompt = String(claudeDebateCall?.context.messages[2].content);
+		const debatePrompt = lastPrompt(claudeDebateCall!.context);
 		// Peer critique from GPT should be in Claude's prompt
 		expect(debatePrompt).toContain("Critique from gpt-4o (openai)");
 		// But Claude's own critique should not be framed as a peer critique in Claude's prompt
@@ -343,18 +391,13 @@ describe("CouncilSession", () => {
 
 	it("runs full autonomous pipeline without manual coaxing", async () => {
 		const stages: string[] = [];
-		const { streamFn } = makeMockStreamFn((model, context) => {
-			const sys = context.systemPrompt?.[0] ?? "";
-			if (sys.includes("Synthesizer")) {
-				return { text: "## Required Plan Revisions\n1. Autonomous synthesized result" };
-			}
-			const last = context.messages[context.messages.length - 1];
-			const content = String(last.content);
-			if (content.includes("Council Debate")) {
-				return { text: `Rebuttal from ${model.id}: agreed` };
-			}
-			return { text: `Critique from ${model.id}: ### Verdict\nNEEDS REVISION` };
-		});
+		const { streamFn } = makeMockStreamFn(
+			scriptedCouncil((model, { round, peerIds }) =>
+				round === 1
+					? [reportPosition("NEEDS REVISION", [`Fix raised by ${model.id}`])]
+					: [reportPosition("APPROVE", [`Fix raised by ${model.id}`], peerIds.map(id => ({ id, stance: "agree" })))],
+			),
+		);
 
 		const session = new CouncilSession({
 			planTitle: "Auto Plan",
@@ -373,6 +416,385 @@ describe("CouncilSession", () => {
 		expect(stages).toEqual(["Round 1 Critiques", "Round 2 Debate", "Synthesizing Consensus"]);
 		expect(session.round).toBe(2);
 		expect(synth.status).toBe("done");
-		expect(synth.text).toContain("Autonomous synthesized result");
+		expect(synth.text).toContain("Synthesized result");
+	});
+});
+
+describe("report_position convergence", () => {
+	const claude = makeFakeReviewer("anthropic", "claude-3-7-sonnet", "claude");
+	const gpt = makeFakeReviewer("openai", "gpt-4o", "gpt");
+
+	function newSession(streamFn: ModelStreamFn, reviewers: ReviewerMember[] = [claude, gpt]): CouncilSession {
+		return new CouncilSession({
+			planTitle: "Convergence Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: reviewers,
+			initialReviewers: reviewers,
+			streamFn,
+		});
+	}
+
+	function reviewerEntry(session: CouncilSession, key: string, kind: ReviewerTurnEntry["kind"]): ReviewerTurnEntry {
+		const entry = session.entries.filter((e): e is ReviewerTurnEntry => isReviewerTurnEntry(e) && e.reviewerKey === key && e.kind === kind).at(-1);
+		if (!entry) throw new Error(`no ${kind} entry for ${key}`);
+		return entry;
+	}
+
+	it("offers report_position on every reviewer turn and answers every tool call in history", async () => {
+		const { streamFn, calls } = makeMockStreamFn(
+			scriptedCouncil((model, { round, peerIds }) =>
+				round === 1
+					? [reportPosition("NEEDS REVISION", [`Fix raised by ${model.id}`]), { name: "web_search", arguments: {} }]
+					: [reportPosition("APPROVE", [], peerIds.map(id => ({ id, stance: "agree" })))],
+			),
+		);
+		const session = newSession(streamFn);
+
+		await session.startInitialCritiques();
+		await session.runDebateRound();
+		await session.askCouncil("Anything else?");
+		await session.synthesizeFeedback(claude.model);
+
+		const reviewerCalls = calls.filter(c => !isSynthesis(c.context));
+		expect(reviewerCalls).toHaveLength(6);
+		for (const call of reviewerCalls) {
+			expect(call.context.tools?.map(t => t.name)).toEqual(["report_position"]);
+		}
+		expect(calls.find(c => isSynthesis(c.context))?.context.tools).toBeUndefined();
+
+		const claudeDebate = reviewerCalls.find(c => c.model === claude.model && lastPrompt(c.context).includes("Council Debate"));
+		const results = toolResultsIn(claudeDebate!.context);
+		expect(results.map(r => [r.toolCallId, r.toolName, r.isError])).toEqual([
+			["call-0", "report_position", false],
+			["call-1", "web_search", true],
+		]);
+		// results follow the assistant message that made the calls, before the next prompt
+		const roles = claudeDebate!.context.messages.map(m => m.role);
+		expect(roles).toEqual(["user", "assistant", "toolResult", "toolResult", "user"]);
+		expect(reviewerEntry(session, claude.key, "critique").position?.revisions).toEqual([
+			{ id: "anthropic/claude-3-7-sonnet#1", summary: "Fix raised by claude-3-7-sonnet" },
+		]);
+	});
+
+	it("forces one report_position follow-up when a critique or rebuttal omits the report", async () => {
+		const followUpMarker = "Call the `report_position` tool now";
+		const { streamFn, calls } = makeMockStreamFn((model, context) => {
+			const prompt = lastPrompt(context);
+			if (prompt.includes(followUpMarker)) {
+				return { text: "", toolCalls: [reportPosition("NEEDS REVISION", [`Fix raised by ${model.id}`])] };
+			}
+			return { text: `Review from ${model.id}` };
+		});
+		const session = newSession(streamFn);
+
+		await session.startInitialCritiques();
+		const claudeCalls = calls.filter(c => c.model === claude.model);
+		expect(claudeCalls.map(c => c.options.toolChoice)).toEqual([undefined, { type: "function", name: "report_position" }]);
+		const critique = reviewerEntry(session, claude.key, "critique");
+		expect(critique.status).toBe("done");
+		expect(critique.text).toBe("Review from claude-3-7-sonnet");
+		expect(critique.position?.revisions.map(r => r.id)).toEqual(["anthropic/claude-3-7-sonnet#1"]);
+
+		await session.runDebateRound();
+		const claudeDebate = calls.find(c => c.model === claude.model && lastPrompt(c.context).includes("Council Debate"));
+		// the forced exchange stays in history so its tool call keeps a paired result
+		expect(claudeDebate!.context.messages.map(m => m.role)).toEqual(["user", "assistant", "user", "assistant", "toolResult", "user"]);
+		expect(reviewerEntry(session, claude.key, "rebuttal").position?.revisions.map(r => r.id)).toEqual([
+			"anthropic/claude-3-7-sonnet#1",
+		]);
+	});
+
+	it("keeps a turn done without a position when report_position arguments stay invalid", async () => {
+		const { streamFn, calls } = makeMockStreamFn(
+			scriptedCouncil(model =>
+				model === claude.model
+					? [{ name: "report_position", arguments: { verdict: "MAYBE", revisions: [], positions: [] } }]
+					: [reportPosition("APPROVE")],
+			),
+		);
+		const session = newSession(streamFn);
+
+		await session.startInitialCritiques();
+		const critique = reviewerEntry(session, claude.key, "critique");
+		expect(critique.status).toBe("done");
+		expect(critique.position).toBeUndefined();
+		expect(critique.positionError).toContain("verdict");
+		expect(session.getConvergence().unreported).toEqual([claude.label]);
+		// one forced retry, then the turn stands without a report
+		expect(calls.filter(c => c.model === claude.model)).toHaveLength(2);
+
+		await session.runDebateRound();
+		const claudeDebate = calls.find(c => c.model === claude.model && lastPrompt(c.context).includes("Council Debate"));
+		expect(toolResultsIn(claudeDebate!.context).map(r => r.isError)).toEqual([true, true]);
+	});
+
+	const stanceCases: Array<{
+		name: string;
+		stances: (peerIds: string[]) => Stance[];
+		converged: boolean;
+		disputes: number;
+		uncovered: number;
+	}> = [
+		{ name: "disputes keep it open", stances: ids => ids.map(id => ({ id, stance: "dispute", reason: "unnecessary" })), converged: false, disputes: 2, uncovered: 0 },
+		{ name: "agreement on every listed ID converges", stances: ids => ids.map(id => ({ id, stance: "agree" })), converged: true, disputes: 0, uncovered: 0 },
+		{
+			name: "stances on unlisted IDs are ignored",
+			stances: ids => [...ids.map(id => ({ id, stance: "agree" as const })), { id: "someone/else#9", stance: "dispute", reason: "x" }],
+			converged: true,
+			disputes: 0,
+			uncovered: 0,
+		},
+		{ name: "omitting a listed ID leaves it uncovered", stances: () => [], converged: false, disputes: 0, uncovered: 2 },
+	];
+
+	for (const c of stanceCases) {
+		it(`scores debate stances on listed peer IDs: ${c.name}`, async () => {
+			const { streamFn, calls } = makeMockStreamFn(
+				scriptedCouncil((model, { round, peerIds }) =>
+					round === 1
+						? [reportPosition("NEEDS REVISION", [`Fix raised by ${model.id}`])]
+						: [reportPosition("NEEDS REVISION", [`Fix raised by ${model.id}`], c.stances(peerIds))],
+				),
+			);
+			const session = newSession(streamFn);
+
+			await session.startInitialCritiques();
+			await session.runDebateRound();
+
+			const gptDebatePrompt = lastPrompt(calls.find(x => x.model === gpt.model && lastPrompt(x.context).includes("Council Debate"))!.context);
+			expect(gptDebatePrompt).toContain("- `anthropic/claude-3-7-sonnet#1`: Fix raised by claude-3-7-sonnet");
+			expect(gptDebatePrompt).not.toContain("openai/gpt-4o#1");
+
+			const report = session.getConvergence();
+			expect(report.converged).toBe(c.converged);
+			expect(report.disputes).toHaveLength(c.disputes);
+			expect(report.uncovered).toHaveLength(c.uncovered);
+			if (c.disputes > 0) {
+				expect(report.disputes).toContainEqual({ id: "anthropic/claude-3-7-sonnet#1", by: gpt.label, reason: "unnecessary" });
+			}
+			if (c.uncovered > 0) {
+				expect(report.uncovered).toContainEqual({ id: "openai/gpt-4o#1", by: claude.label });
+			}
+		});
+	}
+
+	it("keeps peer items open until every other reviewer has been shown them", async () => {
+		const { streamFn } = makeMockStreamFn(
+			scriptedCouncil((model, { round, peerIds }) => {
+				const revisions = [`Fix raised by ${model.id}`];
+				// gpt adds a second required change during the first debate round
+				if (model === gpt.model && round >= 2) revisions.push("Pin dependency versions");
+				const positions = round === 1 ? [] : peerIds.map(id => ({ id, stance: "agree" as const }));
+				return [reportPosition("NEEDS REVISION", revisions, positions)];
+			}),
+		);
+		const session = newSession(streamFn);
+
+		await session.startInitialCritiques();
+		const afterCritiques = session.getConvergence();
+		expect(afterCritiques.converged).toBe(false);
+		expect(afterCritiques.uncovered).toEqual([
+			{ id: "openai/gpt-4o#1", by: claude.label },
+			{ id: "anthropic/claude-3-7-sonnet#1", by: gpt.label },
+		]);
+
+		await session.runDebateRound();
+		const afterFirstDebate = session.getConvergence();
+		expect(afterFirstDebate.disputes).toEqual([]);
+		expect(afterFirstDebate.uncovered).toEqual([{ id: "openai/gpt-4o#2", by: claude.label }]);
+
+		await session.runDebateRound();
+		expect(session.getConvergence().converged).toBe(true);
+	});
+
+	it("ignores stances on peer items their owner dropped in the same round", () => {
+		const report = computeConvergence([
+			{
+				label: "A",
+				position: {
+					verdict: "NEEDS REVISION",
+					revisions: [{ id: "a#1", summary: "Redact headers" }],
+					positions: [
+						{ id: "b#1", stance: "agree", reason: "" },
+						{ id: "b#2", stance: "dispute", reason: "not needed" },
+					],
+					promptedItemIds: ["b#1", "b#2"],
+				},
+			},
+			// B listed b#2 last round and dropped it in this one
+			{
+				label: "B",
+				position: {
+					verdict: "NEEDS REVISION",
+					revisions: [{ id: "b#1", summary: "Use middleware" }],
+					positions: [{ id: "a#1", stance: "agree", reason: "" }],
+					promptedItemIds: ["a#1"],
+				},
+			},
+		]);
+		expect(report.disputes).toEqual([]);
+		expect(report.converged).toBe(true);
+	});
+
+	it("keeps the previous position when an operator reply makes no report", async () => {
+		const { streamFn, calls } = makeMockStreamFn(
+			scriptedCouncil((model, { round, peerIds, prompt }) => {
+				if (prompt.includes("Operator Follow-up")) return [];
+				return round === 1
+					? [reportPosition("NEEDS REVISION", [`Fix raised by ${model.id}`])]
+					: [reportPosition("NEEDS REVISION", [`Fix raised by ${model.id}`], peerIds.map(id => ({ id, stance: "agree" })))];
+			}),
+		);
+		const session = newSession(streamFn);
+
+		await session.startInitialCritiques();
+		await session.runDebateRound();
+		const callsBeforeReply = calls.length;
+		await session.askCouncil("@claude Clarify step 2");
+		// replies report only when something changed, so no forced follow-up
+		expect(calls.length).toBe(callsBeforeReply + 1);
+
+		expect(reviewerEntry(session, claude.key, "reply").status).toBe("done");
+		const report = session.getConvergence();
+		expect(report.converged).toBe(true);
+		expect(report.items.map(i => i.id)).toEqual(["anthropic/claude-3-7-sonnet#1", "openai/gpt-4o#1"]);
+	});
+
+	async function runAuto(
+		turn: (model: Model, t: ScriptedTurn) => MockToolCall[],
+		options: { autoDebate?: boolean; maxDebateRounds?: number } = {},
+	) {
+		const { streamFn, calls } = makeMockStreamFn(scriptedCouncil(turn));
+		const session = newSession(streamFn);
+		const stages: string[] = [];
+		const synth = await session.runAutoPipeline(claude.model, { ...options, onStageChange: s => stages.push(s) });
+		const synthPrompt = lastPrompt(calls.find(c => isSynthesis(c.context))!.context);
+		return { session, stages, synth, synthPrompt };
+	}
+
+	it("gives the synthesizer a reviewer's reported revisions even when its turns have no prose", async () => {
+		const turn = scriptedCouncil((model, { peerIds }) => {
+			const positions = peerIds.map(id => ({ id, stance: "agree" as const }));
+			return model === claude.model
+				? [reportPosition("NEEDS REVISION", ["Add a rollback step"], positions)]
+				: [reportPosition("APPROVE", [], positions)];
+		});
+		const { streamFn, calls } = makeMockStreamFn((model, context) => {
+			const res = turn(model, context);
+			return model === claude.model && !isSynthesis(context) ? { ...res, text: "" } : res;
+		});
+		const session = newSession(streamFn);
+
+		await session.runAutoPipeline(claude.model);
+
+		expect(session.getConvergence().converged).toBe(true);
+		const synthPrompt = lastPrompt(calls.find(c => isSynthesis(c.context))!.context);
+		expect(synthPrompt).not.toContain(`### ${claude.label} (Round`);
+		expect(synthPrompt).toContain(
+			`### Reported Positions\n- ${claude.label}: NEEDS REVISION\n  - \`anthropic/claude-3-7-sonnet#1\`: Add a rollback step\n- ${gpt.label}: APPROVE, no required revisions`,
+		);
+	});
+
+	it("convergence: auto mode debates until reviewers stop disputing, then synthesizes", async () => {
+		const { session, stages, synth, synthPrompt } = await runAuto((model, { round, peerIds }) => {
+			const revisions = [`Fix raised by ${model.id}`];
+			if (round === 1) return [reportPosition("NEEDS REVISION", revisions)];
+			const stance = round === 2 ? "dispute" : "agree";
+			return [reportPosition("NEEDS REVISION", revisions, peerIds.map(id => ({ id, stance, reason: "not needed" })))];
+		});
+
+		expect(stages).toEqual(["Round 1 Critiques", "Round 2 Debate", "Round 3 Debate", "Synthesizing Consensus"]);
+		expect(session.round).toBe(3);
+		expect(session.getConvergence().converged).toBe(true);
+		expect(synth.status).toBe("done");
+		expect(synthPrompt).toContain("### Convergence\nAll reviewers reported agreement on every listed revision.");
+	});
+
+	it("skips debate when every reviewer approves with no revisions", async () => {
+		const { stages } = await runAuto(() => [reportPosition("APPROVE")]);
+		expect(stages).toEqual(["Round 1 Critiques", "Synthesizing Consensus"]);
+	});
+
+	it("stops at maxDebateRounds while disputes remain and tells the synthesizer what is contested", async () => {
+		const { session, stages, synthPrompt } = await runAuto(
+			(model, { peerIds }) => [
+				reportPosition("BLOCK", [`Fix raised by ${model.id}`], peerIds.map(id => ({ id, stance: "dispute", reason: "wrong approach" }))),
+			],
+			{ maxDebateRounds: 2 },
+		);
+
+		expect(stages).toEqual(["Round 1 Critiques", "Round 2 Debate", "Round 3 Debate", "Synthesizing Consensus"]);
+		expect(session.round).toBe(3);
+		expect(synthPrompt).toContain(
+			`- anthropic/claude-3-7-sonnet#1 ("Fix raised by claude-3-7-sonnet") disputed by ${gpt.label}: wrong approach`,
+		);
+	});
+
+	it("stops the whole auto run when the active round is aborted mid-debate", async () => {
+		const turn = scriptedCouncil((model, { peerIds }) => [
+			reportPosition("BLOCK", [`Fix raised by ${model.id}`], peerIds.map(id => ({ id, stance: "dispute", reason: "no" }))),
+		]);
+		const { streamFn, calls } = makeMockStreamFn(async (model, context) => {
+			await Bun.sleep(20);
+			return turn(model, context);
+		});
+		const session = newSession(streamFn);
+		const stages: string[] = [];
+
+		const run = session.runAutoPipeline(claude.model, {
+			onStageChange: stage => {
+				stages.push(stage);
+				// what Esc, `x`, approve, and plan-review resolution do while a debate streams
+				if (stage === "Round 2 Debate") setTimeout(() => session.abortActiveRound(), 5);
+			},
+		});
+
+		await expect(run).rejects.toThrow("Auto council stopped.");
+		await Bun.sleep(50);
+		expect(stages).toEqual(["Round 1 Critiques", "Round 2 Debate"]);
+		expect(calls.some(c => isSynthesis(c.context) || lastPrompt(c.context).includes("Council Debate: Round 3"))).toBe(false);
+		expect(session.isBusy()).toBe(false);
+	});
+
+	it("keeps a round started right after a stop stoppable when the stopped round settles late", async () => {
+		const { streamFn, calls } = makeMockStreamFn(async (_model, context) => {
+			// the stopped round's requests (calls 0-1) settle quickly after the stop; the restarted round's run long
+			await Bun.sleep(calls.findIndex(c => c.context === context) < 2 ? 15 : 200);
+			return { text: "review", toolCalls: [reportPosition("APPROVE")] };
+		});
+		const session = newSession(streamFn);
+
+		const stopped = session.startInitialCritiques();
+		await Bun.sleep(5);
+		session.abortActiveRound();
+		const restarted = session.startInitialCritiques();
+		await stopped;
+
+		// the stopped round's cleanup must not release the restarted one
+		expect(session.isBusy()).toBe(true);
+		session.abortActiveRound();
+		await restarted;
+		expect(calls.slice(2).map(c => c.options.signal.aborted)).toEqual([true, true]);
+		expect(session.isBusy()).toBe(false);
+	});
+
+	it("never debates when autoDebate is false", async () => {
+		const { stages } = await runAuto(model => [reportPosition("BLOCK", [`Fix raised by ${model.id}`])], { autoDebate: false });
+		expect(stages).toEqual(["Round 1 Critiques", "Synthesizing Consensus"]);
+	});
+
+	it("debates to the default cap when a reviewer never reports", async () => {
+		const { stages, synthPrompt } = await runAuto((model, { peerIds }) =>
+			model === claude.model ? [] : [reportPosition("APPROVE", [], peerIds.map(id => ({ id, stance: "agree" })))],
+		);
+		expect(stages).toEqual([
+			"Round 1 Critiques",
+			"Round 2 Debate",
+			"Round 3 Debate",
+			"Round 4 Debate",
+			"Synthesizing Consensus",
+		]);
+		expect(synthPrompt).toContain(`- No position reported: ${claude.label}`);
 	});
 });

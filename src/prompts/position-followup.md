@@ -1,0 +1,1 @@
+Call the `report_position` tool now to record the position from your reply above: your verdict, every plan change you require, and a stance for every peer revision ID listed in the prompt. Do not repeat or extend the review.

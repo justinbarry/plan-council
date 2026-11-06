@@ -44,7 +44,7 @@
 			"autoDebate": {
 				"type": "boolean",
 				"default": true,
-				"description": "Automatically trigger Round 2 debate when peer critiques disagree or request revisions"
+				"description": "Automatically debate after Round 1 and repeat until reviewers report no disputed revisions or maxDebateRounds is reached"
 			},
 			"reviewerModels": {
 				"type": "string",
@@ -58,6 +58,14 @@
 				"max": 6,
 				"step": 1,
 				"description": "Maximum auto-selected reviewer models when reviewerModels is empty"
+			},
+			"maxDebateRounds": {
+				"type": "number",
+				"default": 3,
+				"min": 1,
+				"max": 5,
+				"step": 1,
+				"description": "Maximum automatic debate rounds before synthesis when autoDebate is on"
 			},
 			"synthesizerModel": {
 				"type": "string",

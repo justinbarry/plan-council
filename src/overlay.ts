@@ -13,6 +13,7 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { getMarkdownTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import { CouncilSession, isReviewerTurnEntry, type ReviewerTurnEntry } from "./council-session";
+import { openDisagreementCount } from "./position";
 
 export type CouncilOverlayOutcome =
 	| { action: "close" }
@@ -25,6 +26,7 @@ export interface PlanCouncilOverlayOptions {
 	warnings?: string[];
 	autoProceed?: boolean;
 	autoDebate?: boolean;
+	maxDebateRounds?: number;
 }
 
 interface StatusBanner {
@@ -41,6 +43,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 	#done: (result: CouncilOverlayOutcome) => void;
 	#autoProceed: boolean;
 	#autoDebate: boolean;
+	#maxDebateRounds: number;
 	#autoStage?: string;
 	#mode: "browse" | "compose" = "browse";
 	#tabBar: TabBar;
@@ -68,6 +71,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		this.#warnings = options.warnings ?? [];
 		this.#autoProceed = options.autoProceed ?? false;
 		this.#autoDebate = options.autoDebate ?? true;
+		this.#maxDebateRounds = options.maxDebateRounds ?? 3;
 		this.#done = done;
 
 		const tabBarTheme: TabBarTheme = {
@@ -175,10 +179,17 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		this.#syncTabs();
 
 		// Row 1: Title bar
-		const roundBadge =
-			this.#session.round > 0
-				? theme.fg("accent", ` [Round ${this.#session.round}${this.#session.isBusy() ? " ⏳" : ""}]`)
-				: "";
+		let roundBadge = "";
+		if (this.#session.round > 0) {
+			roundBadge = theme.fg("accent", ` [Round ${this.#session.round}${this.#session.isBusy() ? " ⏳" : ""}]`);
+			const hasDoneReviewer = this.#session.entries.some(e => isReviewerTurnEntry(e) && e.status === "done");
+			if (!this.#session.isBusy() && hasDoneReviewer) {
+				const convergence = this.#session.getConvergence();
+				roundBadge += convergence.converged
+					? theme.fg("success", " · converged")
+					: theme.fg("warning", ` · ${openDisagreementCount(convergence)} open`);
+			}
+		}
 		const warnBadge =
 			this.#warnings.length > 0
 				? theme.fg("warning", ` (${this.#warnings.length} warning${this.#warnings.length === 1 ? "" : "s"})`)
@@ -552,7 +563,14 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			void this.#session
 				.runDebateRound()
 				.then(() => {
-					this.#statusBanner = undefined;
+					const round = this.#session.round;
+					const convergence = this.#session.getConvergence();
+					this.#statusBanner = {
+						text: convergence.converged
+							? `Converged after round ${round}.`
+							: `${openDisagreementCount(convergence)} open disagreement(s) after round ${round}; press d to debate again.`,
+						isError: false,
+					};
 					this.#tui.requestRender();
 				})
 				.catch(err => {
@@ -651,6 +669,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		try {
 			const synth = await this.#session.runAutoPipeline(this.#synthesizerModel, {
 				autoDebate: this.#autoDebate,
+				maxDebateRounds: this.#maxDebateRounds,
 				onStageChange: stage => {
 					this.#autoStage = stage;
 					this.#tui.requestRender();

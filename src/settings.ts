@@ -9,6 +9,7 @@ export interface PlanCouncilSettings {
 	autoDebate: boolean;
 	reviewerModels: string[];
 	maxReviewers: number;
+	maxDebateRounds: number;
 	synthesizerModel: string | undefined;
 	shortcut: string;
 	includeSessionContext: boolean;
@@ -20,6 +21,7 @@ export const DEFAULT_PLAN_COUNCIL_SETTINGS: PlanCouncilSettings = {
 	autoDebate: true,
 	reviewerModels: [],
 	maxReviewers: 3,
+	maxDebateRounds: 3,
 	synthesizerModel: undefined,
 	shortcut: "ctrl+n",
 	includeSessionContext: true,
@@ -52,6 +54,16 @@ export function parsePlanCouncilSettings(raw: Record<string, unknown>): PlanCoun
 		}
 	}
 
+	let maxDebateRounds = DEFAULT_PLAN_COUNCIL_SETTINGS.maxDebateRounds;
+	if (typeof raw.maxDebateRounds === "number" && !Number.isNaN(raw.maxDebateRounds)) {
+		maxDebateRounds = Math.min(5, Math.max(1, Math.round(raw.maxDebateRounds)));
+	} else if (typeof raw.maxDebateRounds === "string") {
+		const parsed = Number.parseInt(raw.maxDebateRounds, 10);
+		if (!Number.isNaN(parsed)) {
+			maxDebateRounds = Math.min(5, Math.max(1, parsed));
+		}
+	}
+
 	const synthesizerModel =
 		typeof raw.synthesizerModel === "string" && raw.synthesizerModel.trim()
 			? raw.synthesizerModel.trim()
@@ -73,6 +85,7 @@ export function parsePlanCouncilSettings(raw: Record<string, unknown>): PlanCoun
 		autoDebate,
 		reviewerModels,
 		maxReviewers,
+		maxDebateRounds,
 		synthesizerModel,
 		shortcut,
 		includeSessionContext,

@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AssistantMessage, AssistantMessageEvent, Model } from "@oh-my-pi/pi-ai";
+import * as ai from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, AssistantMessageEvent, Context, Model } from "@oh-my-pi/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -33,6 +34,37 @@ async function flushMicrotasks(count = 20): Promise<void> {
 	for (let i = 0; i < count; i++) {
 		await Promise.resolve();
 	}
+}
+
+/** point home, XDG dirs, and the agent dir at a temp directory so the developer's ~/.omp plugin state stays out of tests */
+function isolateOmpHome(prefix: string): { home: string; restore: () => void } {
+	const home = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	const originalAgentDir = getAgentDir();
+	const originalXdg = new Map<string, string | undefined>();
+	for (const key of ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]) {
+		originalXdg.set(key, process.env[key]);
+		delete process.env[key];
+	}
+	const homedirSpy = spyOn(os, "homedir").mockReturnValue(home);
+	setAgentDir(path.join(home, ".omp", "agent"));
+
+	const pluginsDir = getPluginsDir();
+	if (!pluginsDir.startsWith(home + path.sep)) {
+		throw new Error(`plugin isolation failed: ${pluginsDir}`);
+	}
+
+	return {
+		home,
+		restore: () => {
+			homedirSpy.mockRestore();
+			for (const [key, value] of originalXdg) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+			setAgentDir(originalAgentDir);
+			removeSyncWithRetries(home);
+		},
+	};
 }
 
 function makeFakeModel(provider: string, id: string): Model {
@@ -517,29 +549,121 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 		expect(setStatusKey).toBe("plan-council");
 		expect(setStatusValue).toBeUndefined();
 	});
+
+	it("--auto launch runs critiques, debate, and synthesis, then resolves the plan review with refine feedback", async () => {
+		const isolation = isolateOmpHome("pi-council-auto-home-");
+		const projectDir = TempDir.createSync("@pi-council-auto-proj-");
+		const reviewerPrompts: string[] = [];
+		const streamSpy = spyOn(ai, "streamSimple").mockImplementation(((_model: Model, context: Context) => {
+			const last = context.messages[context.messages.length - 1];
+			const prompt = last.role === "user" && typeof last.content === "string" ? last.content : "";
+			const isSynthesis = (context.systemPrompt?.[0] ?? "").includes("Synthesizer");
+			const content: AssistantMessage["content"] = [];
+			if (isSynthesis) {
+				content.push({ type: "text", text: "## Required Plan Revisions\n1. Mocked auto synthesis" });
+			} else {
+				reviewerPrompts.push(prompt);
+				const peerIds = [...prompt.matchAll(/^- `([^`]+)`: /gm)].map(m => m[1]);
+				content.push(
+					{ type: "text", text: "### Verdict\nNEEDS REVISION" },
+					{
+						type: "toolCall",
+						id: "call-0",
+						name: "report_position",
+						arguments: {
+							verdict: "NEEDS REVISION",
+							revisions: [{ summary: "Add a rollback step" }],
+							positions: peerIds.map(id => ({ id, stance: "agree", reason: "" })),
+						},
+					},
+				);
+			}
+			const msg = { role: "assistant", content, stopReason: isSynthesis ? "stop" : "toolUse" } as unknown as AssistantMessage;
+			return {
+				async *[Symbol.asyncIterator](): AsyncGenerator<AssistantMessageEvent> {},
+				result: async () => msg,
+			} as unknown as ReturnType<typeof ai.streamSimple>;
+		}) as typeof ai.streamSimple);
+
+		try {
+			const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+			planCouncilExtension({
+				registerCommand: (name: string, opts: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => {
+					commands.set(name, opts);
+				},
+				registerShortcut: () => {},
+				registerFlag: () => {},
+				on: () => {},
+			} as unknown as ExtensionAPI);
+
+			const gpt = makeFakeModel("openai", "gpt-4o");
+			const planning = makeFakeModel("google", "gemini-2.5-pro");
+			let resolved: { reviewId: string; choice: string; feedback?: string } | undefined;
+			const fakeContext = {
+				cwd: projectDir.path(),
+				hasUI: true,
+				agent: { kind: "main", id: "main", name: "main", depth: 0 },
+				models: {
+					list: () => [claude, gpt, planning],
+					current: () => planning,
+					resolve: () => undefined,
+					family: (m: Model) => m.provider,
+				},
+				modelRegistry: { resolver: () => undefined },
+				ui: {
+					theme,
+					notify: () => {},
+					setStatus: () => {},
+					custom: (factory: (tui: TUI, theme: Theme, keybindings: KeybindingsManager, done: (res: unknown) => void) => unknown) => {
+						const { promise, resolve } = Promise.withResolvers<unknown>();
+						const fakeTui = { terminal: { rows: 24, cols: 80 }, requestRender: () => {} } as unknown as TUI;
+						factory(fakeTui, theme as unknown as Theme, {} as unknown as KeybindingsManager, resolve);
+						return promise;
+					},
+				},
+				resolvePlanReview: (reviewId: string, choice: string, opts?: { feedback?: string }) => {
+					resolved = { reviewId, choice, feedback: opts?.feedback };
+					return true;
+				},
+				getPendingPlanReview: () => ({
+					type: "plan_review_requested",
+					reviewId: "rev-auto",
+					sessionId: "sess-auto",
+					title: "Auto Plan",
+					planFilePath: "plan.md",
+					planContent: "# Auto Plan",
+					options: [{ id: "execute", label: "Execute", disabled: false }],
+				}),
+			} as unknown as ExtensionContext;
+
+			const finished = commands.get("plan-council")!.handler("--auto", fakeContext);
+			await Promise.race([
+				finished,
+				delay(3000).then(() => {
+					throw new Error("auto pipeline never closed the overlay");
+				}),
+			]);
+
+			expect(resolved).toEqual({ reviewId: "rev-auto", choice: "refine", feedback: "## Required Plan Revisions\n1. Mocked auto synthesis" });
+			// Round 1 for both reviewers, then one debate round that converges on agreement
+			expect(reviewerPrompts.filter(p => p.includes("# Council Debate: Round 2"))).toHaveLength(2);
+			expect(reviewerPrompts.some(p => p.includes("# Council Debate: Round 3"))).toBe(false);
+		} finally {
+			streamSpy.mockRestore();
+			projectDir.removeSync();
+			isolation.restore();
+		}
+	});
 });
 
 describe("plugin package discovery", () => {
 	let projectDir: TempDir;
-	let tempHome = "";
-	const originalAgentDir = getAgentDir();
-	const xdgVars = ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] as const;
-	const originalXdg = new Map<string, string | undefined>();
+	let isolation: { home: string; restore: () => void };
 
 	beforeEach(() => {
 		projectDir = TempDir.createSync("@pi-council-proj-");
-		tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-council-home-"));
-		for (const key of xdgVars) {
-			originalXdg.set(key, process.env[key]);
-			delete process.env[key];
-		}
-		spyOn(os, "homedir").mockReturnValue(tempHome);
-		setAgentDir(path.join(tempHome, ".omp", "agent"));
-
+		isolation = isolateOmpHome("pi-council-home-");
 		const pluginsDir = getPluginsDir();
-		if (!pluginsDir.startsWith(tempHome + path.sep)) {
-			throw new Error(`plugin isolation failed: ${pluginsDir}`);
-		}
 
 		// Symlink plugins/plan-council into isolated home node_modules
 		const destDir = path.join(pluginsDir, "node_modules", "plan-council");
@@ -562,15 +686,8 @@ describe("plugin package discovery", () => {
 
 	afterEach(() => {
 		projectDir.removeSync();
-		spyOn(os, "homedir").mockRestore();
-		for (const [key, value] of originalXdg) {
-			if (value === undefined) delete process.env[key];
-			else process.env[key] = value;
-		}
-		originalXdg.clear();
-		setAgentDir(originalAgentDir);
 		__closeExtensionParseCacheForTests();
-		removeSyncWithRetries(tempHome);
+		isolation.restore();
 	});
 
 	it("discovers and loads @oh-my-pi/plan-council from plugin manifest", async () => {

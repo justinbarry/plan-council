@@ -1,7 +1,9 @@
 import { prompt } from "@oh-my-pi/pi-utils";
+import type { RevisionItem } from "../position";
 import critiqueRoundTemplate from "./critique-round.md" with { type: "text" };
 import critiqueSystemTemplate from "./critique-system.md" with { type: "text" };
 import debateRebuttalTemplate from "./debate-rebuttal.md" with { type: "text" };
+import positionFollowupTemplate from "./position-followup.md" with { type: "text" };
 import synthesizeSystemTemplate from "./synthesize-system.md" with { type: "text" };
 import synthesizeUserTemplate from "./synthesize-user.md" with { type: "text" };
 import userFollowupTemplate from "./user-followup.md" with { type: "text" };
@@ -27,6 +29,10 @@ function restoreExactValues(rendered: string, replacements: readonly (readonly [
 
 export function renderCritiqueSystem(): string {
 	return prompt.render(critiqueSystemTemplate, {});
+}
+
+export function renderPositionFollowup(): string {
+	return prompt.render(positionFollowupTemplate, {});
 }
 
 export interface RenderCritiqueRoundOptions {
@@ -74,13 +80,31 @@ export interface PeerCritiqueItem {
 export interface RenderDebateRebuttalOptions {
 	round: number;
 	peerCritiques: readonly PeerCritiqueItem[];
+	peerItems?: readonly RevisionItem[];
 	operatorNotes?: string;
+}
+
+/** summaries are model text: render placeholders, then restore the exact values */
+function mapPeerItems(
+	peerItems: readonly RevisionItem[] | undefined,
+	exactValues: readonly string[],
+	replacements: Array<readonly [string, string]>,
+): Array<{ id: string; summary: string }> | undefined {
+	if (!peerItems || peerItems.length === 0) return undefined;
+	return peerItems.map((item, idx) => {
+		const placeholder = exactPlaceholder(`ITEM_${idx}`, idx, exactValues);
+		replacements.push([placeholder, item.summary]);
+		return { id: item.id, summary: placeholder };
+	});
 }
 
 export function renderDebateRebuttal(options: RenderDebateRebuttalOptions): string {
 	const exactValues: string[] = options.peerCritiques.map(p => p.critiqueText);
 	if (options.operatorNotes) {
 		exactValues.push(options.operatorNotes);
+	}
+	for (const item of options.peerItems ?? []) {
+		exactValues.push(item.summary);
 	}
 
 	const replacements: Array<readonly [string, string]> = [];
@@ -99,9 +123,12 @@ export function renderDebateRebuttal(options: RenderDebateRebuttalOptions): stri
 		replacements.push([operatorNotesPlaceholder, options.operatorNotes]);
 	}
 
+	const mappedItems = mapPeerItems(options.peerItems, exactValues, replacements);
+
 	const rendered = prompt.render(debateRebuttalTemplate, {
 		round: options.round,
 		peerCritiques: mappedPeers,
+		peerItems: mappedItems,
 		operatorNotes: operatorNotesPlaceholder,
 	});
 
@@ -116,6 +143,7 @@ export interface PeerUpdateItem {
 export interface RenderUserFollowupOptions {
 	userMessage: string;
 	peerUpdates?: readonly PeerUpdateItem[];
+	peerItems?: readonly RevisionItem[];
 }
 
 export function renderUserFollowup(options: RenderUserFollowupOptions): string {
@@ -124,6 +152,9 @@ export function renderUserFollowup(options: RenderUserFollowupOptions): string {
 		for (const u of options.peerUpdates) {
 			exactValues.push(u.updateText);
 		}
+	}
+	for (const item of options.peerItems ?? []) {
+		exactValues.push(item.summary);
 	}
 
 	const userMsgPlaceholder = exactPlaceholder("USERMSG", 0, exactValues);
@@ -141,9 +172,12 @@ export function renderUserFollowup(options: RenderUserFollowupOptions): string {
 		});
 	}
 
+	const mappedItems = mapPeerItems(options.peerItems, exactValues, replacements);
+
 	const rendered = prompt.render(userFollowupTemplate, {
 		userMessage: userMsgPlaceholder,
 		peerUpdates: mappedUpdates,
+		peerItems: mappedItems,
 	});
 
 	return restoreExactValues(rendered, replacements);

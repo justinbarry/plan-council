@@ -87,7 +87,9 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 				cachedCouncil = { key: sessionCacheKey, session };
 			}
 
-			if (options.startCritiquesImmediately && session.entries.length === 0 && roster.reviewers.length > 0) {
+			const autoProceed = options.autoProceed ?? currentSettings.autoProceed;
+			// auto mode starts critiques through the overlay pipeline; pre-starting here leaves the session busy and the pipeline a no-op
+			if (options.startCritiquesImmediately && !autoProceed && session.entries.length === 0 && roster.reviewers.length > 0) {
 				void session.startInitialCritiques();
 			}
 
@@ -100,8 +102,9 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 							reviewOptions: review.options,
 							synthesizerModel: synthModel,
 							warnings: roster.warnings,
-							autoProceed: options.autoProceed ?? currentSettings.autoProceed,
+							autoProceed,
 							autoDebate: currentSettings.autoDebate,
+							maxDebateRounds: currentSettings.maxDebateRounds,
 						},
 						done,
 					),
