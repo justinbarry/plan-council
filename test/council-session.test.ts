@@ -1,7 +1,15 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, setSystemTime } from "bun:test";
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent";
-import { CouncilSession, extractSessionGoalContext, isReviewerTurnEntry, type ModelStreamFn, type ReviewerTurnEntry } from "../src/council-session";
+import type { CodebaseReader, CodeReaderQueryInput } from "../src/code-reader";
+import {
+	CouncilSession,
+	extractSessionGoalContext,
+	isReviewerTurnEntry,
+	type ModelStreamFn,
+	READER_TARGET_KEY,
+	type ReviewerTurnEntry,
+} from "../src/council-session";
 import { computeConvergence } from "../src/position";
 import type { ReviewerMember } from "../src/models";
 
@@ -807,5 +815,237 @@ describe("report_position convergence", () => {
 			"Synthesizing Consensus",
 		]);
 		expect(synthPrompt).toContain(`- No position reported: ${claude.label}`);
+	});
+});
+
+interface FakeReader {
+	reader: CodebaseReader;
+	queries: CodeReaderQueryInput[];
+}
+
+/** reports queued → reading → grep like the real reader, then answers; a rejected answer is a reader failure */
+function makeFakeReader(answer: (input: CodeReaderQueryInput) => string | Promise<string> = input => `Reader: ${input.question}`): FakeReader {
+	const queries: CodeReaderQueryInput[] = [];
+	const reader: CodebaseReader = {
+		modelLabel: "smol-reader (test)",
+		async query(input) {
+			queries.push(input);
+			input.onStatusChange?.("queued");
+			input.onStatusChange?.("reading");
+			input.onToolActivity?.("grep");
+			const text = await answer(input);
+			input.onTextDelta?.(text, text);
+			return { answer: text, cached: false };
+		},
+		dispose: () => {},
+	};
+	return { reader, queries };
+}
+
+/** messages after the turn's prompt: the reviewer's earlier steps in this turn and their tool results */
+function turnSteps(context: Context): Context["messages"] {
+	return context.messages.slice(context.messages.findLastIndex(m => m.role === "user") + 1);
+}
+
+function readerAnswered(context: Context): boolean {
+	return turnSteps(context).some(m => m.role === "toolResult" && m.toolName === "ask_codebase");
+}
+
+describe("codebase reader", () => {
+	const claude = makeFakeReviewer("anthropic", "claude-3-7-sonnet", "claude");
+	const gpt = makeFakeReviewer("openai", "gpt-4o", "gpt");
+
+	function newSession(streamFn: ModelStreamFn, codeReader: CodebaseReader | undefined, extra: { maxReaderQueriesPerTurn?: number; reviewers?: ReviewerMember[] } = {}) {
+		const reviewers = extra.reviewers ?? [claude, gpt];
+		return new CouncilSession({
+			planTitle: "Reader Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: reviewers,
+			initialReviewers: reviewers,
+			streamFn,
+			codeReader,
+			maxReaderQueriesPerTurn: extra.maxReaderQueriesPerTurn,
+		});
+	}
+
+	function critiqueOf(session: CouncilSession, key: string): ReviewerTurnEntry {
+		const entry = session.entries.find((e): e is ReviewerTurnEntry => isReviewerTurnEntry(e) && e.reviewerKey === key && e.kind === "critique");
+		if (!entry) throw new Error(`no critique for ${key}`);
+		return entry;
+	}
+
+	it("lets a reviewer verify code before reporting and keeps the exchange in its history", async () => {
+		const { reader, queries } = makeFakeReader();
+		const { streamFn, calls } = makeMockStreamFn((model, context) => {
+			if (!readerAnswered(context)) {
+				return {
+					text: `Checking ${model.id}.`,
+					toolCalls: [{ name: "ask_codebase", arguments: { question: `Where is ${model.id} used?`, paths: ["src/index.ts"] } }],
+				};
+			}
+			return { text: `Grounded review from ${model.id}`, toolCalls: [reportPosition("NEEDS REVISION", [`Fix raised by ${model.id}`])] };
+		});
+		const session = newSession(streamFn, reader);
+
+		await session.startInitialCritiques();
+
+		const critique = critiqueOf(session, claude.key);
+		expect(critique.status).toBe("done");
+		expect(critique.readerQueryCount).toBe(1);
+		expect(critique.readerStatus).toBeUndefined();
+		expect(critique.text).toBe("Checking claude-3-7-sonnet.\n\nGrounded review from claude-3-7-sonnet");
+		expect(critique.position?.revisions.map(r => r.summary)).toEqual(["Fix raised by claude-3-7-sonnet"]);
+
+		const claudeCalls = calls.filter(c => c.model === claude.model);
+		expect(claudeCalls).toHaveLength(2);
+		expect(claudeCalls[0].context.systemPrompt?.[0]).toContain("`ask_codebase` tool (up to 3 calls per turn)");
+		expect(claudeCalls[1].context.tools?.map(t => t.name)).toEqual(["ask_codebase", "report_position"]);
+		expect(claudeCalls[1].context.messages.map(m => m.role)).toEqual(["user", "assistant", "toolResult"]);
+		expect(toolResultsIn(claudeCalls[1].context)).toMatchObject([
+			{ toolName: "ask_codebase", isError: false, content: [{ type: "text", text: "Reader: Where is claude-3-7-sonnet used?" }] },
+		]);
+
+		expect(queries.map(q => q.requesterLabel).sort()).toEqual([claude.label, gpt.label].sort());
+		expect(session.readerEntries.find(r => r.requesterKey === claude.key)).toMatchObject({
+			requesterKind: "reviewer",
+			requesterLabel: claude.label,
+			round: 1,
+			question: "Where is claude-3-7-sonnet used?",
+			paths: ["src/index.ts"],
+			status: "done",
+			answer: "Reader: Where is claude-3-7-sonnet used?",
+		});
+
+		await session.runDebateRound();
+		const claudeDebate = calls.find(c => c.model === claude.model && lastPrompt(c.context).includes("Council Debate"));
+		// the reader exchange stays in history so later rounds keep the evidence and every call keeps its result
+		expect(claudeDebate!.context.messages.map(m => m.role)).toEqual(["user", "assistant", "toolResult", "assistant", "toolResult", "user"]);
+	});
+
+	it("caps reader queries per turn, answers every extra call, then offers only report_position", async () => {
+		const { reader, queries } = makeFakeReader();
+		const ask = (n: number): MockToolCall => ({ name: "ask_codebase", arguments: { question: `check ${n}` } });
+		const { streamFn, calls } = makeMockStreamFn((_model, context) =>
+			context.tools?.some(t => t.name === "ask_codebase")
+				? { text: "Looking.", toolCalls: [ask(1), ask(2), ask(3)] }
+				: { text: "Review", toolCalls: [reportPosition("APPROVE")] },
+		);
+		const session = newSession(streamFn, reader, { reviewers: [claude], maxReaderQueriesPerTurn: 2 });
+
+		await session.startInitialCritiques();
+
+		expect(queries.map(q => q.question)).toEqual(["check 1", "check 2"]);
+		expect(calls).toHaveLength(2);
+		expect(calls[1].context.tools?.map(t => t.name)).toEqual(["report_position"]);
+		const results = toolResultsIn(calls[1].context);
+		expect(results.map(r => r.isError)).toEqual([false, false, true]);
+		expect(results[2].content).toEqual([
+			{
+				type: "text",
+				text: "Codebase reader query limit (2) reached for this turn. Write your review and call report_position using the evidence gathered so far.",
+			},
+		]);
+		const critique = critiqueOf(session, claude.key);
+		expect([critique.status, critique.readerQueryCount, critique.position?.verdict]).toEqual(["done", 2, "APPROVE"]);
+	});
+
+	it("turns a reader failure into an error tool result and still completes the review", async () => {
+		const { reader } = makeFakeReader(() => Promise.reject(new Error("reader crashed")));
+		const { streamFn, calls } = makeMockStreamFn((_model, context) =>
+			readerAnswered(context)
+				? { text: "Review from the plan text", toolCalls: [reportPosition("NEEDS REVISION", ["Verify the entry point"])] }
+				: { text: "", toolCalls: [{ name: "ask_codebase", arguments: { question: "entry point?" } }] },
+		);
+		const session = newSession(streamFn, reader, { reviewers: [claude] });
+
+		await session.startInitialCritiques();
+
+		const critique = critiqueOf(session, claude.key);
+		expect(critique.status).toBe("done");
+		expect(critique.position?.verdict).toBe("NEEDS REVISION");
+		const [result] = toolResultsIn(calls[1].context);
+		expect(result.isError).toBe(true);
+		expect(result.content).toEqual([
+			{
+				type: "text",
+				text: "Codebase reader error: reader crashed. Continue your review from the plan text and note any unverified codebase assumptions.",
+			},
+		]);
+		expect(session.readerEntries).toMatchObject([{ status: "error", errorMessage: "reader crashed" }]);
+	});
+
+	it("stops a reviewer waiting on the reader when the round is aborted", async () => {
+		const started = Promise.withResolvers<void>();
+		const { reader } = makeFakeReader(input => {
+			started.resolve();
+			const { promise, reject } = Promise.withResolvers<string>();
+			input.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+			return promise;
+		});
+		const { streamFn, calls } = makeMockStreamFn(() => ({ text: "", toolCalls: [{ name: "ask_codebase", arguments: { question: "slow?" } }] }));
+		const session = newSession(streamFn, reader, { reviewers: [claude] });
+
+		const critiques = session.startInitialCritiques();
+		await started.promise;
+		expect(critiqueOf(session, claude.key).readerStatus).toBe("reading");
+		session.abortActiveRound();
+		await critiques;
+
+		const critique = critiqueOf(session, claude.key);
+		expect([critique.status, critique.readerStatus]).toEqual(["aborted", undefined]);
+		expect(session.readerEntries.map(r => r.status)).toEqual(["aborted"]);
+		expect(calls).toHaveLength(1);
+		expect(session.isBusy()).toBe(false);
+	});
+
+	it("routes operator reader questions to the reader and feeds the answers into the next debate", async () => {
+		const { reader, queries } = makeFakeReader(input => `Answer: ${input.question}`);
+		const { streamFn, calls } = makeMockStreamFn(
+			scriptedCouncil((model, { peerIds }) => [reportPosition("NEEDS REVISION", [`Fix raised by ${model.id}`], peerIds.map(id => ({ id, stance: "agree" })))]),
+		);
+		const session = newSession(streamFn, reader);
+
+		await session.startInitialCritiques();
+		const reviewerCalls = calls.length;
+		// operator notes count only when posted after the reviewer's last turn finished
+		setSystemTime(new Date(Date.now() + 60_000));
+		try {
+			await session.askCouncil("@reader Where is resolvePlanReview called?");
+			await session.askCouncil("@scout Which tests cover it?");
+			await session.askCouncil("And the overlay?", READER_TARGET_KEY);
+		} finally {
+			setSystemTime();
+		}
+
+		expect(calls).toHaveLength(reviewerCalls);
+		expect(session.entries.some(e => e.kind === "user")).toBe(false);
+		expect(queries.map(q => [q.requesterLabel, q.question])).toEqual([
+			["Operator", "Where is resolvePlanReview called?"],
+			["Operator", "Which tests cover it?"],
+			["Operator", "And the overlay?"],
+		]);
+		expect(session.readerEntries.map(r => [r.requesterKind, r.status])).toEqual([
+			["operator", "done"],
+			["operator", "done"],
+			["operator", "done"],
+		]);
+
+		await session.runDebateRound();
+		const debatePrompt = lastPrompt(calls.find(c => c.model === claude.model && lastPrompt(c.context).includes("Council Debate"))!.context);
+		expect(debatePrompt).toContain(
+			"[Operator → Reader]: Where is resolvePlanReview called?\n[Reader]: Answer: Where is resolvePlanReview called?",
+		);
+		expect(debatePrompt).toContain("[Operator → Reader]: And the overlay?\n[Reader]: Answer: And the overlay?");
+	});
+
+	it("rejects reader questions when no reader is configured", async () => {
+		const { streamFn, calls } = makeMockStreamFn(() => ({ text: "review" }));
+		const session = newSession(streamFn, undefined);
+
+		await expect(session.askCouncil("@reader Where is X?")).rejects.toThrow("Codebase reader is disabled or unavailable.");
+		await expect(session.askCouncil("Where is X?", READER_TARGET_KEY)).rejects.toThrow("Codebase reader is disabled or unavailable.");
+		expect(calls).toHaveLength(0);
+		expect(session.isBusy()).toBe(false);
 	});
 });

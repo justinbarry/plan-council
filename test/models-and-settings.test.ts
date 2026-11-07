@@ -9,7 +9,7 @@ import {
 import { describe, expect, it } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionModelQuery } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
-import { modelKey, resolveCouncilRoster, resolveSynthesizer } from "../src/models";
+import { modelKey, resolveCouncilRoster, resolveReaderModel, resolveSynthesizer } from "../src/models";
 import { parsePlanCouncilSettings } from "../src/settings";
 
 function makeFakeModel(provider: string, id: string, family: string): Model {
@@ -95,6 +95,18 @@ describe("settings parser", () => {
 		expect(parsePlanCouncilSettings({ shortcut: "   " }).shortcut).toBe("ctrl+n");
 		expect(parsePlanCouncilSettings({ shortcut: "ctrl+p" }).shortcut).toBe("ctrl+p");
 	});
+
+	it("parses code reader settings and clamps the per-turn query budget", () => {
+		const defaults = parsePlanCouncilSettings({});
+		expect([defaults.enableCodeReader, defaults.readerModel, defaults.maxReaderQueriesPerTurn]).toEqual([true, undefined, 3]);
+		expect(parsePlanCouncilSettings({ enableCodeReader: false }).enableCodeReader).toBe(false);
+		expect(parsePlanCouncilSettings({ readerModel: "  @smol:low " }).readerModel).toBe("@smol:low");
+		expect(parsePlanCouncilSettings({ readerModel: "   " }).readerModel).toBeUndefined();
+		const budgets = [0, 99, "4", "bad", 2.6, Number.NaN].map(
+			raw => parsePlanCouncilSettings({ maxReaderQueriesPerTurn: raw }).maxReaderQueriesPerTurn,
+		);
+		expect(budgets).toEqual([1, 6, 4, 3, 3, 3]);
+	});
 });
 
 describe("model roster resolution", () => {
@@ -176,6 +188,31 @@ describe("model roster resolution", () => {
 		expect(resolveSynthesizer(query, settingsDefault, [])?.model.id).toBe("gemini-2.5-pro");
 	});
 
+	it("resolves the reader through @council_reader, @council-reader, @smol, @fast, @default, then the session model", () => {
+		const roleNames = ["council_reader", "council-reader", "smol", "fast", "default"];
+		const models = roleNames.map(role => makeFakeModel("test", `${role}-model`, role));
+		const settings = parsePlanCouncilSettings({});
+		for (let i = 0; i < roleNames.length; i++) {
+			const roles = Object.fromEntries(roleNames.slice(i).map((role, j) => [role, models[i + j]]));
+			const query = makeFakeModelQuery({ available: [claude, ...models], roles, current: claude });
+			expect(resolveReaderModel(query, settings, [])?.model).toBe(models[i]);
+		}
+
+		const reviewer = { key: modelKey(gpt4o), label: "gpt-4o (openai)", family: "gpt", model: gpt4o };
+		expect(resolveReaderModel(makeFakeModelQuery({ available: [claude], current: claude }), settings, [reviewer])).toEqual({
+			model: claude,
+		});
+		expect(resolveReaderModel(makeFakeModelQuery({ available: [gpt4o] }), settings, [reviewer])).toEqual({ model: gpt4o });
+		expect(resolveReaderModel(makeFakeModelQuery({ available: [] }), settings, [])).toBeUndefined();
+	});
+
+	it("prefers an explicit readerModel and falls back to the reader chain when it does not resolve", () => {
+		const smol = makeFakeModel("openai", "gpt-4o-mini", "gpt");
+		const query = makeFakeModelQuery({ available: [claude, gpt4o, smol], roles: { smol }, current: claude });
+		expect(resolveReaderModel(query, parsePlanCouncilSettings({ readerModel: "gpt-4o" }), [])?.model).toBe(gpt4o);
+		expect(resolveReaderModel(query, parsePlanCouncilSettings({ readerModel: "missing-model" }), [])?.model).toBe(smol);
+	});
+
 	it("prioritizes custom council roles and automatically adds @ prefix when resolving", () => {
 		const council1 = makeFakeModel("google", "gemini-2.5-flash", "gemini");
 		const council2 = makeFakeModel("openai", "gpt-4o", "openai");
@@ -255,6 +292,16 @@ describe("prompt renderers", () => {
 		expect(r1).toContain("File: `plans/feat.md`");
 		expect(r1).toContain(verbatimPlan);
 		expect(r1).toContain(verbatimCtx);
+	});
+
+	it("tells reviewers about ask_codebase only when a reader is available", () => {
+		expect(renderCritiqueSystem()).not.toContain("ask_codebase");
+		expect(renderCritiqueSystem({ hasCodeReader: true, maxReaderQueriesPerTurn: 4 })).toContain(
+			"`ask_codebase` tool (up to 4 calls per turn)",
+		);
+		const debate = { round: 2, peerCritiques: [{ reviewerLabel: "gpt-4o (openai)", critiqueText: "x" }] };
+		expect(renderDebateRebuttal(debate)).not.toContain("ask_codebase");
+		expect(renderDebateRebuttal({ ...debate, hasCodeReader: true })).toContain("verify the code with `ask_codebase`");
 	});
 
 	it("renders debate rebuttal preserving peer critiques verbatim", () => {

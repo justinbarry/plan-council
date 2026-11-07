@@ -6,14 +6,16 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { matchesKey, type KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
+import { CouncilCodeReader } from "./code-reader";
 import { CouncilSession, extractSessionGoalContext } from "./council-session";
-import { resolveCouncilRoster, resolveSynthesizer } from "./models";
+import { resolveCouncilRoster, resolveReaderModel, resolveSynthesizer } from "./models";
 import { type CouncilOverlayOutcome, PlanCouncilOverlay } from "./overlay";
 import { DEFAULT_PLAN_COUNCIL_SETTINGS, loadPlanCouncilSettings, type PlanCouncilSettings } from "./settings";
 
 export * from "./settings";
 export * from "./models";
 export * from "./council-session";
+export * from "./code-reader";
 export * from "./overlay";
 
 export default function planCouncilExtension(pi: ExtensionAPI): void {
@@ -71,8 +73,19 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 			currentSettings = await loadPlanCouncilSettings(ctx.cwd);
 			const roster = resolveCouncilRoster(ctx.models, currentSettings);
 			const synthesizer = resolveSynthesizer(ctx.models, currentSettings, roster.reviewers);
+			const readerSpec = currentSettings.enableCodeReader
+				? resolveReaderModel(ctx.models, currentSettings, roster.reviewers)
+				: undefined;
+			const warnings = [...roster.warnings];
+			if (currentSettings.enableCodeReader && !readerSpec) {
+				warnings.push("Codebase reader enabled, but no authenticated model is available for it.");
+			}
 
-			const sessionCacheKey = `${review.sessionId}:${review.planFilePath}:${Bun.hash(review.planContent)}`;
+			// toggling the reader, changing its model, or changing its per-turn cap rebuilds the cached council
+			const readerCacheKey = readerSpec
+				? `${readerSpec.model.provider}/${readerSpec.model.id}:${readerSpec.thinkingLevel ?? ""}:${currentSettings.maxReaderQueriesPerTurn}`
+				: "off";
+			const sessionCacheKey = `${review.sessionId}:${review.planFilePath}:${Bun.hash(review.planContent)}:${currentSettings.enableCodeReader}:${readerCacheKey}`;
 			let session: CouncilSession;
 
 			if (cachedCouncil && cachedCouncil.key === sessionCacheKey) {
@@ -97,6 +110,19 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 					sessionId: review.sessionId,
 					getApiKey: model =>
 						ctx.modelRegistry?.resolver ? ctx.modelRegistry.resolver(model, review.sessionId) : undefined,
+					codeReader: readerSpec
+						? new CouncilCodeReader({
+								cwd: ctx.cwd,
+								model: readerSpec.model,
+								thinkingLevel: readerSpec.thinkingLevel,
+								planTitle: review.title,
+								planFilePath: review.planFilePath,
+								sessionId: review.sessionId,
+								modelRegistry: ctx.modelRegistry,
+								localProtocolOptions: ctx.localProtocolOptions,
+							})
+						: undefined,
+					maxReaderQueriesPerTurn: currentSettings.maxReaderQueriesPerTurn,
 				});
 
 				reportCouncilWork(session);
@@ -118,7 +144,7 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 							reviewOptions: review.options,
 							synthesizerModel: synthesizer?.model,
 							synthesizerThinkingLevel: synthesizer?.thinkingLevel,
-							warnings: roster.warnings,
+							warnings,
 							autoProceed,
 							autoDebate: currentSettings.autoDebate,
 							maxDebateRounds: currentSettings.maxDebateRounds,

@@ -25,7 +25,7 @@ Peer reviewers have reviewed the plan. Examine their assessments below:
 ---
 ### Instructions for Rebuttal
 1. Compare your earlier review with the peer critiques above.
-2. Directly address disagreements: identify where a peer caught a genuine risk you missed, or where a peer's objection is mistaken or ungrounded.
+2. Directly address disagreements: identify where a peer caught a genuine risk you missed, or where a peer's objection is mistaken or ungrounded.{{#if hasCodeReader}} When peers dispute existing file contents, signatures, or callsites, verify the code with `ask_codebase` instead of speculating.{{/if}}
 3. Retract any of your own earlier objections if refuted or addressed.
 4. Conclude with your updated assessment:
    - State whether your verdict is still `APPROVE`, `NEEDS REVISION`, or `BLOCK`.

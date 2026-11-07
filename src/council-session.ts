@@ -1,8 +1,25 @@
-import type { ApiKey, AssistantMessage, AssistantMessageEvent, Context, Message, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
-import { streamSimple } from "@oh-my-pi/pi-ai";
+import type {
+	ApiKey,
+	AssistantMessage,
+	AssistantMessageEvent,
+	Context,
+	Message,
+	Model,
+	SimpleStreamOptions,
+	ToolCall,
+	ToolResultMessage,
+} from "@oh-my-pi/pi-ai";
+import { streamSimple, validateToolArguments } from "@oh-my-pi/pi-ai";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent";
 import { replaceTabs } from "@oh-my-pi/pi-tui";
 import { concreteThinkingLevel, shouldDisableReasoning, toReasoningEffort, type ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import {
+	ASK_CODEBASE_TOOL,
+	ASK_CODEBASE_TOOL_NAME,
+	type askCodebaseSchema,
+	type CodebaseReader,
+	type CodeReaderQueryInput,
+} from "./code-reader";
 import type { ReviewerMember } from "./models";
 import {
 	computeConvergence,
@@ -15,6 +32,7 @@ import {
 	type ReviewerPosition,
 	type RevisionItem,
 	shouldStartDebate,
+	validateReportedPosition,
 } from "./position";
 import {
 	renderCritiqueRound,
@@ -42,6 +60,10 @@ export type CouncilTurnEntry =
 			positionError?: string;
 			startedAt: number;
 			finishedAt?: number;
+			/** the turn is waiting on the codebase reader */
+			readerStatus?: "queued" | "reading";
+			/** ask_codebase queries this turn has made */
+			readerQueryCount?: number;
 	  }
 	| {
 			id: string;
@@ -70,10 +92,44 @@ export function isReviewerTurnEntry(e: CouncilTurnEntry): e is ReviewerTurnEntry
 	return e.kind === "critique" || e.kind === "rebuttal" || e.kind === "reply";
 }
 
+/** composer target key that routes an operator question to the codebase reader */
+export const READER_TARGET_KEY = "@reader";
+
+/** operator questions wait in the reader's queue behind reviewer checks, so the budget covers both */
+const OPERATOR_READER_TIMEOUT_MS = 90_000;
+
+export interface ReaderTurnEntry {
+	id: string;
+	round: number;
+	requesterKind: "reviewer" | "operator";
+	requesterKey?: string;
+	requesterLabel: string;
+	question: string;
+	paths?: string[];
+	status: "queued" | "reading" | "done" | "error" | "aborted";
+	activeTool?: string;
+	answer: string;
+	cached?: boolean;
+	errorMessage?: string;
+	startedAt: number;
+	finishedAt?: number;
+}
+
 function createUserMessage(content: string): Message {
 	return {
 		role: "user",
 		content,
+		timestamp: Date.now(),
+	};
+}
+
+function createToolResult(block: ToolCall, text: string, isError: boolean): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId: block.id,
+		toolName: block.name,
+		content: [{ type: "text", text }],
+		isError,
 		timestamp: Date.now(),
 	};
 }
@@ -94,6 +150,9 @@ export interface CouncilSessionOptions {
 	streamFn?: ModelStreamFn;
 	getApiKey?: (model: Model) => ApiKey | Promise<ApiKey | undefined> | undefined;
 	sessionId?: string;
+	/** shared read-only codebase subagent reviewers and the operator may query */
+	codeReader?: CodebaseReader;
+	maxReaderQueriesPerTurn?: number;
 }
 
 export function extractSessionGoalContext(entries: readonly SessionEntry[], maxChars = 2000): string | undefined {
@@ -152,6 +211,9 @@ export class CouncilSession {
 	#sessionId?: string;
 	/** the running auto pipeline; abortActiveRound stops it so it cannot continue after the overlay closes */
 	#autoRun?: { stopped: boolean };
+	#codeReader?: CodebaseReader;
+	#maxReaderQueriesPerTurn: number;
+	#readerEntries: ReaderTurnEntry[] = [];
 
 	/** preserve reviewer request options when forwarding to the native model stream */
 	constructor(options: CouncilSessionOptions) {
@@ -163,6 +225,8 @@ export class CouncilSession {
 		this.#activeReviewers = [...options.initialReviewers];
 		this.#getApiKey = options.getApiKey;
 		this.#sessionId = options.sessionId;
+		this.#codeReader = options.codeReader;
+		this.#maxReaderQueriesPerTurn = Math.min(6, Math.max(1, Math.round(options.maxReaderQueriesPerTurn ?? 3)));
 
 		this.#streamFn =
 			options.streamFn ??
@@ -207,6 +271,18 @@ export class CouncilSession {
 
 	get latestSynthesis(): (CouncilTurnEntry & { kind: "synthesis" }) | undefined {
 		return this.#latestSynthesis;
+	}
+
+	get hasCodeReader(): boolean {
+		return Boolean(this.#codeReader);
+	}
+
+	get readerModelLabel(): string | undefined {
+		return this.#codeReader?.modelLabel;
+	}
+
+	get readerEntries(): readonly ReaderTurnEntry[] {
+		return this.#readerEntries;
 	}
 
 	isBusy(): boolean {
@@ -262,7 +338,6 @@ export class CouncilSession {
 		const controller = this.#beginRound();
 		this.#emitChange();
 
-		const systemPrompt = renderCritiqueSystem();
 		const userPrompt = renderCritiqueRound({
 			round: 1,
 			planTitle: this.#planTitle,
@@ -272,7 +347,7 @@ export class CouncilSession {
 		});
 
 		const tasks = reviewersToRun.map(async reviewer => {
-			const entry: CouncilTurnEntry = {
+			const entry: ReviewerTurnEntry = {
 				id: crypto.randomUUID(),
 				kind: "critique",
 				round: 1,
@@ -284,74 +359,15 @@ export class CouncilSession {
 			};
 			this.#entries.push(entry);
 			this.#emitChange();
-
-			const timeoutSignal = AbortSignal.timeout(120_000);
-			const combinedSignal = AbortSignal.any([controller.signal, timeoutSignal]);
-
-			try {
-				const apiKey = this.#getApiKey ? await this.#getApiKey(reviewer.model) : undefined;
-				const context: Context = {
-					systemPrompt: [systemPrompt],
-					messages: [createUserMessage(userPrompt)],
-					tools: [REPORT_POSITION_TOOL],
-				};
-
-				const level = concreteThinkingLevel(reviewer.thinkingLevel);
-				const stream = this.#streamFn(reviewer.model, context, {
-					signal: combinedSignal,
-					apiKey,
-					reasoning: toReasoningEffort(level),
-					disableReasoning: shouldDisableReasoning(level),
-				});
-				for await (const event of stream) {
-					if (event.type === "text_delta") {
-						entry.text += event.delta;
-						this.#emitChange();
-					}
-				}
-
-				const msg = await stream.result();
-				if (combinedSignal.aborted || msg.stopReason === "aborted") {
-					entry.status = "aborted";
-				} else if (msg.stopReason === "error") {
-					entry.status = "error";
-					entry.errorMessage = msg.errorMessage || "Model request failed";
-				} else {
-					if (!entry.text && msg.content) {
-						entry.text = msg.content
-							.filter(c => c.type === "text")
-							.map(c => c.text)
-							.join("");
-					}
-					const report = await this.#collectPosition(reviewer, context, msg, [], {
-						signal: combinedSignal,
-						apiKey,
-						force: true,
-					});
-					// abortActiveRound marks streaming entries aborted while a report follow-up runs
-					if (entry.status === "streaming") {
-						entry.status = "done";
-						entry.position = report.position;
-						entry.positionError = report.positionError;
-						let history = this.#histories.get(reviewer.key);
-						if (!history) {
-							history = [];
-							this.#histories.set(reviewer.key, history);
-						}
-						history.push(createUserMessage(userPrompt), ...report.messages);
-					}
-				}
-			} catch (err) {
-				if (combinedSignal.aborted) {
-					entry.status = "aborted";
-				} else {
-					entry.status = "error";
-					entry.errorMessage = err instanceof Error ? err.message : String(err);
-				}
-			} finally {
-				entry.finishedAt = Date.now();
-				this.#emitChange();
-			}
+			await this.#runReviewerTurn({
+				reviewer,
+				entry,
+				signal: controller.signal,
+				baseMessages: [],
+				promptText: userPrompt,
+				promptedItemIds: [],
+				forcePosition: true,
+			});
 		});
 
 		try {
@@ -416,12 +432,15 @@ export class CouncilSession {
 			const recentUserMessages = this.#entries.filter(
 				(e): e is CouncilTurnEntry & { kind: "user" } => e.kind === "user" && e.createdAt > lastTurnTime,
 			);
-			let operatorNotes: string | undefined;
-			if (recentUserMessages.length > 0) {
-				operatorNotes = recentUserMessages
-					.map(u => (u.targetLabel ? `[To ${u.targetLabel}]: ${u.text}` : u.text))
-					.join("\n\n");
-			}
+			// operator codebase checks completed since the reviewer's last turn travel with the operator guidance
+			const recentReaderAnswers = this.#readerEntries.filter(
+				r => r.requesterKind === "operator" && r.status === "done" && (r.finishedAt ?? 0) > lastTurnTime,
+			);
+			const notes = [
+				...recentUserMessages.map(u => (u.targetLabel ? `[To ${u.targetLabel}]: ${u.text}` : u.text)),
+				...recentReaderAnswers.map(r => `[Operator → Reader]: ${r.question}\n[Reader]: ${r.answer}`),
+			];
+			const operatorNotes = notes.length > 0 ? notes.join("\n\n") : undefined;
 
 			const peerItems = this.#peerItems(reviewer.key);
 			const promptedItemIds = peerItems.map(i => i.id);
@@ -430,6 +449,7 @@ export class CouncilSession {
 				peerCritiques,
 				peerItems,
 				operatorNotes,
+				hasCodeReader: Boolean(this.#codeReader),
 			});
 
 			// Per-reviewer history setup
@@ -448,7 +468,7 @@ export class CouncilSession {
 				history.push(createUserMessage(initialUserPrompt));
 			}
 
-			const entry: CouncilTurnEntry = {
+			const entry: ReviewerTurnEntry = {
 				id: crypto.randomUUID(),
 				kind: "rebuttal",
 				round: roundNum,
@@ -460,69 +480,15 @@ export class CouncilSession {
 			};
 			this.#entries.push(entry);
 			this.#emitChange();
-
-			const timeoutSignal = AbortSignal.timeout(120_000);
-			const combinedSignal = AbortSignal.any([controller.signal, timeoutSignal]);
-
-			try {
-				const apiKey = this.#getApiKey ? await this.#getApiKey(reviewer.model) : undefined;
-				const context: Context = {
-					systemPrompt: [renderCritiqueSystem()],
-					messages: [...history, createUserMessage(promptText)],
-					tools: [REPORT_POSITION_TOOL],
-				};
-
-				const level = concreteThinkingLevel(reviewer.thinkingLevel);
-				const stream = this.#streamFn(reviewer.model, context, {
-					signal: combinedSignal,
-					apiKey,
-					reasoning: toReasoningEffort(level),
-					disableReasoning: shouldDisableReasoning(level),
-				});
-				for await (const event of stream) {
-					if (event.type === "text_delta") {
-						entry.text += event.delta;
-						this.#emitChange();
-					}
-				}
-
-				const msg = await stream.result();
-				if (combinedSignal.aborted || msg.stopReason === "aborted") {
-					entry.status = "aborted";
-				} else if (msg.stopReason === "error") {
-					entry.status = "error";
-					entry.errorMessage = msg.errorMessage || "Model request failed";
-				} else {
-					if (!entry.text && msg.content) {
-						entry.text = msg.content
-							.filter(c => c.type === "text")
-							.map(c => c.text)
-							.join("");
-					}
-					const report = await this.#collectPosition(reviewer, context, msg, promptedItemIds, {
-						signal: combinedSignal,
-						apiKey,
-						force: true,
-					});
-					// abortActiveRound marks streaming entries aborted while a report follow-up runs
-					if (entry.status === "streaming") {
-						entry.status = "done";
-						entry.position = report.position;
-						entry.positionError = report.positionError;
-						history.push(createUserMessage(promptText), ...report.messages);
-					}
-				}
-			} catch (err) {
-				if (combinedSignal.aborted) {
-					entry.status = "aborted";
-				} else {
-					entry.status = "error";
-					entry.errorMessage = err instanceof Error ? err.message : String(err);
-				}
-			} finally {
-				entry.finishedAt = Date.now();
-				this.#emitChange();
-			}
+			await this.#runReviewerTurn({
+				reviewer,
+				entry,
+				signal: controller.signal,
+				baseMessages: history,
+				promptText,
+				promptedItemIds,
+				forcePosition: true,
+			});
 		});
 
 		try {
@@ -542,6 +508,7 @@ export class CouncilSession {
 		const match = rawInput.match(/^@([a-zA-Z0-9_\-./]+)\s*(.*)$/s);
 		let targetReviewer: ReviewerMember | undefined;
 		let userText = rawInput.trim();
+		let askReader = false;
 
 		const allKnownReviewers = [...this.#availableReviewers];
 		for (const r of this.#activeReviewers) {
@@ -564,6 +531,8 @@ export class CouncilSession {
 
 			if (exact) {
 				targetReviewer = exact;
+			} else if (token === "reader" || token === "scout") {
+				askReader = true;
 			} else {
 				// Substring match
 				const candidates = allKnownReviewers.filter(
@@ -579,12 +548,19 @@ export class CouncilSession {
 				}
 				targetReviewer = candidates[0];
 			}
+		} else if (defaultTargetKey === READER_TARGET_KEY) {
+			askReader = true;
 		} else if (defaultTargetKey) {
 			targetReviewer = allKnownReviewers.find(r => r.key === defaultTargetKey);
 		}
 
 		if (!userText) {
 			throw new Error("Please enter a question or comment.");
+		}
+
+		if (askReader) {
+			await this.#askCodeReader(userText);
+			return;
 		}
 
 		const targetKey = targetReviewer?.key;
@@ -627,7 +603,7 @@ export class CouncilSession {
 				history.push(createUserMessage(initialUserPrompt));
 			}
 
-			const entry: CouncilTurnEntry = {
+			const entry: ReviewerTurnEntry = {
 				id: crypto.randomUUID(),
 				kind: "reply",
 				round: this.#round,
@@ -639,28 +615,150 @@ export class CouncilSession {
 			};
 			this.#entries.push(entry);
 			this.#emitChange();
+			// replies report only when something changed, so a missing report is not forced
+			await this.#runReviewerTurn({
+				reviewer,
+				entry,
+				signal: controller.signal,
+				baseMessages: history,
+				promptText,
+				promptedItemIds,
+				forcePosition: false,
+			});
+		});
 
-			const timeoutSignal = AbortSignal.timeout(120_000);
-			const combinedSignal = AbortSignal.any([controller.signal, timeoutSignal]);
+		try {
+			await Promise.allSettled(tasks);
+		} finally {
+			this.#endRound(controller);
+			this.#emitChange();
+		}
+	}
 
-			try {
-				const apiKey = this.#getApiKey ? await this.#getApiKey(reviewer.model) : undefined;
+	/** answer an operator question with the shared reader; the exchange lives in the Reader tab, not the council log */
+	async #askCodeReader(question: string): Promise<void> {
+		const reader = this.#codeReader;
+		if (!reader) {
+			throw new Error("Codebase reader is disabled or unavailable.");
+		}
+
+		const controller = this.#beginRound();
+		const readerEntry: ReaderTurnEntry = {
+			id: crypto.randomUUID(),
+			round: this.#round,
+			requesterKind: "operator",
+			requesterLabel: "Operator",
+			question,
+			status: "queued",
+			answer: "",
+			startedAt: Date.now(),
+		};
+		this.#readerEntries.push(readerEntry);
+		this.#emitChange();
+
+		const timeoutSignal = AbortSignal.timeout(OPERATOR_READER_TIMEOUT_MS);
+		try {
+			const result = await reader.query({
+				requesterLabel: readerEntry.requesterLabel,
+				question,
+				signal: AbortSignal.any([controller.signal, timeoutSignal]),
+				...this.#readerProgress(readerEntry),
+			});
+			readerEntry.status = "done";
+			readerEntry.answer = result.answer;
+			readerEntry.cached = result.cached;
+		} catch (err) {
+			if (controller.signal.aborted) {
+				readerEntry.status = "aborted";
+			} else {
+				readerEntry.status = "error";
+				readerEntry.errorMessage = timeoutSignal.aborted
+					? `Codebase reader query timed out after ${OPERATOR_READER_TIMEOUT_MS / 1000}s`
+					: err instanceof Error
+						? err.message
+						: String(err);
+			}
+		} finally {
+			readerEntry.activeTool = undefined;
+			readerEntry.finishedAt = Date.now();
+			this.#endRound(controller);
+			this.#emitChange();
+		}
+	}
+
+	/** live reader progress for the Reader tab; a reviewer turn mirrors the queued/reading status for its badge */
+	#readerProgress(
+		readerEntry: ReaderTurnEntry,
+		turnEntry?: ReviewerTurnEntry,
+	): Pick<CodeReaderQueryInput, "onStatusChange" | "onToolActivity" | "onTextDelta"> {
+		return {
+			onStatusChange: status => {
+				readerEntry.status = status;
+				if (turnEntry) turnEntry.readerStatus = status;
+				this.#emitChange();
+			},
+			onToolActivity: toolName => {
+				readerEntry.activeTool = toolName;
+				this.#emitChange();
+			},
+			onTextDelta: (_delta, snapshot) => {
+				readerEntry.answer = snapshot;
+				this.#emitChange();
+			},
+		};
+	}
+
+	/**
+	 * stream one reviewer turn: a step that calls ask_codebase gets the reader's answers as tool results and the
+	 * turn continues; the first step without reader calls is finalized through #collectPosition
+	 */
+	async #runReviewerTurn(turn: {
+		reviewer: ReviewerMember;
+		entry: ReviewerTurnEntry;
+		signal: AbortSignal;
+		baseMessages: readonly Message[];
+		promptText: string;
+		promptedItemIds: string[];
+		forcePosition: boolean;
+	}): Promise<void> {
+		const { reviewer, entry } = turn;
+		const reader = this.#codeReader;
+		const maxQueries = this.#maxReaderQueriesPerTurn;
+		// reader round trips share the turn budget, so reader-enabled turns get more of it
+		const combinedSignal = AbortSignal.any([turn.signal, AbortSignal.timeout(reader ? 240_000 : 120_000)]);
+		const systemPrompt = renderCritiqueSystem({ hasCodeReader: Boolean(reader), maxReaderQueriesPerTurn: maxQueries });
+		const turnPrompt = createUserMessage(turn.promptText);
+		const stepMessages: Message[] = [];
+		let queriesUsed = 0;
+		// invalid ask_codebase calls spend no query budget, so reader steps are capped separately
+		let readerSteps = 0;
+		// a report_position sent alongside ask_codebase stands if the final step does not report again
+		let fallbackPosition: ReviewerPosition | undefined;
+
+		try {
+			const apiKey = this.#getApiKey ? await this.#getApiKey(reviewer.model) : undefined;
+			const level = concreteThinkingLevel(reviewer.thinkingLevel);
+
+			while (!combinedSignal.aborted) {
+				const canQueryReader = reader !== undefined && queriesUsed < maxQueries && readerSteps <= maxQueries;
 				const context: Context = {
-					systemPrompt: [renderCritiqueSystem()],
-					messages: [...history, createUserMessage(promptText)],
-					tools: [REPORT_POSITION_TOOL],
+					systemPrompt: [systemPrompt],
+					messages: [...turn.baseMessages, turnPrompt, ...stepMessages],
+					tools: canQueryReader ? [ASK_CODEBASE_TOOL, REPORT_POSITION_TOOL] : [REPORT_POSITION_TOOL],
 				};
-
-				const level = concreteThinkingLevel(reviewer.thinkingLevel);
 				const stream = this.#streamFn(reviewer.model, context, {
 					signal: combinedSignal,
 					apiKey,
 					reasoning: toReasoningEffort(level),
 					disableReasoning: shouldDisableReasoning(level),
 				});
+				// prose from a continuation step starts its own paragraph
+				const separator = stepMessages.length > 0 && entry.text.trim() && !entry.text.endsWith("\n\n") ? "\n\n" : "";
+				let stepText = "";
 				for await (const event of stream) {
-					if (event.type === "text_delta") {
-						entry.text += event.delta;
+					if (event.type === "text_delta" && event.delta) {
+						entry.text += (stepText ? "" : separator) + event.delta;
+						stepText += event.delta;
 						this.#emitChange();
 					}
 				}
@@ -668,44 +766,160 @@ export class CouncilSession {
 				const msg = await stream.result();
 				if (combinedSignal.aborted || msg.stopReason === "aborted") {
 					entry.status = "aborted";
-				} else if (msg.stopReason === "error") {
+					return;
+				}
+				if (msg.stopReason === "error") {
 					entry.status = "error";
 					entry.errorMessage = msg.errorMessage || "Model request failed";
-				} else {
-					entry.status = "done";
-					if (!entry.text && msg.content) {
-						entry.text = msg.content
-							.filter(c => c.type === "text")
-							.map(c => c.text)
-							.join("");
-					}
-					// replies report only when something changed, so a missing report is not forced
-					const report = await this.#collectPosition(reviewer, context, msg, promptedItemIds, {
+					return;
+				}
+				if (!stepText) {
+					const text = msg.content
+						.filter(c => c.type === "text")
+						.map(c => c.text)
+						.join("");
+					if (text) entry.text += separator + text;
+				}
+
+				if (!canQueryReader || !msg.content.some(b => b.type === "toolCall" && b.name === ASK_CODEBASE_TOOL_NAME)) {
+					const report = await this.#collectPosition(reviewer, context, msg, turn.promptedItemIds, {
 						signal: combinedSignal,
 						apiKey,
-						force: false,
+						force: turn.forcePosition,
 					});
-					entry.position = report.position;
-					entry.positionError = report.positionError;
-					history.push(createUserMessage(promptText), ...report.messages);
+					// abortActiveRound marks streaming entries aborted while a report follow-up runs
+					if (entry.status === "streaming") {
+						entry.status = "done";
+						entry.position = report.position ?? fallbackPosition;
+						entry.positionError = report.position || !fallbackPosition ? report.positionError : undefined;
+						let history = this.#histories.get(reviewer.key);
+						if (!history) {
+							history = [];
+							this.#histories.set(reviewer.key, history);
+						}
+						history.push(turnPrompt, ...stepMessages, ...report.messages);
+					}
+					return;
 				}
-			} catch (err) {
-				if (combinedSignal.aborted) {
-					entry.status = "aborted";
-				} else {
-					entry.status = "error";
-					entry.errorMessage = err instanceof Error ? err.message : String(err);
+
+				readerSteps++;
+				// providers reject unanswered calls, so every call in the step gets a result
+				const toolResults: ToolResultMessage[] = [];
+				for (const block of msg.content) {
+					if (block.type !== "toolCall") continue;
+
+					if (block.name === REPORT_POSITION_TOOL_NAME) {
+						try {
+							fallbackPosition = validateReportedPosition(block, reviewer.key, turn.promptedItemIds);
+							toolResults.push(
+								createToolResult(
+									block,
+									`Codebase results attached; incorporate them into your review and call ${REPORT_POSITION_TOOL_NAME} again with your final verdict.`,
+									false,
+								),
+							);
+						} catch (err) {
+							toolResults.push(createToolResult(block, err instanceof Error ? err.message : String(err), true));
+						}
+						continue;
+					}
+					if (block.name !== ASK_CODEBASE_TOOL_NAME) {
+						toolResults.push(
+							createToolResult(
+								block,
+								`Unknown tool "${block.name}"; available tools: ${ASK_CODEBASE_TOOL_NAME}, ${REPORT_POSITION_TOOL_NAME}.`,
+								true,
+							),
+						);
+						continue;
+					}
+
+					let args: typeof askCodebaseSchema.infer;
+					try {
+						args = validateToolArguments(ASK_CODEBASE_TOOL, block) as typeof askCodebaseSchema.infer;
+					} catch (err) {
+						toolResults.push(createToolResult(block, err instanceof Error ? err.message : String(err), true));
+						continue;
+					}
+					if (queriesUsed >= maxQueries) {
+						toolResults.push(
+							createToolResult(
+								block,
+								`Codebase reader query limit (${maxQueries}) reached for this turn. Write your review and call ${REPORT_POSITION_TOOL_NAME} using the evidence gathered so far.`,
+								true,
+							),
+						);
+						continue;
+					}
+
+					queriesUsed++;
+					entry.readerQueryCount = queriesUsed;
+					const readerEntry: ReaderTurnEntry = {
+						id: crypto.randomUUID(),
+						round: entry.round,
+						requesterKind: "reviewer",
+						requesterKey: reviewer.key,
+						requesterLabel: reviewer.label,
+						question: args.question,
+						paths: args.paths,
+						status: "queued",
+						answer: "",
+						startedAt: Date.now(),
+					};
+					this.#readerEntries.push(readerEntry);
+					entry.readerStatus = "queued";
+					this.#emitChange();
+					try {
+						const result = await reader.query({
+							requesterLabel: reviewer.label,
+							question: args.question,
+							paths: args.paths,
+							signal: combinedSignal,
+							...this.#readerProgress(readerEntry, entry),
+						});
+						readerEntry.status = "done";
+						readerEntry.answer = result.answer;
+						readerEntry.cached = result.cached;
+						toolResults.push(createToolResult(block, result.answer, false));
+					} catch (err) {
+						if (combinedSignal.aborted) {
+							readerEntry.status = "aborted";
+							break;
+						}
+						const message = err instanceof Error ? err.message : String(err);
+						readerEntry.status = "error";
+						readerEntry.errorMessage = message;
+						// a reader failure degrades the review to plan-text evidence instead of failing the turn
+						toolResults.push(
+							createToolResult(
+								block,
+								`Codebase reader error: ${message}. Continue your review from the plan text and note any unverified codebase assumptions.`,
+								true,
+							),
+						);
+					} finally {
+						readerEntry.activeTool = undefined;
+						readerEntry.finishedAt = Date.now();
+						this.#emitChange();
+					}
 				}
-			} finally {
-				entry.finishedAt = Date.now();
+
+				entry.readerStatus = undefined;
+				if (combinedSignal.aborted) break;
+				stepMessages.push(msg, ...toolResults);
 				this.#emitChange();
 			}
-		});
-
-		try {
-			await Promise.allSettled(tasks);
+			entry.status = "aborted";
+		} catch (err) {
+			if (combinedSignal.aborted) {
+				entry.status = "aborted";
+			} else {
+				entry.status = "error";
+				entry.errorMessage = err instanceof Error ? err.message : String(err);
+			}
 		} finally {
-			this.#endRound(controller);
+			entry.readerStatus = undefined;
+			entry.finishedAt = Date.now();
 			this.#emitChange();
 		}
 	}
@@ -834,7 +1048,9 @@ export class CouncilSession {
 		promptedItemIds: string[],
 		request: { signal: AbortSignal; apiKey: ApiKey | undefined; force: boolean },
 	): Promise<{ position?: ReviewerPosition; positionError?: string; messages: Message[] }> {
-		const first = parseReviewerPosition(msg, reviewer.key, promptedItemIds);
+		// the error for an unknown call names the tools the turn actually offered
+		const offeredTools = context.tools?.map(t => t.name);
+		const first = parseReviewerPosition(msg, reviewer.key, promptedItemIds, offeredTools);
 		const messages: Message[] = [msg, ...first.toolResults];
 		if (first.position || !request.force || request.signal.aborted) {
 			return { position: first.position, positionError: first.positionError, messages };
@@ -861,7 +1077,7 @@ export class CouncilSession {
 			if (followUp.stopReason === "error" || followUp.stopReason === "aborted") {
 				return { positionError: first.positionError, messages };
 			}
-			const second = parseReviewerPosition(followUp, reviewer.key, promptedItemIds);
+			const second = parseReviewerPosition(followUp, reviewer.key, promptedItemIds, offeredTools);
 			return {
 				position: second.position,
 				positionError: second.positionError,
@@ -982,9 +1198,19 @@ export class CouncilSession {
 			this.#roundAbortController.abort();
 		}
 		for (const entry of this.#entries) {
+			if (isReviewerTurnEntry(entry)) {
+				entry.readerStatus = undefined;
+			}
 			if (entry.kind !== "user" && entry.status === "streaming") {
 				entry.status = "aborted";
 				entry.finishedAt = Date.now();
+			}
+		}
+		for (const readerEntry of this.#readerEntries) {
+			if (readerEntry.status === "queued" || readerEntry.status === "reading") {
+				readerEntry.status = "aborted";
+				readerEntry.activeTool = undefined;
+				readerEntry.finishedAt = Date.now();
 			}
 		}
 		this.#busy = false;
@@ -993,6 +1219,7 @@ export class CouncilSession {
 
 	dispose(): void {
 		this.abortActiveRound();
+		void this.#codeReader?.dispose();
 		this.#listeners.clear();
 	}
 }

@@ -13,6 +13,9 @@ export interface PlanCouncilSettings {
 	synthesizerModel: string | undefined;
 	shortcut: string;
 	includeSessionContext: boolean;
+	enableCodeReader: boolean;
+	readerModel: string | undefined;
+	maxReaderQueriesPerTurn: number;
 }
 
 export const DEFAULT_PLAN_COUNCIL_SETTINGS: PlanCouncilSettings = {
@@ -25,6 +28,9 @@ export const DEFAULT_PLAN_COUNCIL_SETTINGS: PlanCouncilSettings = {
 	synthesizerModel: undefined,
 	shortcut: "ctrl+n",
 	includeSessionContext: true,
+	enableCodeReader: true,
+	readerModel: undefined,
+	maxReaderQueriesPerTurn: 3,
 };
 
 export function parsePlanCouncilSettings(raw: Record<string, unknown>): PlanCouncilSettings {
@@ -79,6 +85,24 @@ export function parsePlanCouncilSettings(raw: Record<string, unknown>): PlanCoun
 			? raw.includeSessionContext
 			: DEFAULT_PLAN_COUNCIL_SETTINGS.includeSessionContext;
 
+	const enableCodeReader =
+		typeof raw.enableCodeReader === "boolean" ? raw.enableCodeReader : DEFAULT_PLAN_COUNCIL_SETTINGS.enableCodeReader;
+
+	const readerModel =
+		typeof raw.readerModel === "string" && raw.readerModel.trim()
+			? raw.readerModel.trim()
+			: DEFAULT_PLAN_COUNCIL_SETTINGS.readerModel;
+
+	let maxReaderQueriesPerTurn = DEFAULT_PLAN_COUNCIL_SETTINGS.maxReaderQueriesPerTurn;
+	if (typeof raw.maxReaderQueriesPerTurn === "number" && Number.isFinite(raw.maxReaderQueriesPerTurn)) {
+		maxReaderQueriesPerTurn = Math.min(6, Math.max(1, Math.round(raw.maxReaderQueriesPerTurn)));
+	} else if (typeof raw.maxReaderQueriesPerTurn === "string") {
+		const parsed = Number.parseInt(raw.maxReaderQueriesPerTurn, 10);
+		if (!Number.isNaN(parsed)) {
+			maxReaderQueriesPerTurn = Math.min(6, Math.max(1, parsed));
+		}
+	}
+
 	return {
 		autoStart,
 		autoProceed,
@@ -89,6 +113,9 @@ export function parsePlanCouncilSettings(raw: Record<string, unknown>): PlanCoun
 		synthesizerModel,
 		shortcut,
 		includeSessionContext,
+		enableCodeReader,
+		readerModel,
+		maxReaderQueriesPerTurn,
 	};
 }
 

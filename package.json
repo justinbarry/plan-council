@@ -81,6 +81,24 @@
 				"type": "boolean",
 				"default": true,
 				"description": "Include user prompts from the active session branch alongside the plan markdown"
+			},
+			"enableCodeReader": {
+				"type": "boolean",
+				"default": true,
+				"description": "Allow council reviewers and @reader to query a shared read-only codebase subagent"
+			},
+			"readerModel": {
+				"type": "string",
+				"default": "",
+				"description": "Model selector or role name (optional :effort suffix) for the codebase reader subagent (empty uses @council_reader, @smol, @fast, then @default)"
+			},
+			"maxReaderQueriesPerTurn": {
+				"type": "number",
+				"default": 3,
+				"min": 1,
+				"max": 6,
+				"step": 1,
+				"description": "Maximum ask_codebase tool calls a reviewer may make per turn"
 			}
 		}
 	}

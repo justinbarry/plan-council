@@ -60,6 +60,7 @@ export const COUNCIL_ROLE_CHAINS = {
 	council2: ["@council2", "@smol", "@fast"],
 	council3: ["@council3", "@slow", "@advisor", "@reasoning"],
 	synthesizer: ["@council_synthesizer", "@council-synth", "@plan", "@slow", "@default"],
+	reader: ["@council_reader", "@council-reader", "@smol", "@fast", "@default"],
 };
 
 /** resolve a council role through its existing model fallback chain */
@@ -292,6 +293,45 @@ export function resolveSynthesizer(
 	}
 
 	// the session model and reviewers carry no level for synthesis
+	const model = models.current() ?? activeReviewers[0]?.model;
+	return model ? { model } : undefined;
+}
+
+export interface ResolvedReaderModel {
+	model: Model;
+	thinkingLevel?: ConfiguredThinkingLevel;
+}
+
+/** the shared codebase reader and its level: an explicit suffix, else the level its role configures */
+export function resolveReaderModel(
+	models: ExtensionModelQuery,
+	settings: PlanCouncilSettings,
+	activeReviewers: readonly ReviewerMember[],
+): ResolvedReaderModel | undefined {
+	const spec = settings.readerModel?.trim();
+	if (spec) {
+		const { base, level } = splitThinkingSuffix(spec, -1, MAX_THINKING_SUFFIX_OPTIONS);
+		// resolve the full selector first to preserve model ids with a literal thinking suffix
+		const selection = resolveRoleWithBackup(models, spec) ?? (level ? resolveRoleWithBackup(models, base) : undefined);
+		if (selection) {
+			const resolved = selection.model;
+			const literalId = spec.toLowerCase() === resolved.id.toLowerCase() || spec.toLowerCase() === modelKey(resolved).toLowerCase();
+			return {
+				model: resolved,
+				thinkingLevel: supportedThinkingLevel(resolved, (literalId ? undefined : level) ?? selection.thinkingLevel),
+			};
+		}
+	}
+
+	// a fallback role uses its own level; an unresolved selector's suffix is not carried over
+	for (const candidate of COUNCIL_ROLE_CHAINS.reader) {
+		const selection = resolveModelSpec(models, candidate);
+		if (selection) {
+			return { model: selection.model, thinkingLevel: supportedThinkingLevel(selection.model, selection.thinkingLevel) };
+		}
+	}
+
+	// the session model and reviewers carry no level for the reader
 	const model = models.current() ?? activeReviewers[0]?.model;
 	return model ? { model } : undefined;
 }

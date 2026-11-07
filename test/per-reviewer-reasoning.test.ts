@@ -5,7 +5,7 @@ import type { ExtensionModelQuery } from "@oh-my-pi/pi-coding-agent/extensibilit
 import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { parseEffort, parseThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { CouncilSession } from "../src/council-session";
-import { modelKey, resolveCouncilRoster, resolveSynthesizer } from "../src/models";
+import { modelKey, resolveCouncilRoster, resolveReaderModel, resolveSynthesizer } from "../src/models";
 import { parsePlanCouncilSettings } from "../src/settings";
 
 // native effort values keep the fixtures reasoning capabilities checked by the library types
@@ -271,6 +271,39 @@ describe("role thinking levels", () => {
 		// the session model (sol) is skipped, so the @plan role's model is auto-selected with its level
 		const auto = makeModelQuery({ plan: `${modelKey(opus)}:high` }, [sol, opus], withSelection);
 		expect(levels(resolveCouncilRoster(auto, parsePlanCouncilSettings({})).reviewers)).toEqual([[modelKey(opus), "high"]]);
+	});
+
+	// the reader selector takes the same effort suffix as reviewer selectors, through models and roles alike
+	it.each([
+		["openai-codex/gpt-6.1-sol:low", {}, sol, "low"],
+		["@smol:high", { smol: modelKey(opus) }, opus, "high"],
+		["openai-codex/gpt-6.1-sol", {}, sol, undefined],
+	] as const)("resolves reader selector %s with its effort", (selector, roles, model, effort) => {
+		const resolved = resolveReaderModel(makeModelQuery(roles), parsePlanCouncilSettings({ readerModel: selector }), []);
+		expect(resolved?.model).toBe(model);
+		expect(resolved?.thinkingLevel?.toString()).toBe(effort);
+	});
+
+	it("does not reinterpret a literal reader model id as a reasoning setting", () => {
+		const literal: Model = { ...sol, id: "example:max" };
+		const resolved = resolveReaderModel(
+			makeModelQuery({}, [literal]),
+			parsePlanCouncilSettings({ readerModel: "openai-codex/example:max" }),
+			[],
+		);
+		expect(resolved).toEqual({ model: literal, thinkingLevel: undefined });
+	});
+
+	// a role's configured level reaches the reader when the omp host reports it
+	it.each([
+		["", "high"],
+		["@smol", "high"],
+		["@smol:low", "low"],
+	] as const)("uses the smol role's level for reader selector %j unless a suffix overrides it", (selector, expectedEffort) => {
+		const query = makeModelQuery({ smol: `${modelKey(opus)}:high` }, [sol, opus], { resolveSelection: true });
+		const resolved = resolveReaderModel(query, parsePlanCouncilSettings({ readerModel: selector }), []);
+		expect(resolved?.model).toBe(opus);
+		expect(resolved?.thinkingLevel?.toString()).toBe(expectedEffort);
 	});
 });
 
