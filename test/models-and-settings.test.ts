@@ -304,6 +304,38 @@ describe("prompt renderers", () => {
 		expect(renderDebateRebuttal({ ...debate, hasCodeReader: true })).toContain("verify the code with `ask_codebase`");
 	});
 
+	it("renders the Round 1 prompt unchanged when no files are attached", () => {
+		const base = { planTitle: "T", planFilePath: "plan.md", planContent: "Plan body" };
+		const expected =
+			"# Plan Review: T\nFile: `plan.md`\n\n## Proposed Plan\nPlan body\n\nPerform your Round 1 critique according to your review criteria. Be direct, rigorous, and cite specific lines or steps from the plan.";
+		expect(renderCritiqueRound(base)).toBe(expected);
+		expect(renderCritiqueRound({ ...base, referencedFiles: [] })).toBe(expected);
+	});
+
+	it("renders attached file excerpts verbatim after the plan", () => {
+		const excerptBlock = "```ts\n1: const f = a -> b; // MUST NOT != x\n2: {{#each x}}y{{/each}}\n```";
+		const rendered = renderCritiqueRound({
+			planTitle: "T",
+			planFilePath: "plan.md",
+			planContent: "Plan body",
+			referencedFiles: [
+				{ path: "src/a->b.ts", rangeLabel: "lines 1–2", excerptBlock },
+				{ path: "src/c.ts", rangeLabel: "line 1", excerptBlock: "```ts\n1: c\n```" },
+			],
+		});
+		expect(rendered).toContain(
+			`Plan body\n\n## Referenced Repository Files\nNumbered working-tree excerpts captured during council initialization for paths named in the plan (line numbers reflect the current file and may be offset from plan citations):\n\n### \`src/a->b.ts\` (lines 1–2)\n${excerptBlock}\n\n### \`src/c.ts\` (line 1)\n\`\`\`ts\n1: c\n\`\`\`\n\nPerform your Round 1 critique`,
+		);
+	});
+
+	it("tells reviewers to trust attached excerpts and keep ask_codebase for what they do not cover", () => {
+		const sys = renderCritiqueSystem({ hasCodeReader: true });
+		expect(sys).toContain("`ask_codebase` tool (up to 3 calls per turn)");
+		expect(sys).toContain(
+			"When the prompt includes `## Referenced Repository Files`, treat those numbered working-tree excerpts as ground truth for the shown lines unless a line or excerpt is marked `[line truncated]` or `[truncated ...]` or working-tree drift is in question",
+		);
+	});
+
 	it("renders debate rebuttal preserving peer critiques verbatim", () => {
 		const peer1 = "Peer 1 notes: race condition in `step 2` -> line 44: <tag>";
 		const peer2 = "Peer 2 says: approve with condition: verify `build()` output";

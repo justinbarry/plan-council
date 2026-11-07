@@ -10,6 +10,7 @@ import { CouncilCodeReader } from "./code-reader";
 import { CouncilSession, extractSessionGoalContext } from "./council-session";
 import { resolveCouncilRoster, resolveReaderModel, resolveSynthesizer } from "./models";
 import { type CouncilOverlayOutcome, PlanCouncilOverlay } from "./overlay";
+import { collectPlanReferencedFiles } from "./plan-files";
 import { DEFAULT_PLAN_COUNCIL_SETTINGS, loadPlanCouncilSettings, type PlanCouncilSettings } from "./settings";
 
 export * from "./settings";
@@ -17,8 +18,14 @@ export * from "./models";
 export * from "./council-session";
 export * from "./code-reader";
 export * from "./overlay";
+export * from "./plan-files";
 
-export default function planCouncilExtension(pi: ExtensionAPI): void {
+/** injectable collaborators; OMP calls the extension with `pi` only */
+export interface PlanCouncilExtensionDeps {
+	collectPlanReferencedFiles?: typeof collectPlanReferencedFiles;
+}
+
+export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncilExtensionDeps = {}): void {
 	let currentSettings: PlanCouncilSettings = { ...DEFAULT_PLAN_COUNCIL_SETTINGS };
 	let activeReview: PlanReviewRequestedEvent | undefined;
 	let latestCtx: ExtensionContext | undefined;
@@ -66,11 +73,17 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
+		// claim the slot and the review synchronously: a resolution arriving mid-await must match this launch
+		activeReview = review;
+		const launchAbort = new AbortController();
 		overlayOpen = true;
-		overlayAbort = new AbortController();
+		overlayAbort = launchAbort;
+		/** a resolved review or a newer launch supersedes this one; it must then leave shared state alone */
+		const isCurrentLaunch = () => !launchAbort.signal.aborted && overlayAbort === launchAbort;
 
 		try {
 			currentSettings = await loadPlanCouncilSettings(ctx.cwd);
+			if (!isCurrentLaunch()) return;
 			const roster = resolveCouncilRoster(ctx.models, currentSettings);
 			const synthesizer = resolveSynthesizer(ctx.models, currentSettings, roster.reviewers);
 			const readerSpec = currentSettings.enableCodeReader
@@ -91,8 +104,17 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 			if (cachedCouncil && cachedCouncil.key === sessionCacheKey) {
 				session = cachedCouncil.session;
 			} else {
+				// reviewers read the files the plan names in Round 1 instead of each asking the reader for them
+				const referencedFiles = await (deps.collectPlanReferencedFiles ?? collectPlanReferencedFiles)(
+					ctx.cwd,
+					review.planContent,
+					{ excludePaths: [review.planFilePath] },
+				);
+				if (!isCurrentLaunch()) return;
+
 				if (cachedCouncil) {
 					cachedCouncil.session.dispose();
+					cachedCouncil = undefined;
 				}
 
 				let sessionContext: string | undefined;
@@ -123,6 +145,7 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 							})
 						: undefined,
 					maxReaderQueriesPerTurn: currentSettings.maxReaderQueriesPerTurn,
+					referencedFiles,
 				});
 
 				reportCouncilWork(session);
@@ -153,7 +176,7 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 					),
 				{
 					overlay: true,
-					signal: overlayAbort.signal,
+					signal: launchAbort.signal,
 					overlayOptions: {
 						anchor: "bottom-center",
 						width: "100%",
@@ -165,6 +188,7 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 				},
 			);
 
+			if (!isCurrentLaunch()) return;
 			if (outcome.action === "refine") {
 				const resolved = ctx.resolvePlanReview(review.reviewId, "refine", { feedback: outcome.feedback });
 				if (!resolved) {
@@ -177,12 +201,14 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 				}
 			}
 		} catch (err) {
-			if (!(err instanceof Error && err.name === "AbortError")) {
+			if (isCurrentLaunch() && !(err instanceof Error && err.name === "AbortError")) {
 				logger.error("Plan Council overlay error", { error: err });
 			}
 		} finally {
-			overlayOpen = false;
-			overlayAbort = undefined;
+			if (overlayAbort === launchAbort) {
+				overlayOpen = false;
+				overlayAbort = undefined;
+			}
 		}
 	}
 
@@ -265,6 +291,8 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 				overlayAbort.abort();
 				overlayAbort = undefined;
 			}
+			// free the launch slot now, even if a launch is still suspended before its overlay opens
+			overlayOpen = false;
 			if (cachedCouncil) {
 				cachedCouncil.session.abortActiveRound();
 			}

@@ -1,4 +1,5 @@
 import { prompt } from "@oh-my-pi/pi-utils";
+import type { PlanFileExcerpt } from "../plan-files";
 import type { RevisionItem } from "../position";
 import critiqueRoundTemplate from "./critique-round.md" with { type: "text" };
 import critiqueSystemTemplate from "./critique-system.md" with { type: "text" };
@@ -51,12 +52,19 @@ export interface RenderCritiqueRoundOptions {
 	planContent: string;
 	round?: number;
 	sessionContext?: string;
+	/** working-tree excerpts of files the plan names, rendered verbatim */
+	referencedFiles?: readonly PlanFileExcerpt[];
 }
 
 export function renderCritiqueRound(options: RenderCritiqueRoundOptions): string {
+	const referencedFiles = options.referencedFiles ?? [];
 	const exactValues: string[] = [options.planContent];
 	if (options.sessionContext) {
 		exactValues.push(options.sessionContext);
+	}
+	// every value is registered before any placeholder is minted, so no placeholder can occur inside a restored value
+	for (const file of referencedFiles) {
+		exactValues.push(file.path, file.rangeLabel, file.excerptBlock);
 	}
 
 	const planBodyPlaceholder = exactPlaceholder("PLAN", 0, exactValues);
@@ -68,12 +76,23 @@ export function renderCritiqueRound(options: RenderCritiqueRoundOptions): string
 		replacements.push([sessionContextPlaceholder, options.sessionContext]);
 	}
 
+	const referencedFilePlaceholders = referencedFiles.map((file, idx) => {
+		const entry = {
+			path: exactPlaceholder("REFPATH", idx, exactValues),
+			rangeLabel: exactPlaceholder("REFRANGE", idx, exactValues),
+			excerptBlock: exactPlaceholder("REFBLOCK", idx, exactValues),
+		};
+		replacements.push([entry.path, file.path], [entry.rangeLabel, file.rangeLabel], [entry.excerptBlock, file.excerptBlock]);
+		return entry;
+	});
+
 	const rendered = prompt.render(critiqueRoundTemplate, {
 		planTitle: options.planTitle,
 		planFilePath: options.planFilePath,
 		planBody: planBodyPlaceholder,
 		round: options.round ?? 1,
 		sessionContext: sessionContextPlaceholder,
+		referencedFiles: referencedFilePlaceholders.length > 0 ? referencedFilePlaceholders : undefined,
 	});
 
 	return restoreExactValues(rendered, replacements);

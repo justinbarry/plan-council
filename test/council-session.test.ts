@@ -370,6 +370,38 @@ describe("CouncilSession", () => {
 		expect(calls.length).toBe(callsBefore + 1 + 2); // Claude and GPT both called
 	});
 
+	it("seeds every reviewer, including late joiners, with the attached file excerpts", async () => {
+		const { streamFn, calls } = makeMockStreamFn(model => ({ text: `Answer from ${model.id}`, toolCalls: [reportPosition("APPROVE")] }));
+		const session = new CouncilSession({
+			planTitle: "Files Plan",
+			planFilePath: "plan.md",
+			planContent: "Edit src/a.ts",
+			availableReviewers: [claude, gpt, gemini],
+			initialReviewers: [claude],
+			streamFn,
+			referencedFiles: [{ path: "src/a.ts", rangeLabel: "line 1", excerptBlock: "```ts\n1: export const a = 1;\n```" }],
+		});
+		const firstPrompt = (model: Model) => {
+			const first = calls.find(c => c.model === model)!.context.messages[0];
+			return first.role === "user" && typeof first.content === "string" ? first.content : "";
+		};
+		const attachedSection = "## Referenced Repository Files";
+
+		await session.startInitialCritiques();
+		expect(firstPrompt(claude.model)).toContain(attachedSection);
+
+		// gemini joins before an operator question, gpt before a debate round
+		session.setReviewers([claude.key, gemini.key]);
+		await session.askCouncil("@gemini Is step 1 safe?");
+		session.setReviewers([claude.key, gemini.key, gpt.key]);
+		await session.runDebateRound();
+
+		for (const reviewer of [gpt, gemini]) {
+			expect(firstPrompt(reviewer.model)).toContain(attachedSection);
+			expect(firstPrompt(reviewer.model)).toContain("### `src/a.ts` (line 1)\n```ts\n1: export const a = 1;\n```");
+		}
+	});
+
 	it("synthesizes feedback preserving verbatim plan and operator comments", async () => {
 		const { streamFn } = makeMockStreamFn((_model, context) => {
 			const userMsg = context.messages[0];

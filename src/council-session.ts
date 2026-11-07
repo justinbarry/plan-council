@@ -21,6 +21,7 @@ import {
 	type CodeReaderQueryInput,
 } from "./code-reader";
 import type { ReviewerMember } from "./models";
+import type { PlanFileExcerpt } from "./plan-files";
 import {
 	computeConvergence,
 	type ConvergenceReport,
@@ -153,6 +154,8 @@ export interface CouncilSessionOptions {
 	/** shared read-only codebase subagent reviewers and the operator may query */
 	codeReader?: CodebaseReader;
 	maxReaderQueriesPerTurn?: number;
+	/** plan-referenced file excerpts attached to every reviewer's Round 1 prompt */
+	referencedFiles?: readonly PlanFileExcerpt[];
 }
 
 export function extractSessionGoalContext(entries: readonly SessionEntry[], maxChars = 2000): string | undefined {
@@ -214,6 +217,7 @@ export class CouncilSession {
 	#codeReader?: CodebaseReader;
 	#maxReaderQueriesPerTurn: number;
 	#readerEntries: ReaderTurnEntry[] = [];
+	#referencedFiles: PlanFileExcerpt[];
 
 	/** preserve reviewer request options when forwarding to the native model stream */
 	constructor(options: CouncilSessionOptions) {
@@ -227,6 +231,7 @@ export class CouncilSession {
 		this.#sessionId = options.sessionId;
 		this.#codeReader = options.codeReader;
 		this.#maxReaderQueriesPerTurn = Math.min(6, Math.max(1, Math.round(options.maxReaderQueriesPerTurn ?? 3)));
+		this.#referencedFiles = [...(options.referencedFiles ?? [])];
 
 		this.#streamFn =
 			options.streamFn ??
@@ -255,6 +260,11 @@ export class CouncilSession {
 
 	get sessionContext(): string | undefined {
 		return this.#sessionContext;
+	}
+
+	/** construction-time snapshot; late joiners see the same excerpts */
+	get referencedFiles(): readonly PlanFileExcerpt[] {
+		return this.#referencedFiles;
 	}
 
 	get availableReviewers(): readonly ReviewerMember[] {
@@ -316,6 +326,18 @@ export class CouncilSession {
 		this.#emitChange();
 	}
 
+	/** the Round 1 plan prompt every reviewer history starts from, including late joiners */
+	#renderInitialPlanPrompt(): string {
+		return renderCritiqueRound({
+			round: 1,
+			planTitle: this.#planTitle,
+			planFilePath: this.#planFilePath,
+			planContent: this.#planContent,
+			sessionContext: this.#sessionContext,
+			referencedFiles: this.#referencedFiles,
+		});
+	}
+
 	/** request initial critiques using each selected reviewer and its thinking level */
 	async startInitialCritiques(): Promise<void> {
 		if (this.#busy) {
@@ -338,13 +360,7 @@ export class CouncilSession {
 		const controller = this.#beginRound();
 		this.#emitChange();
 
-		const userPrompt = renderCritiqueRound({
-			round: 1,
-			planTitle: this.#planTitle,
-			planFilePath: this.#planFilePath,
-			planContent: this.#planContent,
-			sessionContext: this.#sessionContext,
-		});
+		const userPrompt = this.#renderInitialPlanPrompt();
 
 		const tasks = reviewersToRun.map(async reviewer => {
 			const entry: ReviewerTurnEntry = {
@@ -458,13 +474,7 @@ export class CouncilSession {
 				history = [];
 				this.#histories.set(reviewer.key, history);
 				// Newly joined reviewer seeds with Round 1 plan prompt
-				const initialUserPrompt = renderCritiqueRound({
-					round: 1,
-					planTitle: this.#planTitle,
-					planFilePath: this.#planFilePath,
-					planContent: this.#planContent,
-					sessionContext: this.#sessionContext,
-				});
+				const initialUserPrompt = this.#renderInitialPlanPrompt();
 				history.push(createUserMessage(initialUserPrompt));
 			}
 
@@ -593,13 +603,7 @@ export class CouncilSession {
 			if (!history) {
 				history = [];
 				this.#histories.set(reviewer.key, history);
-				const initialUserPrompt = renderCritiqueRound({
-					round: 1,
-					planTitle: this.#planTitle,
-					planFilePath: this.#planFilePath,
-					planContent: this.#planContent,
-					sessionContext: this.#sessionContext,
-				});
+				const initialUserPrompt = this.#renderInitialPlanPrompt();
 				history.push(createUserMessage(initialUserPrompt));
 			}
 

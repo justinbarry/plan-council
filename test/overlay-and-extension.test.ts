@@ -19,12 +19,13 @@ import { __closeExtensionParseCacheForTests } from "@oh-my-pi/pi-coding-agent/ex
 import type { Theme, TUI } from "@oh-my-pi/pi-tui";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { parseThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
-import { getAgentDir, getPluginsDir, removeSyncWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { getAgentDir, getPluginsDir, logger, removeSyncWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import type { CodebaseReader } from "../src/code-reader";
 import { CouncilSession, type ModelStreamFn } from "../src/council-session";
 import planCouncilExtension from "../src/index";
 import type { ReviewerMember } from "../src/models";
 import { type CouncilOverlayOutcome, PlanCouncilOverlay } from "../src/overlay";
+import type { collectPlanReferencedFiles, PlanFileExcerpt } from "../src/plan-files";
 
 function delay(ms: number): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
@@ -500,6 +501,63 @@ describe("PlanCouncilOverlay UI component", () => {
 		expect(overlay.render(120).join("\n")).not.toContain("Reader");
 	});
 
+	it("lists pre-attached files on the Reader tab without a reader and sends Reader-tab input to the council", async () => {
+		const { tui } = createFakeTui();
+		const asked: string[] = [];
+		const streamFn: ModelStreamFn = (_model, context) => {
+			const last = context.messages[context.messages.length - 1];
+			asked.push(String(last.content));
+			return {
+				async *[Symbol.asyncIterator]() {},
+				result: async () =>
+					({ role: "assistant", content: [{ type: "text", text: "Answer" }], stopReason: "stop" }) as unknown as AssistantMessage,
+			};
+		};
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Edit src/a.ts and src/b.ts",
+			availableReviewers: [claude],
+			initialReviewers: [claude],
+			streamFn,
+			referencedFiles: [
+				{ path: "src/a.ts", rangeLabel: "lines 1–12", excerptBlock: "```ts\n1: a\n```" },
+				{ path: "src/b.ts", rangeLabel: "lines 30–62 of 320", excerptBlock: "```ts\n30: b\n```" },
+			],
+		});
+		const overlay = new PlanCouncilOverlay(tui, session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		// Council → claude → Reader
+		overlay.handleInput("]");
+		overlay.handleInput("]");
+		let rendered = overlay.render(120).join("\n");
+		expect(rendered).toContain("Pre-attached to Round 1 (2 files):");
+		expect(rendered).toContain("• src/a.ts");
+		expect(rendered).toContain("(lines 30–62 of 320)");
+		expect(rendered).toContain("On-demand codebase reader is disabled (enableCodeReader: false).");
+		expect(rendered).not.toContain("@reader <question>");
+		expect(rendered).toContain("Ask council >");
+
+		// a plain question on the Reader tab goes to the council instead of the missing reader
+		overlay.handleInput("i");
+		for (const ch of "Which tests?") overlay.handleInput(ch);
+		overlay.handleInput("\r");
+		await flushMicrotasks();
+		expect(asked).toHaveLength(1);
+		expect(asked[0]).toContain("Which tests?");
+		expect(session.entries.some(e => e.kind === "user" && e.text === "Which tests?")).toBe(true);
+
+		overlay.handleInput("i");
+		for (const ch of "@reader where is foo?") overlay.handleInput(ch);
+		overlay.handleInput("\r");
+		await flushMicrotasks();
+		rendered = overlay.render(120).join("\n");
+		expect(rendered).toContain("Codebase reader is disabled or unavailable.");
+		expect(rendered).toContain("Pre-attached to Round 1 (2 files):");
+		expect(session.readerEntries).toHaveLength(0);
+		expect(asked).toHaveLength(1);
+	});
+
 	it("sends @reader questions to the Reader tab and answers Reader-tab questions with the reader", async () => {
 		const { tui } = createFakeTui();
 		const questions: string[] = [];
@@ -602,6 +660,7 @@ describe("PlanCouncilOverlay UI component", () => {
 		expect(done).toContain("· 1 codebase check");
 		expect(done).not.toContain("asking reader");
 	});
+
 });
 
 describe("planCouncilExtension lifecycle & shortcut wiring", () => {
@@ -799,9 +858,12 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 		}
 	});
 
-	it("--auto launch runs critiques, debate, and synthesis, then resolves the plan review with refine feedback", async () => {
+	it("--auto launch attaches plan-referenced files, runs critiques, debate, and synthesis, then resolves with refine feedback", async () => {
 		const isolation = isolateOmpHome("pi-council-auto-home-");
 		const projectDir = TempDir.createSync("@pi-council-auto-proj-");
+		fs.mkdirSync(projectDir.join("src"));
+		fs.writeFileSync(projectDir.join("src", "target.ts"), "export const target = 1;\n");
+		fs.writeFileSync(projectDir.join("plan.md"), "# Auto Plan\n");
 		const reviewerPrompts: string[] = [];
 		const streamSpy = spyOn(ai, "streamSimple").mockImplementation(((_model: Model, context: Context) => {
 			const last = context.messages[context.messages.length - 1];
@@ -887,7 +949,7 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 					sessionId: "sess-auto",
 					title: "Auto Plan",
 					planFilePath: "plan.md",
-					planContent: "# Auto Plan",
+					planContent: "# Auto Plan\nUpdate `src/target.ts` line 1 and keep plan.md in sync.",
 					options: [{ id: "execute", label: "Execute", disabled: false }],
 				}),
 			} as unknown as ExtensionContext;
@@ -906,12 +968,168 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 			expect(reviewerPrompts.some(p => p.includes("# Council Debate: Round 3"))).toBe(false);
 			// herdr sees one Working hold across critiques, debate, and synthesis
 			expect(herdrWorking).toEqual([{ active: true }, { active: false }]);
+			// Round 1 carries the referenced file but never the plan file itself
+			const round1 = reviewerPrompts.filter(p => p.includes("# Plan Review: Auto Plan"));
+			expect(round1).toHaveLength(2);
+			for (const prompt of round1) {
+				expect(prompt).toContain("## Referenced Repository Files");
+				expect(prompt).toContain("### `src/target.ts` (line 1)\n```ts\n1: export const target = 1;\n```");
+				expect(prompt).not.toContain("### `plan.md`");
+			}
 		} finally {
 			streamSpy.mockRestore();
 			projectDir.removeSync();
 			isolation.restore();
 		}
 	});
+
+	it("a launch superseded while collecting files leaves the newer launch's overlay, review, and session alone", async () => {
+		const isolation = isolateOmpHome("pi-council-race-home-");
+		const projectDir = TempDir.createSync("@pi-council-race-proj-");
+		const requestedPlans: string[] = [];
+		const streamSpy = spyOn(ai, "streamSimple").mockImplementation(((_model: Model, context: Context) => {
+			const first = context.messages[0];
+			requestedPlans.push(first.role === "user" && typeof first.content === "string" ? first.content.split("\n")[0] : "");
+			const msg = { role: "assistant", content: [{ type: "text", text: "### Verdict\nAPPROVE" }], stopReason: "stop" } as unknown as AssistantMessage;
+			return {
+				async *[Symbol.asyncIterator](): AsyncGenerator<AssistantMessageEvent> {},
+				result: async () => msg,
+			} as unknown as ReturnType<typeof ai.streamSimple>;
+		}) as typeof ai.streamSimple);
+		const loggerSpy = spyOn(logger, "error");
+		const disposeSpy = spyOn(CouncilSession.prototype, "dispose");
+
+		const reviewFor = (n: number): PlanReviewRequestedEvent => ({
+			type: "plan_review_requested",
+			reviewId: `rev-${n}`,
+			sessionId: "sess-race",
+			title: `Review ${n}`,
+			planFilePath: "plan.md",
+			planContent: `# Review ${n}`,
+			options: [{ id: "execute", label: "Execute", disabled: false }],
+		});
+		const firstCollect = Promise.withResolvers<PlanFileExcerpt[]>();
+		const firstCollectReached = Promise.withResolvers<void>();
+		const collectedPlans: string[] = [];
+		const collect: typeof collectPlanReferencedFiles = async (_cwd, planContent) => {
+			collectedPlans.push(planContent);
+			if (planContent === "# Review 1") {
+				firstCollectReached.resolve();
+				return firstCollect.promise;
+			}
+			return [];
+		};
+
+		try {
+			const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+			const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
+			planCouncilExtension(
+				{
+					registerCommand: (name: string, opts: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => {
+						commands.set(name, opts);
+					},
+					registerShortcut: () => {},
+					registerFlag: () => {},
+					on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => {
+						handlers.set(event, handler);
+					},
+					events: { emit: () => {}, on: () => () => {} },
+				} as unknown as ExtensionAPI,
+				{ collectPlanReferencedFiles: collect },
+			);
+
+			const gpt = makeFakeModel("openai", "gpt-4o");
+			const planning = makeFakeModel("google", "gemini-2.5-pro");
+			let pending = reviewFor(1);
+			const overlays: Array<{ signal: AbortSignal; done: (res: unknown) => void }> = [];
+			const overlayOpened = Promise.withResolvers<void>();
+			const resolved: Array<{ reviewId: string; choice: string }> = [];
+			const ctx = {
+				cwd: projectDir.path(),
+				hasUI: true,
+				agent: { kind: "main", id: "main", name: "main", depth: 0 },
+				models: {
+					list: () => [claude, gpt, planning],
+					current: () => planning,
+					resolve: () => undefined,
+					family: (m: Model) => m.provider,
+				},
+				modelRegistry: { resolver: () => undefined },
+				ui: {
+					theme,
+					notify: () => {},
+					setStatus: () => {},
+					custom: (
+						factory: (tui: TUI, theme: Theme, keybindings: KeybindingsManager, done: (res: unknown) => void) => unknown,
+						opts: { signal: AbortSignal },
+					) => {
+						const { promise, resolve } = Promise.withResolvers<unknown>();
+						const fakeTui = { terminal: { rows: 24, cols: 80 }, requestRender: () => {} } as unknown as TUI;
+						factory(fakeTui, theme as unknown as Theme, {} as unknown as KeybindingsManager, resolve);
+						overlays.push({ signal: opts.signal, done: resolve });
+						overlayOpened.resolve();
+						return promise;
+					},
+				},
+				resolvePlanReview: (reviewId: string, choice: string) => {
+					resolved.push({ reviewId, choice });
+					return true;
+				},
+				getPendingPlanReview: () => pending,
+			} as unknown as ExtensionContext;
+			const openCouncil = () => commands.get("plan-council")!.handler("", ctx);
+
+			// launch 1 comes from the command with no prior plan_review_requested and stalls collecting files
+			const launch1 = openCouncil();
+			await firstCollectReached.promise;
+			const resolvedEvent: PlanReviewResolvedEvent = {
+				type: "plan_review_resolved",
+				reviewId: "rev-1",
+				sessionId: "sess-race",
+				choice: "refine",
+				by: "extension",
+			};
+			handlers.get("plan_review_resolved")!(resolvedEvent, ctx);
+
+			// launch 2 opens for the next review before launch 1's collector settles
+			pending = reviewFor(2);
+			const launch2 = openCouncil();
+			await Promise.race([
+				overlayOpened.promise,
+				delay(1000).then(() => {
+					throw new Error("launch 2 never opened: the resolved review did not free the launch slot");
+				}),
+			]);
+			firstCollect.reject(new Error("stale collector failure"));
+			await launch1;
+			await flushMicrotasks();
+
+			expect(collectedPlans).toEqual(["# Review 1", "# Review 2"]);
+			expect(overlays).toHaveLength(1);
+			expect(overlays[0].signal.aborted).toBe(false);
+			expect(loggerSpy).not.toHaveBeenCalled();
+			expect(disposeSpy).not.toHaveBeenCalled();
+
+			// launch 2 still owns the slot, so opening again is a no-op (not awaited: a wrongly opened overlay never settles)
+			void openCouncil();
+			await delay(20);
+			expect(overlays).toHaveLength(1);
+
+			overlays[0].done({ action: "refine", feedback: "Review 2 feedback" });
+			await launch2;
+			await flushMicrotasks();
+			expect(resolved).toEqual([{ reviewId: "rev-2", choice: "refine" }]);
+			expect(requestedPlans.length).toBeGreaterThan(0);
+			expect(requestedPlans.every(p => p === "# Plan Review: Review 2")).toBe(true);
+		} finally {
+			streamSpy.mockRestore();
+			loggerSpy.mockRestore();
+			disposeSpy.mockRestore();
+			projectDir.removeSync();
+			isolation.restore();
+		}
+	});
+
 });
 
 describe("plugin package discovery", () => {

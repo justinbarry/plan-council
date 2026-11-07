@@ -140,7 +140,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		}
 
 		const readerEntries = this.#session.readerEntries;
-		if (this.#session.hasCodeReader || readerEntries.length > 0) {
+		if (this.#session.hasCodeReader || readerEntries.length > 0 || this.#session.referencedFiles.length > 0) {
 			const readerBusy = readerEntries.some(e => e.status === "queued" || e.status === "reading");
 			tabs.push({
 				id: "reader",
@@ -318,7 +318,20 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			}
 		} else if (activeTab === "reader") {
 			const readerEntries = this.#session.readerEntries;
-			if (readerEntries.length === 0) {
+			const attached = this.#session.referencedFiles;
+			if (attached.length > 0) {
+				lines.push(
+					"",
+					theme.fg("accent", `  Pre-attached to Round 1 (${attached.length} ${attached.length === 1 ? "file" : "files"}):`),
+					...attached.map(f =>
+						truncateToWidth(replaceTabs(`  • ${f.path} ${theme.fg("muted", `(${f.rangeLabel})`)}`), contentWidth),
+					),
+					...(readerEntries.length > 0 ? [""] : []),
+				);
+			}
+			if (readerEntries.length === 0 && !this.#session.hasCodeReader) {
+				lines.push("", theme.fg("muted", "  On-demand codebase reader is disabled (enableCodeReader: false)."), "");
+			} else if (readerEntries.length === 0) {
 				const modelLabel = this.#session.readerModelLabel;
 				lines.push(
 					"",
@@ -423,7 +436,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			const reviewerKey = activeTab.slice("reviewer:".length);
 			const reviewer = this.#session.availableReviewers.find(r => r.key === reviewerKey);
 			this.#input.prompt = `Reply @${reviewer?.model.id ?? "model"} > `;
-		} else if (activeTab === "reader") {
+		} else if (activeTab === "reader" && this.#session.hasCodeReader) {
 			this.#input.prompt = "Ask @reader > ";
 		} else {
 			this.#input.prompt = "Ask council > ";
@@ -490,7 +503,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 				let defaultTargetKey: string | undefined;
 				if (activeTab?.startsWith("reviewer:")) {
 					defaultTargetKey = activeTab.slice("reviewer:".length);
-				} else if (activeTab === "reader") {
+				} else if (activeTab === "reader" && this.#session.hasCodeReader) {
 					defaultTargetKey = READER_TARGET_KEY;
 				}
 				// watch the reader stream its answer live
