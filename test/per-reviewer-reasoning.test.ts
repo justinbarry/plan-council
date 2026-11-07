@@ -5,7 +5,7 @@ import type { ExtensionModelQuery } from "@oh-my-pi/pi-coding-agent/extensibilit
 import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { parseEffort, parseThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { CouncilSession } from "../src/council-session";
-import { modelKey, resolveCouncilRoster, resolveSynthesizer, resolveSynthesizerModel } from "../src/models";
+import { modelKey, resolveCouncilRoster, resolveSynthesizer } from "../src/models";
 import { parsePlanCouncilSettings } from "../src/settings";
 
 // native effort values keep the fixtures reasoning capabilities checked by the library types
@@ -134,8 +134,8 @@ describe("per-reviewer reasoning selection", () => {
 	// synthesis now supports the same explicit role suffixes as reviewers
 	it("selects the configured synthesizer role when it includes a thinking suffix", () => {
 		const query = makeModelQuery({ plan: modelKey(sol), smol: modelKey(opus) });
-		const model = resolveSynthesizerModel(query, parsePlanCouncilSettings({ synthesizerModel: "council2:high" }), []);
-		expect(model).toBe(opus);
+		const selection = resolveSynthesizer(query, parsePlanCouncilSettings({ synthesizerModel: "council2:high" }), []);
+		expect(selection?.model).toBe(opus);
 	});
 });
 
@@ -197,7 +197,18 @@ describe("synthesizer reasoning selection", () => {
 		const selection = resolveSynthesizer(query, parsePlanCouncilSettings({ synthesizerModel: selector }), []);
 		expect(selection?.model).toBe(expectedModel);
 		expect(selection?.thinkingLevel?.toString()).toBe(expectedEffort);
-		expect(resolveSynthesizerModel(query, parsePlanCouncilSettings({ synthesizerModel: selector }), [])).toBe(expectedModel);
+	});
+
+	// a role's configured level reaches synthesis when the omp host reports it
+	it.each([
+		["", "high"],
+		["@plan", "high"],
+		["@plan:medium", "medium"],
+	] as const)("uses the plan role's level for selector %j unless a suffix overrides it", (selector, expectedEffort) => {
+		const query = makeModelQuery({ plan: `${modelKey(sol)}:high` }, [sol, opus], { resolveSelection: true });
+		const selection = resolveSynthesizer(query, parsePlanCouncilSettings({ synthesizerModel: selector }), []);
+		expect(selection?.model).toBe(sol);
+		expect(selection?.thinkingLevel?.toString()).toBe(expectedEffort);
 	});
 
 	// literal suffixes keep their model identity with no explicit reasoning override

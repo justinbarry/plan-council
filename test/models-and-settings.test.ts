@@ -9,7 +9,7 @@ import {
 import { describe, expect, it } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionModelQuery } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
-import { modelKey, resolveCouncilRoster, resolveSynthesizerModel } from "../src/models";
+import { modelKey, resolveCouncilRoster, resolveSynthesizer } from "../src/models";
 import { parsePlanCouncilSettings } from "../src/settings";
 
 function makeFakeModel(provider: string, id: string, family: string): Model {
@@ -169,11 +169,11 @@ describe("model roster resolution", () => {
 			current: claude,
 		});
 		const settingsWithExplicit = parsePlanCouncilSettings({ synthesizerModel: "gpt-4o" });
-		expect(resolveSynthesizerModel(query, settingsWithExplicit, [])?.id).toBe("gpt-4o");
+		expect(resolveSynthesizer(query, settingsWithExplicit, [])?.model.id).toBe("gpt-4o");
 
 		const settingsDefault = parsePlanCouncilSettings({});
 		// slow role is gemini
-		expect(resolveSynthesizerModel(query, settingsDefault, [])?.id).toBe("gemini-2.5-pro");
+		expect(resolveSynthesizer(query, settingsDefault, [])?.model.id).toBe("gemini-2.5-pro");
 	});
 
 	it("prioritizes custom council roles and automatically adds @ prefix when resolving", () => {

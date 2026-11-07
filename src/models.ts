@@ -262,7 +262,7 @@ export interface ResolvedSynthesizer {
 	thinkingLevel?: ConfiguredThinkingLevel;
 }
 
-/** retain the synthesizer model and its explicit supported thinking level */
+/** the synthesizer model and its level: an explicit suffix, else the level its role configures */
 export function resolveSynthesizer(
 	models: ExtensionModelQuery,
 	settings: PlanCouncilSettings,
@@ -272,34 +272,26 @@ export function resolveSynthesizer(
 		const spec = settings.synthesizerModel.trim();
 		const { base, level } = splitThinkingSuffix(spec, -1, MAX_THINKING_SUFFIX_OPTIONS);
 		// resolve the full selector first to preserve model ids with a literal thinking suffix
-		const resolved = (resolveRoleWithBackup(models, spec) ?? (level ? resolveRoleWithBackup(models, base) : undefined))?.model;
-		if (resolved) {
+		const selection = resolveRoleWithBackup(models, spec) ?? (level ? resolveRoleWithBackup(models, base) : undefined);
+		if (selection) {
+			const resolved = selection.model;
 			const literalId = spec.toLowerCase() === resolved.id.toLowerCase() || spec.toLowerCase() === modelKey(resolved).toLowerCase();
 			return {
 				model: resolved,
-				thinkingLevel: level && !literalId
-					? resolveThinkingLevelForModel(resolved, concreteThinkingLevel(level))
-					: undefined,
+				thinkingLevel: supportedThinkingLevel(resolved, (literalId ? undefined : level) ?? selection.thinkingLevel),
 			};
 		}
 	}
 
+	// a fallback role uses its own level; an unresolved selector's suffix is not carried over
 	for (const candidate of COUNCIL_ROLE_CHAINS.synthesizer) {
-		const resolved = resolveModelSpec(models, candidate)?.model;
-		if (resolved) {
-			return { model: resolved };
+		const selection = resolveModelSpec(models, candidate);
+		if (selection) {
+			return { model: selection.model, thinkingLevel: supportedThinkingLevel(selection.model, selection.thinkingLevel) };
 		}
 	}
 
+	// the session model and reviewers carry no level for synthesis
 	const model = models.current() ?? activeReviewers[0]?.model;
 	return model ? { model } : undefined;
-}
-
-/** preserve the model only lookup for existing callers */
-export function resolveSynthesizerModel(
-	models: ExtensionModelQuery,
-	settings: PlanCouncilSettings,
-	activeReviewers: readonly ReviewerMember[],
-): Model | undefined {
-	return resolveSynthesizer(models, settings, activeReviewers)?.model;
 }

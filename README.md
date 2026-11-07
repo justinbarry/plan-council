@@ -102,26 +102,26 @@ omp --plugin-dir /path/to/plan-council
 
 ## Configuration
 
-Configure options via `omp plugin config`:
+Configure options via `omp plugin config set`:
 
 ```bash
 # Hands-free mode: auto-proceed through critiques -> debate -> synthesis -> refine
-omp plugin config plan-council autoProceed true
+omp plugin config set plan-council autoProceed true
 
 # Automatically open council when a plan is drafted (no Ctrl+N needed)
-omp plugin config plan-council autoStart true
+omp plugin config set plan-council autoStart true
 
 # Specify exact models (or role aliases) for reviewers
-omp plugin config plan-council reviewerModels "default, smol"
+omp plugin config set plan-council reviewerModels "default, smol"
 
 # Limit maximum number of auto-selected reviewers (1-6)
-omp plugin config plan-council maxReviewers 2
+omp plugin config set plan-council maxReviewers 2
 
 # Cap automatic debate rounds after Round 1 (1-5, default 3)
-omp plugin config plan-council maxDebateRounds 2
+omp plugin config set plan-council maxDebateRounds 2
 
 # Change the activation shortcut
-omp plugin config plan-council shortcut "ctrl+p"
+omp plugin config set plan-council shortcut "ctrl+p"
 ```
 
 ### Per-Reviewer Reasoning
@@ -156,20 +156,23 @@ Set `synthesizerModel` to choose a different model for synthesis and append a
 thinking suffix to set its reasoning level independently of the reviewers:
 
 ```bash
-omp plugin config plan-council synthesizerModel "openai-codex/gpt-6.1-sol:xhigh"
+omp plugin config set plan-council synthesizerModel "openai-codex/gpt-6.1-sol:xhigh"
 ```
 
 Role selectors also accept a suffix, such as `@council_synthesizer:high`.
 The chosen effort applies to manual synthesis, Refine Plan, and the automatic
 pipeline. It follows OMP's adjustment to the model's supported levels; `:off`
-disables reasoning. A selector without a suffix keeps the existing request
-defaults. Put the suffix in this plugin setting because OMP's model-query API
-does not expose thinking levels stored inside role definitions.
+disables reasoning. Without a suffix, a role selector uses the level configured
+on that role, as reviewers do; this needs an OMP version whose extension API
+includes `ctx.models.resolveSelection`, so on older versions put the suffix in
+this setting instead. A plain model id without a suffix keeps the request
+defaults.
 
 An empty or unresolved selector keeps the existing fallback order:
 `@council_synthesizer`, `@council-synth`, `@plan`, `@slow`, `@default`, then the
-session model or first active reviewer. Fallback models keep their request
-defaults rather than inheriting a suffix from an unresolved selector.
+session model or first active reviewer. A fallback role uses its own configured
+level; the session model and reviewers keep request defaults, and an unresolved
+selector's suffix is never carried over to a fallback.
 
 ### Custom Model Roles
 
