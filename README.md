@@ -42,6 +42,7 @@ When OMP creates a plan (`write xd://propose`), Plan Council convenes a panel of
 - **Operator Steering**: Jump in at any time to steer the council via broadcast questions (`Ask council > ...`) or targeted mentions (`Ask council > @gpt ...`).
 - **One-Key Auto-Run**: Press `Space` or `Enter` in the overlay to execute the full review pipeline in a single step.
 - **Smart Model Resolution**: Automatically prioritizes your configured `modelRoles` (e.g. `council1`, `council2`, `default`, `plan`, `smol`) and filters out retired date-stamped snapshots.
+- **herdr Status**: Inside [herdr](https://herdr.dev), the pane shows as working while the council runs, instead of idle between agent turns. Requires herdr's OMP integration version 11 or newer (`herdr integration status`).
 
 ---
 

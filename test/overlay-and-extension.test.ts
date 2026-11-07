@@ -445,6 +445,7 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 			on: (event: string, handler: unknown) => {
 				handlers.set(event, handler as ExtensionHandler<unknown, unknown>);
 			},
+			events: { emit: () => {}, on: () => () => {} },
 		} as unknown as ExtensionAPI;
 
 		planCouncilExtension(mockPi);
@@ -587,6 +588,7 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 
 		try {
 			const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+			const herdrWorking: unknown[] = [];
 			planCouncilExtension({
 				registerCommand: (name: string, opts: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => {
 					commands.set(name, opts);
@@ -594,6 +596,12 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 				registerShortcut: () => {},
 				registerFlag: () => {},
 				on: () => {},
+				events: {
+					emit: (channel: string, data: unknown) => {
+						if (channel === "herdr:working") herdrWorking.push(data);
+					},
+					on: () => () => {},
+				},
 			} as unknown as ExtensionAPI);
 
 			const gpt = makeFakeModel("openai", "gpt-4o");
@@ -648,6 +656,8 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 			// Round 1 for both reviewers, then one debate round that converges on agreement
 			expect(reviewerPrompts.filter(p => p.includes("# Council Debate: Round 2"))).toHaveLength(2);
 			expect(reviewerPrompts.some(p => p.includes("# Council Debate: Round 3"))).toBe(false);
+			// herdr sees one Working hold across critiques, debate, and synthesis
+			expect(herdrWorking).toEqual([{ active: true }, { active: false }]);
 		} finally {
 			streamSpy.mockRestore();
 			projectDir.removeSync();

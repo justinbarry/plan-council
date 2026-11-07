@@ -40,6 +40,20 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 		});
 	}
 
+	/**
+	 * the council calls models between agent turns, so herdr's OMP integration would show the pane idle;
+	 * hold it in Working through the integration's `herdr:working` event (OMP integration v11+, ignored otherwise)
+	 */
+	function reportCouncilWork(session: CouncilSession): void {
+		let working = false;
+		session.subscribe(() => {
+			const active = session.isActive();
+			if (active === working) return;
+			working = active;
+			pi.events.emit("herdr:working", { active });
+		});
+	}
+
 	async function launchCouncilOverlay(
 		ctx: ExtensionContext | ExtensionCommandContext,
 		review: PlanReviewRequestedEvent,
@@ -84,6 +98,7 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 						ctx.modelRegistry?.resolver ? ctx.modelRegistry.resolver(model, review.sessionId) : undefined,
 				});
 
+				reportCouncilWork(session);
 				cachedCouncil = { key: sessionCacheKey, session };
 			}
 

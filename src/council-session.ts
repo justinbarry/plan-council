@@ -213,6 +213,11 @@ export class CouncilSession {
 		return this.#busy;
 	}
 
+	/** a round is running, or an auto run that has not been stopped is between stages */
+	isActive(): boolean {
+		return this.#busy || (this.#autoRun !== undefined && !this.#autoRun.stopped);
+	}
+
 	subscribe(listener: () => void): () => void {
 		this.#listeners.add(listener);
 		return () => {
@@ -935,6 +940,7 @@ export class CouncilSession {
 			return await this.synthesizeFeedback(synthesizerModel);
 		} finally {
 			if (this.#autoRun === run) this.#autoRun = undefined;
+			this.#emitChange();
 		}
 	}
 

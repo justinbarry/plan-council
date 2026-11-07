@@ -741,12 +741,21 @@ describe("report_position convergence", () => {
 		});
 		const session = newSession(streamFn);
 		const stages: string[] = [];
+		// what herdr is told: the council stays active between stages and stops being active on stop
+		const activeAfterStage: boolean[] = [];
+		let activeAfterStop: boolean | undefined;
 
 		const run = session.runAutoPipeline(claude.model, {
 			onStageChange: stage => {
 				stages.push(stage);
+				activeAfterStage.push(session.isActive());
 				// what Esc, `x`, approve, and plan-review resolution do while a debate streams
-				if (stage === "Round 2 Debate") setTimeout(() => session.abortActiveRound(), 5);
+				if (stage === "Round 2 Debate") {
+					setTimeout(() => {
+						session.abortActiveRound();
+						activeAfterStop = session.isActive();
+					}, 5);
+				}
 			},
 		});
 
@@ -755,6 +764,8 @@ describe("report_position convergence", () => {
 		expect(stages).toEqual(["Round 1 Critiques", "Round 2 Debate"]);
 		expect(calls.some(c => isSynthesis(c.context) || lastPrompt(c.context).includes("Council Debate: Round 3"))).toBe(false);
 		expect(session.isBusy()).toBe(false);
+		expect(activeAfterStage).toEqual([true, true]);
+		expect(activeAfterStop).toBe(false);
 	});
 
 	it("keeps a round started right after a stop stoppable when the stopped round settles late", async () => {
