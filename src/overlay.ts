@@ -12,7 +12,7 @@ import {
 	truncateToWidth,
 } from "@oh-my-pi/pi-tui";
 import { getMarkdownTheme, theme } from "@oh-my-pi/pi-tui/theme";
-import { CouncilSession, isReviewerTurnEntry, type ReviewerTurnEntry } from "./council-session";
+import { CouncilSession, isReviewerTurnEntry, READER_TARGET_KEY, type ReviewerTurnEntry } from "./council-session";
 import { openDisagreementCount } from "./position";
 
 export type CouncilOverlayOutcome =
@@ -135,6 +135,15 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			});
 		}
 
+		const readerEntries = this.#session.readerEntries;
+		if (this.#session.hasCodeReader || readerEntries.length > 0) {
+			const readerBusy = readerEntries.some(e => e.status === "queued" || e.status === "reading");
+			tabs.push({
+				id: "reader",
+				label: `${readerBusy ? "⏳ " : ""}Reader${readerEntries.length > 0 ? ` (${readerEntries.length})` : ""}`,
+			});
+		}
+
 		const synthReady = this.#session.latestSynthesis?.status === "done";
 		tabs.push({
 			id: "synthesis",
@@ -167,6 +176,23 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		const md = new Markdown(text, 1, 0, getMarkdownTheme());
 		this.#markdownCache.set(id, { text, md });
 		return md;
+	}
+
+	/** reviewer turn header: status badge (naming reader waits) and, once settled, how many codebase checks it made */
+	#formatReviewerHeader(entry: ReviewerTurnEntry): string {
+		let badge = "";
+		if (entry.status === "streaming") {
+			if (entry.readerStatus === "queued") badge = theme.fg("warning", " ⏳ queued for reader...");
+			else if (entry.readerStatus === "reading") badge = theme.fg("warning", " ⏳ asking reader...");
+			else badge = theme.fg("warning", " ⏳ streaming...");
+		} else if (entry.status === "error") badge = theme.fg("error", " ✗ error");
+		else if (entry.status === "aborted") badge = theme.fg("dim", " ⊘ aborted");
+
+		const checks = entry.readerQueryCount ?? 0;
+		if (checks > 0 && !entry.readerStatus) {
+			badge += theme.fg("muted", ` · ${checks} codebase ${checks === 1 ? "check" : "checks"}`);
+		}
+		return theme.bold(theme.fg("accent", `[${entry.reviewerLabel} · Round ${entry.round} ${entry.kind}]`)) + badge;
 	}
 
 	render(width: number): string[] {
@@ -241,13 +267,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 						}
 						lines.push("");
 					} else {
-						let badge = "";
-						if (entry.status === "streaming") badge = theme.fg("warning", " ⏳ streaming...");
-						else if (entry.status === "error") badge = theme.fg("error", " ✗ error");
-						else if (entry.status === "aborted") badge = theme.fg("dim", " ⊘ aborted");
-						lines.push(
-							theme.bold(theme.fg("accent", `[${entry.reviewerLabel} · Round ${entry.round} ${entry.kind}]`)) + badge,
-						);
+						lines.push(this.#formatReviewerHeader(entry));
 						if (entry.status === "error" && entry.errorMessage) {
 							lines.push(theme.fg("error", `  Error: ${replaceTabs(entry.errorMessage)}`));
 						}
@@ -280,13 +300,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 						}
 						lines.push("");
 					} else if (isReviewerTurnEntry(entry)) {
-						let badge = "";
-						if (entry.status === "streaming") badge = theme.fg("warning", " ⏳ streaming...");
-						else if (entry.status === "error") badge = theme.fg("error", " ✗ error");
-						else if (entry.status === "aborted") badge = theme.fg("dim", " ⊘ aborted");
-						lines.push(
-							theme.bold(theme.fg("accent", `[${entry.reviewerLabel} · Round ${entry.round} ${entry.kind}]`)) + badge,
-						);
+						lines.push(this.#formatReviewerHeader(entry));
 						if (entry.status === "error" && entry.errorMessage) {
 							lines.push(theme.fg("error", `  Error: ${replaceTabs(entry.errorMessage)}`));
 						}
@@ -296,6 +310,44 @@ export class PlanCouncilOverlay implements Component, Focusable {
 						}
 						lines.push("");
 					}
+				}
+			}
+		} else if (activeTab === "reader") {
+			const readerEntries = this.#session.readerEntries;
+			if (readerEntries.length === 0) {
+				const modelLabel = this.#session.readerModelLabel;
+				lines.push(
+					"",
+					theme.fg("muted", `  No codebase reader queries yet.${modelLabel ? ` Reader model: ${modelLabel}` : ""}`),
+					"",
+					"  • Reviewers check files, symbols, and callers through the reader automatically while they review",
+					`  • Press ${theme.bold("i")} here, or type ${theme.bold("@reader <question>")} on any tab, to ask it directly`,
+					"",
+				);
+			} else {
+				for (const entry of readerEntries) {
+					let status: string;
+					if (entry.status === "queued") status = theme.fg("muted", " ⏳ queued...");
+					else if (entry.status === "reading") {
+						status = theme.fg("warning", entry.activeTool ? ` ⏳ ${entry.activeTool}...` : " ⏳ reading codebase...");
+					} else if (entry.status === "done") status = entry.cached ? theme.fg("muted", " · cached") : "";
+					else if (entry.status === "error") status = theme.fg("error", " ✗ error");
+					else status = theme.fg("dim", " ⊘ aborted");
+					const round = entry.round > 0 ? ` · Round ${entry.round}` : "";
+					lines.push(theme.bold(theme.fg("accent", replaceTabs(`[${entry.requesterLabel} → Reader${round}]`))) + status);
+					entry.question.split("\n").forEach((l, i) => {
+						lines.push(`${i === 0 ? "  Q: " : "     "}${replaceTabs(l)}`);
+					});
+					if (entry.paths && entry.paths.length > 0) {
+						lines.push(theme.fg("muted", `  Paths: ${replaceTabs(entry.paths.join(", "))}`));
+					}
+					if (entry.status === "error" && entry.errorMessage) {
+						lines.push(theme.fg("error", `  Error: ${replaceTabs(entry.errorMessage)}`));
+					}
+					if (entry.answer) {
+						lines.push(...this.#getEntryMarkdown(`reader:${entry.id}`, entry.answer).render(contentWidth));
+					}
+					lines.push("");
 				}
 			}
 		} else if (activeTab === "synthesis") {
@@ -344,7 +396,10 @@ export class PlanCouncilOverlay implements Component, Focusable {
 
 		const isStreamingTab =
 			this.#session.isBusy() &&
-			(activeTab === "council" || activeTab.startsWith("reviewer:") || activeTab === "synthesis");
+			(activeTab === "council" ||
+				activeTab.startsWith("reviewer:") ||
+				activeTab === "reader" ||
+				activeTab === "synthesis");
 		this.#scrollView.setFollowTail(isStreamingTab);
 
 		const bodyLines = this.#scrollView.render(safeWidth);
@@ -364,6 +419,8 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			const reviewerKey = activeTab.slice("reviewer:".length);
 			const reviewer = this.#session.availableReviewers.find(r => r.key === reviewerKey);
 			this.#input.prompt = `Reply @${reviewer?.model.id ?? "model"} > `;
+		} else if (activeTab === "reader") {
+			this.#input.prompt = "Ask @reader > ";
 		} else {
 			this.#input.prompt = "Ask council > ";
 		}
@@ -428,6 +485,12 @@ export class PlanCouncilOverlay implements Component, Focusable {
 				let defaultTargetKey: string | undefined;
 				if (activeTab?.startsWith("reviewer:")) {
 					defaultTargetKey = activeTab.slice("reviewer:".length);
+				} else if (activeTab === "reader") {
+					defaultTargetKey = READER_TARGET_KEY;
+				}
+				// watch the reader stream its answer live
+				if (this.#session.hasCodeReader && /^@(reader|scout)\b/i.test(text)) {
+					this.#tabBar.selectTab("reader");
 				}
 
 				void this.#session

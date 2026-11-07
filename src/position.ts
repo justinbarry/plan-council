@@ -2,6 +2,7 @@ import {
 	type,
 	type AssistantMessage,
 	type Tool,
+	type ToolCall,
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@oh-my-pi/pi-ai";
@@ -66,11 +67,28 @@ export interface ConvergenceReport {
 	unreported: string[];
 }
 
+/** validate one report_position call into a position; throws the validator's message when the arguments are invalid */
+export function validateReportedPosition(
+	block: ToolCall,
+	reviewerKey: string,
+	promptedItemIds: readonly string[],
+): ReviewerPosition {
+	// the shared validator repairs common model quirks (e.g. arrays sent as JSON strings) before rejecting
+	const args = validateToolArguments(REPORT_POSITION_TOOL, block) as typeof positionSchema.infer;
+	return {
+		verdict: args.verdict,
+		revisions: args.revisions.map((r, index) => ({ id: `${reviewerKey}#${index + 1}`, summary: r.summary })),
+		positions: args.positions.map(p => ({ id: p.id, stance: p.stance, reason: p.reason ?? "" })),
+		promptedItemIds: [...promptedItemIds],
+	};
+}
+
 /** answer every tool call in the message (providers reject unanswered calls) and extract the last valid report */
 export function parseReviewerPosition(
 	msg: AssistantMessage,
 	reviewerKey: string,
 	promptedItemIds: string[],
+	allowedToolNames: readonly string[] = [REPORT_POSITION_TOOL_NAME],
 ): ParsedPosition {
 	const parsed: ParsedPosition = { toolResults: [] };
 	let reported = false;
@@ -81,21 +99,17 @@ export function parseReviewerPosition(
 		let text: string;
 		let isError: boolean;
 		if (block.name !== REPORT_POSITION_TOOL_NAME) {
-			text = `Unknown tool "${block.name}"; only ${REPORT_POSITION_TOOL_NAME} is available.`;
+			text =
+				allowedToolNames.length > 1
+					? `Unknown tool "${block.name}"; available tools: ${allowedToolNames.join(", ")}.`
+					: `Unknown tool "${block.name}"; only ${REPORT_POSITION_TOOL_NAME} is available.`;
 			isError = true;
 		} else {
 			reported = true;
 			try {
-				// the shared validator repairs common model quirks (e.g. arrays sent as JSON strings) before rejecting
-				const args = validateToolArguments(REPORT_POSITION_TOOL, block) as typeof positionSchema.infer;
+				parsed.position = validateReportedPosition(block, reviewerKey, promptedItemIds);
 				text = "Position recorded.";
 				isError = false;
-				parsed.position = {
-					verdict: args.verdict,
-					revisions: args.revisions.map((r, index) => ({ id: `${reviewerKey}#${index + 1}`, summary: r.summary })),
-					positions: args.positions.map(p => ({ id: p.id, stance: p.stance, reason: p.reason ?? "" })),
-					promptedItemIds: [...promptedItemIds],
-				};
 			} catch (err) {
 				text = err instanceof Error ? err.message : String(err);
 				isError = true;

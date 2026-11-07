@@ -19,6 +19,7 @@ import { __closeExtensionParseCacheForTests } from "@oh-my-pi/pi-coding-agent/ex
 import type { Theme, TUI } from "@oh-my-pi/pi-tui";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { getAgentDir, getPluginsDir, removeSyncWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import type { CodebaseReader } from "../src/code-reader";
 import { CouncilSession, type ModelStreamFn } from "../src/council-session";
 import planCouncilExtension from "../src/index";
 import type { ReviewerMember } from "../src/models";
@@ -420,6 +421,122 @@ describe("PlanCouncilOverlay UI component", () => {
 		overlay.handleInput("a");
 		expect(resolvedOutcome).toEqual({ action: "approve", choice: "execute" });
 	});
+
+	it("hides the Reader tab when no reader is configured", () => {
+		const { tui } = createFakeTui();
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude],
+			initialReviewers: [claude],
+		});
+		const overlay = new PlanCouncilOverlay(tui, session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+		expect(overlay.render(120).join("\n")).not.toContain("Reader");
+	});
+
+	it("sends @reader questions to the Reader tab and answers Reader-tab questions with the reader", async () => {
+		const { tui } = createFakeTui();
+		const questions: string[] = [];
+		const reader: CodebaseReader = {
+			modelLabel: "smol-reader (test)",
+			async query(input) {
+				questions.push(input.question);
+				const answer = `Called from src/index.ts for ${input.question}`;
+				input.onTextDelta?.(answer, answer);
+				return { answer, cached: false };
+			},
+			dispose: () => {},
+		};
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude],
+			initialReviewers: [claude],
+			codeReader: reader,
+		});
+		const overlay = new PlanCouncilOverlay(tui, session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		overlay.handleInput("i");
+		for (const ch of "@reader resolvePlanReview") overlay.handleInput(ch);
+		overlay.handleInput("\r");
+		await flushMicrotasks();
+
+		const rendered = overlay.render(120).join("\n");
+		expect(rendered).toContain("Reader (1)");
+		expect(rendered).toContain("[Operator → Reader]");
+		expect(rendered).toContain("Q: resolvePlanReview");
+		expect(rendered).toContain("Called from src/index.ts for resolvePlanReview");
+		expect(rendered).toContain("Ask @reader >");
+
+		// on the Reader tab a plain question goes to the reader, not the council
+		overlay.handleInput("i");
+		for (const ch of "Which tests?") overlay.handleInput(ch);
+		overlay.handleInput("\r");
+		await flushMicrotasks();
+
+		expect(questions).toEqual(["resolvePlanReview", "Which tests?"]);
+		expect(session.entries).toHaveLength(0);
+		expect(overlay.render(120).join("\n")).toContain("Reader (2)");
+	});
+
+	it("shows live reader badges while a reviewer waits on the reader, then its codebase check count", async () => {
+		const { tui } = createFakeTui();
+		const started = Promise.withResolvers<void>();
+		const answer = Promise.withResolvers<string>();
+		const reader: CodebaseReader = {
+			modelLabel: "smol-reader (test)",
+			async query(input) {
+				input.onStatusChange?.("reading");
+				input.onToolActivity?.("grep");
+				started.resolve();
+				return { answer: await answer.promise, cached: false };
+			},
+			dispose: () => {},
+		};
+		const streamFn: ModelStreamFn = (_model, context) => {
+			const content = context.messages.some(m => m.role === "toolResult")
+				? [
+						{ type: "text", text: "Grounded critique" },
+						{ type: "toolCall", id: "c2", name: "report_position", arguments: { verdict: "APPROVE", revisions: [], positions: [] } },
+					]
+				: [{ type: "toolCall", id: "c1", name: "ask_codebase", arguments: { question: "Where is X?" } }];
+			return {
+				async *[Symbol.asyncIterator]() {},
+				result: async () => ({ role: "assistant", content, stopReason: "toolUse" }) as unknown as AssistantMessage,
+			};
+		};
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude],
+			initialReviewers: [claude],
+			codeReader: reader,
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tui, session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		const critiques = session.startInitialCritiques();
+		await started.promise;
+		const waiting = overlay.render(120).join("\n");
+		expect(waiting).toContain("⏳ asking reader...");
+		expect(waiting).toContain("⏳ Reader (1)");
+
+		// reviewer tab, then the Reader tab with the reader's current tool
+		overlay.handleInput("]");
+		overlay.handleInput("]");
+		expect(overlay.render(120).join("\n")).toContain("⏳ grep...");
+
+		answer.resolve("X lives in src/x.ts");
+		await critiques;
+		overlay.handleInput("[");
+		const done = overlay.render(120).join("\n");
+		expect(done).toContain("Grounded critique");
+		expect(done).toContain("· 1 codebase check");
+		expect(done).not.toContain("asking reader");
+	});
 });
 
 describe("planCouncilExtension lifecycle & shortcut wiring", () => {
@@ -548,6 +665,72 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 		reviewResolvedHandler(sampleResolvedEvent, fakeContext);
 		expect(setStatusKey).toBe("plan-council");
 		expect(setStatusValue).toBeUndefined();
+	});
+
+	it("reuses the cached council on reopen but rebuilds it when the reader query cap changes", async () => {
+		const isolation = isolateOmpHome("pi-council-cap-home-");
+		const projectDir = TempDir.createSync("@pi-council-cap-proj-");
+		const overridesPath = path.join(projectDir.path(), ".omp", "plugin-overrides.json");
+		const setCap = (cap: number) => {
+			fs.mkdirSync(path.dirname(overridesPath), { recursive: true });
+			fs.writeFileSync(overridesPath, JSON.stringify({ settings: { "plan-council": { maxReaderQueriesPerTurn: cap } } }));
+		};
+		const disposeSpy = spyOn(CouncilSession.prototype, "dispose");
+
+		try {
+			const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+			planCouncilExtension({
+				registerCommand: (name: string, opts: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => {
+					commands.set(name, opts);
+				},
+				registerShortcut: () => {},
+				registerFlag: () => {},
+				on: () => {},
+			} as unknown as ExtensionAPI);
+
+			const fakeContext = {
+				cwd: projectDir.path(),
+				hasUI: true,
+				agent: { kind: "main", id: "main", name: "main", depth: 0 },
+				// no reviewers, so opening never starts critiques; the session model serves as the reader
+				models: { list: () => [], current: () => claude, resolve: () => undefined, family: (m: Model) => m.provider },
+				modelRegistry: { resolver: () => undefined },
+				ui: {
+					theme,
+					notify: () => {},
+					setStatus: () => {},
+					custom: async (factory: (tui: TUI, theme: Theme, keybindings: KeybindingsManager, done: (res: unknown) => void) => unknown) => {
+						const fakeTui = { terminal: { rows: 24, cols: 80 }, requestRender: () => {} } as unknown as TUI;
+						factory(fakeTui, theme as unknown as Theme, {} as unknown as KeybindingsManager, () => {});
+						return { action: "close" };
+					},
+				},
+				resolvePlanReview: () => true,
+				getPendingPlanReview: () => ({
+					type: "plan_review_requested",
+					reviewId: "rev-cap",
+					sessionId: "sess-cap",
+					title: "Cap Plan",
+					planFilePath: "plan.md",
+					planContent: "# Cap Plan",
+					options: [{ id: "execute", label: "Execute", disabled: false }],
+				}),
+			} as unknown as ExtensionContext;
+			const open = () => commands.get("plan-council")!.handler("", fakeContext);
+
+			setCap(2);
+			await open();
+			await open();
+			expect(disposeSpy).not.toHaveBeenCalled();
+
+			setCap(5);
+			await open();
+			expect(disposeSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			disposeSpy.mockRestore();
+			projectDir.removeSync();
+			isolation.restore();
+		}
 	});
 
 	it("--auto launch runs critiques, debate, and synthesis, then resolves the plan review with refine feedback", async () => {

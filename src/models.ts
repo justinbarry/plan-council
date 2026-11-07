@@ -37,6 +37,7 @@ export const COUNCIL_ROLE_CHAINS = {
 	council2: ["@council2", "@smol", "@fast"],
 	council3: ["@council3", "@slow", "@advisor", "@reasoning"],
 	synthesizer: ["@council_synthesizer", "@council-synth", "@plan", "@slow", "@default"],
+	reader: ["@council_reader", "@council-reader", "@smol", "@fast", "@default"],
 };
 
 /** resolve a council role through its existing model fallback chain */
@@ -248,4 +249,40 @@ export function resolveSynthesizerModel(
 	}
 
 	return models.current() ?? activeReviewers[0]?.model;
+}
+
+export interface ResolvedReaderModel {
+	model: Model;
+	thinkingLevel?: ConfiguredThinkingLevel;
+}
+
+/** resolve the shared codebase reader: explicit selector (with optional :effort), then the reader role chain, then the session model */
+export function resolveReaderModel(
+	models: ExtensionModelQuery,
+	settings: PlanCouncilSettings,
+	activeReviewers: readonly ReviewerMember[],
+): ResolvedReaderModel | undefined {
+	const trimmed = settings.readerModel?.trim();
+	if (trimmed) {
+		const { base, level } = splitThinkingSuffix(trimmed, -1, MAX_THINKING_SUFFIX_OPTIONS);
+		// try the full selector first so literal model ids keep their existing meaning
+		const resolved = resolveRoleWithBackup(models, trimmed) ?? (level ? resolveRoleWithBackup(models, base) : undefined);
+		if (resolved) {
+			const thinkingLevel =
+				level !== undefined && trimmed !== resolved.id && trimmed !== modelKey(resolved)
+					? resolveThinkingLevelForModel(resolved, concreteThinkingLevel(level))
+					: undefined;
+			return { model: resolved, thinkingLevel };
+		}
+	}
+
+	for (const candidate of COUNCIL_ROLE_CHAINS.reader) {
+		const resolved = resolveModelSpec(models, candidate);
+		if (resolved) {
+			return { model: resolved };
+		}
+	}
+
+	const fallback = models.current() ?? activeReviewers[0]?.model;
+	return fallback ? { model: fallback } : undefined;
 }

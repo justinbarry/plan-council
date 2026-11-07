@@ -5,7 +5,7 @@ import type { ExtensionModelQuery } from "@oh-my-pi/pi-coding-agent/extensibilit
 import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { parseEffort } from "@oh-my-pi/pi-tui/thinking";
 import { CouncilSession } from "../src/council-session";
-import { modelKey, resolveCouncilRoster, resolveSynthesizerModel } from "../src/models";
+import { modelKey, resolveCouncilRoster, resolveReaderModel, resolveSynthesizerModel } from "../src/models";
 import { parsePlanCouncilSettings } from "../src/settings";
 
 // native effort values keep the fixtures reasoning capabilities checked by the library types
@@ -123,6 +123,27 @@ describe("per-reviewer reasoning selection", () => {
 		const query = makeModelQuery({ plan: modelKey(sol), smol: modelKey(opus) });
 		const model = resolveSynthesizerModel(query, parsePlanCouncilSettings({ synthesizerModel: "council2:high" }), []);
 		expect(model).toBe(sol);
+	});
+
+	// the reader selector takes the same effort suffix as reviewer selectors, through models and roles alike
+	it.each([
+		["openai-codex/gpt-6.1-sol:low", {}, sol, "low"],
+		["@smol:high", { smol: modelKey(opus) }, opus, "high"],
+		["openai-codex/gpt-6.1-sol", {}, sol, undefined],
+	] as const)("resolves reader selector %s with its effort", (selector, roles, model, effort) => {
+		const resolved = resolveReaderModel(makeModelQuery(roles), parsePlanCouncilSettings({ readerModel: selector }), []);
+		expect(resolved?.model).toBe(model);
+		expect(resolved?.thinkingLevel?.toString()).toBe(effort);
+	});
+
+	it("does not reinterpret a literal reader model id as a reasoning setting", () => {
+		const literal: Model = { ...sol, id: "example:max" };
+		const resolved = resolveReaderModel(
+			makeModelQuery({}, [literal]),
+			parsePlanCouncilSettings({ readerModel: "openai-codex/example:max" }),
+			[],
+		);
+		expect(resolved).toEqual({ model: literal, thinkingLevel: undefined });
 	});
 });
 

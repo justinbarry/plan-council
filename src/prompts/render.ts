@@ -4,6 +4,8 @@ import critiqueRoundTemplate from "./critique-round.md" with { type: "text" };
 import critiqueSystemTemplate from "./critique-system.md" with { type: "text" };
 import debateRebuttalTemplate from "./debate-rebuttal.md" with { type: "text" };
 import positionFollowupTemplate from "./position-followup.md" with { type: "text" };
+import readerQueryTemplate from "./reader-query.md" with { type: "text" };
+import readerSystemTemplate from "./reader-system.md" with { type: "text" };
 import synthesizeSystemTemplate from "./synthesize-system.md" with { type: "text" };
 import synthesizeUserTemplate from "./synthesize-user.md" with { type: "text" };
 import userFollowupTemplate from "./user-followup.md" with { type: "text" };
@@ -27,8 +29,16 @@ function restoreExactValues(rendered: string, replacements: readonly (readonly [
 	return result;
 }
 
-export function renderCritiqueSystem(): string {
-	return prompt.render(critiqueSystemTemplate, {});
+export interface RenderCritiqueSystemOptions {
+	hasCodeReader?: boolean;
+	maxReaderQueriesPerTurn?: number;
+}
+
+export function renderCritiqueSystem(options: RenderCritiqueSystemOptions = {}): string {
+	return prompt.render(critiqueSystemTemplate, {
+		hasCodeReader: options.hasCodeReader === true,
+		maxReaderQueriesPerTurn: options.maxReaderQueriesPerTurn ?? 3,
+	});
 }
 
 export function renderPositionFollowup(): string {
@@ -82,6 +92,7 @@ export interface RenderDebateRebuttalOptions {
 	peerCritiques: readonly PeerCritiqueItem[];
 	peerItems?: readonly RevisionItem[];
 	operatorNotes?: string;
+	hasCodeReader?: boolean;
 }
 
 /** summaries are model text: render placeholders, then restore the exact values */
@@ -130,6 +141,7 @@ export function renderDebateRebuttal(options: RenderDebateRebuttalOptions): stri
 		peerCritiques: mappedPeers,
 		peerItems: mappedItems,
 		operatorNotes: operatorNotesPlaceholder,
+		hasCodeReader: options.hasCodeReader === true,
 	});
 
 	return restoreExactValues(rendered, replacements);
@@ -210,6 +222,54 @@ export function renderSynthesizeUser(options: RenderSynthesizeUserOptions): stri
 		planFilePath: options.planFilePath,
 		planBody: planBodyPlaceholder,
 		discussionHistory: historyPlaceholder,
+	});
+
+	return restoreExactValues(rendered, replacements);
+}
+
+export interface RenderReaderSystemOptions {
+	planTitle: string;
+	planFilePath: string;
+}
+
+export function renderReaderSystem(options: RenderReaderSystemOptions): string {
+	return prompt.render(readerSystemTemplate, {
+		planTitle: options.planTitle,
+		planFilePath: options.planFilePath,
+	});
+}
+
+export interface RenderReaderQueryOptions {
+	requesterLabel: string;
+	question: string;
+	paths?: readonly string[];
+}
+
+/** questions routinely quote code (including `{{...}}`), so every caller value is restored verbatim after rendering */
+export function renderReaderQuery(options: RenderReaderQueryOptions): string {
+	const joinedPaths = options.paths && options.paths.length > 0 ? options.paths.join(", ") : undefined;
+	const exactValues: string[] = [options.question, options.requesterLabel];
+	if (joinedPaths) {
+		exactValues.push(joinedPaths);
+	}
+
+	const questionPlaceholder = exactPlaceholder("QUESTION", 0, exactValues);
+	const labelPlaceholder = exactPlaceholder("REQUESTER", 1, exactValues);
+	const replacements: Array<readonly [string, string]> = [
+		[questionPlaceholder, options.question],
+		[labelPlaceholder, options.requesterLabel],
+	];
+
+	let pathsPlaceholder: string | undefined;
+	if (joinedPaths) {
+		pathsPlaceholder = exactPlaceholder("PATHS", 2, exactValues);
+		replacements.push([pathsPlaceholder, joinedPaths]);
+	}
+
+	const rendered = prompt.render(readerQueryTemplate, {
+		requesterLabel: labelPlaceholder,
+		priorityPaths: pathsPlaceholder,
+		question: questionPlaceholder,
 	});
 
 	return restoreExactValues(rendered, replacements);
