@@ -165,6 +165,7 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 						session,
 						{
 							reviewOptions: review.options,
+							reviewTiers: review.tiers,
 							synthesizerModel: synthesizer?.model,
 							synthesizerThinkingLevel: synthesizer?.thinkingLevel,
 							warnings,
@@ -195,7 +196,12 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 					ctx.ui.notify("Failed to apply refined plan feedback.", "warning");
 				}
 			} else if (outcome.action === "approve") {
-				const resolved = ctx.resolvePlanReview(review.reviewId, outcome.choice);
+				// the overlay only reports a role when the review offers a tier slider; the host rejects one otherwise
+				const resolved = ctx.resolvePlanReview(
+					review.reviewId,
+					outcome.choice,
+					outcome.role ? { role: outcome.role } : undefined,
+				);
 				if (!resolved) {
 					ctx.ui.notify(`Failed to approve plan with choice "${outcome.choice}".`, "warning");
 				}

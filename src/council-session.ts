@@ -1122,8 +1122,21 @@ export class CouncilSession {
 		return completedKeys.size;
 	}
 
+	/** the reviewer's current position, under the same reply-retention rule synthesis and convergence use */
+	getLatestPosition(reviewerKey: string): ReviewerPosition | undefined {
+		return this.#latestPosition(reviewerKey);
+	}
+
+	/** every active reviewer with its current position, in roster order */
+	getReviewerPositions(): Array<{ reviewer: ReviewerMember; position?: ReviewerPosition }> {
+		return this.#activeReviewers.map(reviewer => ({
+			reviewer,
+			position: this.#latestPosition(reviewer.key),
+		}));
+	}
+
 	#reviewerPositions(): { label: string; position?: ReviewerPosition }[] {
-		return this.#activeReviewers.map(r => ({ label: r.label, position: this.#latestPosition(r.key) }));
+		return this.getReviewerPositions().map(({ reviewer, position }) => ({ label: reviewer.label, position }));
 	}
 
 	getConvergence(): ConvergenceReport {

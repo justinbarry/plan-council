@@ -12,11 +12,13 @@ import type {
 	PlanReviewOption,
 	PlanReviewRequestedEvent,
 	PlanReviewResolvedEvent,
+	PlanReviewTier,
 	SessionStartEvent,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { discoverAndLoadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { __closeExtensionParseCacheForTests } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
 import type { Theme, TUI } from "@oh-my-pi/pi-tui";
+import { visibleWidth } from "@oh-my-pi/pi-tui";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { parseThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { getAgentDir, getPluginsDir, logger, removeSyncWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
@@ -118,6 +120,58 @@ describe("PlanCouncilOverlay UI component", () => {
 			},
 		};
 	}
+
+	function plain(rows: readonly string[]): string {
+		return Bun.stripANSI(rows.join("\n"));
+	}
+
+	/** body rows between the header divider and the 3-row footer, ANSI stripped */
+	function bodyRows(rows: readonly string[]): string[] {
+		const stripped = rows.map(r => Bun.stripANSI(r));
+		const start = stripped.findIndex(r => /^─+$/.test(r)) + 1;
+		return stripped.slice(start, stripped.length - 3);
+	}
+
+	const synthesisText = "## Required Plan Revisions\n1. Gate the budget";
+
+	/** reviewers approve at once; the synthesizer answers only after `releaseSynthesis` */
+	function gatedSynthesisStream(): { streamFn: ModelStreamFn; synthesisStarted: Promise<void>; releaseSynthesis: () => void } {
+		const started = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const streamFn: ModelStreamFn = (_model, context) => {
+			// reviewer turns offer report_position; the synthesizer request carries no tools
+			const reviewer = Boolean(context.tools?.length);
+			if (!reviewer) started.resolve();
+			return {
+				async *[Symbol.asyncIterator]() {},
+				result: async () => {
+					if (!reviewer) await gate.promise;
+					return {
+						role: "assistant",
+						content: reviewer
+							? [
+									{ type: "text", text: "Approve" },
+									{ type: "toolCall", id: "call-0", name: "report_position", arguments: { verdict: "APPROVE", revisions: [], positions: [] } },
+								]
+							: [{ type: "text", text: synthesisText }],
+						stopReason: reviewer ? "toolUse" : "stop",
+					} as unknown as AssistantMessage;
+				},
+			};
+		};
+		return { streamFn, synthesisStarted: started.promise, releaseSynthesis: () => gate.resolve() };
+	}
+
+	const approvalOptions: PlanReviewOption[] = [
+		{ id: "execute", label: "Execute plan", disabled: false },
+		{ id: "compact", label: "Compact & execute", disabled: false },
+		{ id: "keep", label: "Keep context", disabled: true },
+		{ id: "refine", label: "Refine plan", disabled: false },
+	];
+	const reviewTiers: PlanReviewTier[] = [
+		{ role: "smol", provider: "openai", model: "gpt-4o-mini" },
+		{ role: "default", provider: "anthropic", model: "claude-3-7-sonnet", thinkingLevel: parseThinkingLevel("high") },
+	];
 
 	it("renders title, tabs, empty state guide, and hint bar", () => {
 		const { tui } = createFakeTui();
@@ -461,7 +515,7 @@ describe("PlanCouncilOverlay UI component", () => {
 		}
 	});
 
-	it("resolves approve action on 'a'", () => {
+	it("opens an approval picker on 'a', cancels on Esc, and confirms the chosen approval and execution tier", () => {
 		const { tui } = createFakeTui();
 		const session = new CouncilSession({
 			planTitle: "Test Plan",
@@ -470,22 +524,144 @@ describe("PlanCouncilOverlay UI component", () => {
 			availableReviewers: [claude],
 			initialReviewers: [claude],
 		});
-
-		let resolvedOutcome: CouncilOverlayOutcome | undefined;
+		const outcomes: CouncilOverlayOutcome[] = [];
 		const overlay = new PlanCouncilOverlay(
 			tui,
 			session,
-			{
-				reviewOptions: defaultReviewOptions,
-				synthesizerModel: claude.model,
-			},
-			res => {
-				resolvedOutcome = res;
-			},
+			{ reviewOptions: approvalOptions, reviewTiers, synthesizerModel: claude.model },
+			res => outcomes.push(res),
 		);
+		const footer = () => plain(overlay.render(100).slice(-3));
 
 		overlay.handleInput("a");
-		expect(resolvedOutcome).toEqual({ action: "approve", choice: "execute" });
+		expect(outcomes).toEqual([]);
+		let bar = footer();
+		expect(bar).toContain("Approve:  Execute plan   Compact & execute");
+		expect(bar).not.toContain("Keep context");
+		// the host's default tier is preselected
+		expect(bar).toContain("Tier: ◂ default (claude-3-7-sonnet:high) ▸");
+
+		overlay.handleInput("\x1b");
+		expect(outcomes).toEqual([]);
+		expect(footer()).not.toContain("Approve:");
+
+		overlay.handleInput("a");
+		overlay.handleInput("\x1b[C");
+		overlay.handleInput("\t");
+		bar = footer();
+		expect(bar).toContain("Tier: ◂ smol (gpt-4o-mini) ▸");
+		overlay.handleInput("\r");
+		expect(outcomes).toEqual([{ action: "approve", choice: "compact", role: "smol" }]);
+	});
+
+	it("keeps an auto run's synthesis from closing the overlay once the approval picker is open", async () => {
+		const { tui } = createFakeTui();
+		const { streamFn, synthesisStarted, releaseSynthesis } = gatedSynthesisStream();
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude],
+			initialReviewers: [claude],
+			streamFn,
+		});
+		const outcomes: CouncilOverlayOutcome[] = [];
+		const overlay = new PlanCouncilOverlay(
+			tui,
+			session,
+			{ reviewOptions: defaultReviewOptions, synthesizerModel: claude.model, autoProceed: true },
+			res => outcomes.push(res),
+		);
+		const footer = () => plain(overlay.render(100).slice(-3));
+
+		await synthesisStarted;
+		overlay.handleInput("a");
+		releaseSynthesis();
+		await delay(5);
+		expect(session.latestSynthesis?.status).toBe("done");
+		expect(outcomes).toEqual([]);
+		expect(footer()).toContain("Approve:");
+
+		overlay.handleInput("\x1b");
+		expect(outcomes).toEqual([]);
+		const browse = footer();
+		expect(browse).not.toContain("Approve:");
+		expect(browse).toContain("Synthesis ready — press f to refine plan, or a to approve.");
+
+		overlay.handleInput("a");
+		overlay.handleInput("\r");
+		expect(outcomes).toEqual([{ action: "approve", choice: "execute" }]);
+	});
+
+	it.each(["auto", "f"])("reports only the approval when Enter lands as the %s synthesis settles", async trigger => {
+		const { tui } = createFakeTui();
+		const { streamFn, synthesisStarted, releaseSynthesis } = gatedSynthesisStream();
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude],
+			initialReviewers: [claude],
+			streamFn,
+		});
+		if (trigger === "f") await session.startInitialCritiques();
+		const outcomes: CouncilOverlayOutcome[] = [];
+		const overlay = new PlanCouncilOverlay(
+			tui,
+			session,
+			{ reviewOptions: defaultReviewOptions, synthesizerModel: claude.model, autoProceed: trigger === "auto" },
+			res => outcomes.push(res),
+		);
+		if (trigger === "f") overlay.handleInput("f");
+
+		await synthesisStarted;
+		overlay.handleInput("a");
+		releaseSynthesis();
+		overlay.handleInput("\r");
+		await delay(5);
+		expect(outcomes).toEqual([{ action: "approve", choice: "execute" }]);
+	});
+
+	it.each([
+		["while the picker is open", false],
+		["after the picker is cancelled", true],
+	] as const)("leaves an f synthesis superseded by the picker to the operator when it settles %s", async (_when, cancelFirst) => {
+		const { tui } = createFakeTui();
+		const { streamFn, synthesisStarted, releaseSynthesis } = gatedSynthesisStream();
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude],
+			initialReviewers: [claude],
+			streamFn,
+		});
+		await session.startInitialCritiques();
+		const outcomes: CouncilOverlayOutcome[] = [];
+		const overlay = new PlanCouncilOverlay(
+			tui,
+			session,
+			{ reviewOptions: defaultReviewOptions, synthesizerModel: claude.model },
+			res => outcomes.push(res),
+		);
+		const footer = () => plain(overlay.render(100).slice(-3));
+
+		overlay.handleInput("f");
+		await synthesisStarted;
+		overlay.handleInput("a");
+		if (cancelFirst) overlay.handleInput("\x1b");
+		releaseSynthesis();
+		await delay(5);
+		expect(outcomes).toEqual([]);
+		if (!cancelFirst) {
+			expect(footer()).toContain("Approve:");
+			overlay.handleInput("\x1b");
+			expect(outcomes).toEqual([]);
+		}
+		expect(footer()).toContain("Synthesis ready — press f to refine plan, or a to approve.");
+
+		overlay.handleInput("f");
+		expect(outcomes).toEqual([{ action: "refine", feedback: synthesisText }]);
 	});
 
 	it("hides the Reader tab when no reader is configured", () => {
@@ -661,6 +837,309 @@ describe("PlanCouncilOverlay UI component", () => {
 		expect(done).not.toContain("asking reader");
 	});
 
+	it("scores verdicts, required revisions, and disputes, and collapses the scorecard on 'o'", async () => {
+		const { tui } = createFakeTui();
+		const streamFn: ModelStreamFn = (model, context) => {
+			const prompt = String(context.messages[context.messages.length - 1].content);
+			const debate = prompt.includes("Council Debate");
+			const args =
+				model.id === claude.model.id
+					? {
+							verdict: "APPROVE",
+							revisions: [],
+							positions: debate ? [{ id: `${gpt.key}#1`, stance: "dispute", reason: "already clamped" }] : [],
+						}
+					: { verdict: "NEEDS REVISION", revisions: [{ summary: "Clamp negative budgets" }], positions: [] };
+			return {
+				async *[Symbol.asyncIterator]() {},
+				result: async () =>
+					({
+						role: "assistant",
+						content: [
+							{ type: "text", text: "Review" },
+							{ type: "toolCall", id: "call-0", name: "report_position", arguments: args },
+						],
+						stopReason: "toolUse",
+					}) as unknown as AssistantMessage,
+			};
+		};
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tui, session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		await session.startInitialCritiques();
+		let rows = overlay.render(120);
+		let text = plain(rows);
+		expect(text).toContain("▾ Consensus Scorecard · 1 open · 1 revision");
+		expect(text).toContain("✓ APPROVE · claude-3-7-sonnet (anthropic) (no required revisions)");
+		expect(text).toContain("△ NEEDS REVISION · gpt-4o (openai) (1 required revision)");
+		expect(text).toContain("• gpt-4o#1: Clamp negative budgets");
+		expect(text).toContain("• 1 revision awaits peer cross-examination (press d to debate)");
+		expect(text).toMatch(/\[claude-3-7-sonnet \(anthropic\) · Round 1 critique\] ✓ APPROVE · \d+\.\ds/);
+		expect(text).toMatch(/\[gpt-4o \(openai\) · Round 1 critique\] △ NEEDS REVISION · \d+\.\ds/);
+		const tabRow = Bun.stripANSI(rows[1]);
+		expect(tabRow).toContain("✓ claude-3-7-sonnet");
+		expect(tabRow).toContain("△ gpt-4o");
+
+		await session.runDebateRound();
+		text = plain(overlay.render(120));
+		expect(text).toContain("⚡ Dispute on gpt-4o#1 by claude-3-7-sonnet (anthropic): already clamped");
+		expect(text).not.toContain("awaits peer cross-examination");
+
+		overlay.handleInput("o");
+		rows = overlay.render(120);
+		expect(bodyRows(rows)[0]).toContain("▸ Consensus Scorecard · 1 open · 1 revision (o to expand)");
+		expect(plain(rows)).not.toContain("△ NEEDS REVISION · gpt-4o");
+		overlay.handleInput("o");
+		expect(plain(overlay.render(120))).toContain("△ NEEDS REVISION · gpt-4o");
+	});
+
+	it("shows configuration warnings and the reviewer, synthesizer, and reader settings", () => {
+		const { tui } = createFakeTui();
+		const thinkingClaude: ReviewerMember = { ...claude, thinkingLevel: parseThinkingLevel("high") };
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [thinkingClaude, gpt],
+			initialReviewers: [thinkingClaude],
+		});
+		const overlay = new PlanCouncilOverlay(
+			tui,
+			session,
+			{
+				reviewOptions: defaultReviewOptions,
+				synthesizerModel: gpt.model,
+				synthesizerThinkingLevel: parseThinkingLevel("low"),
+				warnings: ["Role @council3 did not resolve"],
+			},
+			() => {},
+		);
+
+		expect(plain(overlay.render(100))).toContain("⚠ Role @council3 did not resolve");
+		overlay.handleInput("m");
+		const models = plain(overlay.render(100));
+		expect(models).toContain("claude-3-7-sonnet (anthropic) [family: anthropic · thinking: high]");
+		expect(models).toContain("gpt-4o (openai) [family: openai]");
+		expect(models).toContain("Synthesizer: gpt-4o (openai) · thinking: low");
+		expect(models).toContain("Codebase reader: disabled");
+		expect(models).toContain("⚠ Role @council3 did not resolve");
+	});
+
+	it("restores each tab's scroll position when returning to it", () => {
+		const { tui } = createFakeTui();
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: Array.from({ length: 60 }, (_, i) => `- item ${i}`).join("\n"),
+			availableReviewers: [claude],
+			initialReviewers: [claude],
+		});
+		const overlay = new PlanCouncilOverlay(tui, session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		// Council → claude → Synthesis → Plan
+		for (let i = 0; i < 3; i++) overlay.handleInput("]");
+		expect(bodyRows(overlay.render(80))[0]).toMatch(/\bitem 0\b/);
+		for (let i = 0; i < 5; i++) overlay.handleInput("j");
+		expect(bodyRows(overlay.render(80))[0]).toMatch(/\bitem 5\b/);
+
+		overlay.handleInput("[");
+		expect(bodyRows(overlay.render(80))[1]).toContain("No synthesis available yet.");
+
+		overlay.handleInput("]");
+		expect(bodyRows(overlay.render(80))[0]).toMatch(/\bitem 5\b/);
+	});
+
+	it("follows an auto run's tail until the operator scrolls up, holds through stage changes, and resumes on G or a new run", async () => {
+		const { tui } = createFakeTui();
+		const gates: Array<() => void> = [];
+		let call = 0;
+		// every turn streams 30 distinct lines at once and settles when its gate opens
+		const streamFn: ModelStreamFn = (model, context) => {
+			const turn = ++call;
+			const reviewer = Boolean(context.tools?.length);
+			const text = `Turn ${turn}\n\n${Array.from({ length: 30 }, (_, i) => `- t${turn} point ${i}`).join("\n")}`;
+			const gate = Promise.withResolvers<void>();
+			gates.push(gate.resolve);
+			const position =
+				model.id === gpt.model.id
+					? { verdict: "NEEDS REVISION", revisions: [{ summary: "Clamp" }], positions: [] }
+					: { verdict: "APPROVE", revisions: [], positions: [] };
+			return {
+				async *[Symbol.asyncIterator]() {
+					yield { type: "text_delta", delta: text } as unknown as AssistantMessageEvent;
+				},
+				result: async () => {
+					await gate.promise;
+					return {
+						role: "assistant",
+						content: reviewer
+							? [{ type: "text", text }, { type: "toolCall", id: `call-${turn}`, name: "report_position", arguments: position }]
+							: [{ type: "text", text }],
+						stopReason: reviewer ? "toolUse" : "stop",
+					} as unknown as AssistantMessage;
+				},
+			};
+		};
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(
+			tui,
+			session,
+			{ reviewOptions: defaultReviewOptions, synthesizerModel: claude.model, maxDebateRounds: 1 },
+			() => {},
+		);
+		const visible = () => bodyRows(overlay.render(80));
+
+		try {
+			// collapsed, the scorecard keeps one height as positions arrive, so only appended turns move content
+			overlay.handleInput("o");
+			overlay.handleInput(" ");
+			await delay(5);
+			// Round 1: t1 claude, t2 gpt
+			expect(visible().join("\n")).toContain("t2 point 29");
+			gates[0]();
+			await delay(5);
+			expect(visible().join("\n")).toContain("t2 point 29");
+
+			for (let i = 0; i < 5; i++) overlay.handleInput("k");
+			const pausedTop = visible()[0];
+			expect(visible().join("\n")).not.toContain("t2 point 29");
+
+			// Round 1 → Round 2 debate (t3, t4) → synthesis (t5) without snapping back to the tail
+			gates[1]();
+			await delay(5);
+			expect(session.round).toBe(2);
+			expect(visible()[0]).toBe(pausedTop);
+			expect(visible().join("\n")).not.toContain("t4 point 29");
+			gates[2]();
+			gates[3]();
+			await delay(5);
+			expect(session.latestSynthesis?.status).toBe("streaming");
+			expect(visible()[0]).toBe(pausedTop);
+			expect(visible().join("\n")).not.toContain("t5 point 29");
+
+			overlay.handleInput("G");
+			expect(visible().join("\n")).toContain("t5 point 29");
+			gates[4]();
+			await delay(5);
+			expect(session.isActive()).toBe(false);
+
+			// a paused view resumes following when the next run starts
+			for (let i = 0; i < 3; i++) overlay.handleInput("[");
+			for (let i = 0; i < 5; i++) overlay.handleInput("k");
+			overlay.handleInput(" ");
+			await delay(5);
+			expect(visible().join("\n")).toContain("t7 point 29");
+			for (let i = 0; i < 5; i++) overlay.handleInput("k");
+			expect(visible().join("\n")).not.toContain("t7 point 29");
+			overlay.handleInput("G");
+			expect(visible().join("\n")).toContain("t7 point 29");
+		} finally {
+			for (let i = 0; i < 10 && session.isActive(); i++) {
+				for (const open of gates) open();
+				await delay(5);
+			}
+			overlay.dispose();
+			session.dispose();
+		}
+	});
+
+	it("keeps the full frame height and every tab reachable on a narrow terminal", () => {
+		const { tui } = createFakeTui();
+		const gemini = makeFakeReviewer("google", "gemini-2.5-pro-preview-20250506");
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt, gemini],
+			initialReviewers: [claude, gpt, gemini],
+		});
+		const overlay = new PlanCouncilOverlay(tui, session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		const rows = overlay.render(56);
+		expect(rows).toHaveLength(24);
+		expect(rows.every(r => visibleWidth(r) <= 56)).toBe(true);
+		const header = plain(rows.slice(0, rows.findIndex(r => /^─+$/.test(Bun.stripANSI(r)))));
+		expect(header).toContain("gemini-2.5-pr…");
+		expect(header).toContain("Models");
+
+		overlay.handleInput("m");
+		const models = overlay.render(56);
+		expect(models).toHaveLength(24);
+		expect(plain(models)).toContain("gemini-2.5-pro-preview-20250506 (google)");
+	});
+
+	it("shows the plan beside the discussion on 'p', scrolls only the focused pane, and collapses when narrow", async () => {
+		const tui = { terminal: { rows: 24, cols: 140 }, requestRender: () => {} } as unknown as TUI;
+		const critique = Array.from({ length: 40 }, (_, i) => `- critique point ${i}`).join("\n");
+		const streamFn: ModelStreamFn = () => ({
+			async *[Symbol.asyncIterator]() {},
+			result: async () =>
+				({
+					role: "assistant",
+					content: [
+						{ type: "text", text: critique },
+						{ type: "toolCall", id: "call-0", name: "report_position", arguments: { verdict: "APPROVE", revisions: [], positions: [] } },
+					],
+					stopReason: "toolUse",
+				}) as unknown as AssistantMessage,
+		});
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "docs/plan.md",
+			planContent: Array.from({ length: 40 }, (_, i) => `- plan step ${i}`).join("\n"),
+			availableReviewers: [claude],
+			initialReviewers: [claude],
+			streamFn,
+		});
+		await session.startInitialCritiques();
+		const overlay = new PlanCouncilOverlay(tui, session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		overlay.handleInput("p");
+		let rows = overlay.render(140);
+		expect(rows).toHaveLength(24);
+		expect(Bun.stripANSI(rows[0])).toContain("[Split · Main]");
+		let body = bodyRows(rows);
+		expect(body[0]).toContain("Consensus Scorecard");
+		expect(body[0]).toContain(" │   Plan Reference (docs/plan.md)");
+
+		// focus the plan pane: j scrolls it while the discussion stays put
+		overlay.handleInput("\x1b[C");
+		for (let i = 0; i < 3; i++) overlay.handleInput("j");
+		rows = overlay.render(140);
+		expect(Bun.stripANSI(rows[0])).toContain("[Split · Plan]");
+		body = bodyRows(rows);
+		expect(body[0]).toContain("Consensus Scorecard");
+		expect(body[0]).toContain(" ┃ ");
+		expect(body.join("\n")).not.toContain("Plan Reference");
+		const dividerAt = body[0].indexOf("┃");
+		const planTop = body[0].slice(dividerAt);
+		expect(planTop).toMatch(/plan step \d+/);
+
+		overlay.handleInput("\x1b[D");
+		for (let i = 0; i < 3; i++) overlay.handleInput("j");
+		body = bodyRows(overlay.render(140));
+		expect(body[0]).not.toContain("Consensus Scorecard");
+		expect(body[0].slice(dividerAt)).toBe(planTop.replace("┃", "│"));
+
+		rows = overlay.render(80);
+		expect(rows).toHaveLength(24);
+		expect(Bun.stripANSI(rows[0])).toContain("[Split: narrow]");
+		expect(plain(rows)).not.toContain("plan step");
+	});
 });
 
 describe("planCouncilExtension lifecycle & shortcut wiring", () => {
@@ -1130,6 +1609,71 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 		}
 	});
 
+	it("resolves the plan review with the approval and execution tier picked in the overlay", async () => {
+		const isolation = isolateOmpHome("pi-council-tier-home-");
+		const projectDir = TempDir.createSync("@pi-council-tier-proj-");
+		try {
+			const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+			planCouncilExtension({
+				registerCommand: (name: string, opts: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => {
+					commands.set(name, opts);
+				},
+				registerShortcut: () => {},
+				registerFlag: () => {},
+				on: () => {},
+				events: { emit: () => {}, on: () => () => {} },
+			} as unknown as ExtensionAPI);
+
+			const resolved: Array<{ reviewId: string; choice: string; input?: { feedback?: string; role?: string } }> = [];
+			const ctx = {
+				cwd: projectDir.path(),
+				hasUI: true,
+				agent: { kind: "main", id: "main", name: "main", depth: 0 },
+				// no reviewers, so opening never starts critiques
+				models: { list: () => [], current: () => claude, resolve: () => undefined, family: (m: Model) => m.provider },
+				modelRegistry: { resolver: () => undefined },
+				ui: {
+					theme,
+					notify: () => {},
+					setStatus: () => {},
+					custom: (factory: (tui: TUI, theme: Theme, keybindings: KeybindingsManager, done: (res: unknown) => void) => unknown) => {
+						const { promise, resolve } = Promise.withResolvers<unknown>();
+						const fakeTui = { terminal: { rows: 24, cols: 80 }, requestRender: () => {} } as unknown as TUI;
+						const overlay = factory(fakeTui, theme as unknown as Theme, {} as unknown as KeybindingsManager, resolve) as PlanCouncilOverlay;
+						// open the picker, pick Compact, step from the preselected default tier to smol, confirm
+						for (const key of ["a", "\x1b[C", "\t", "\r"]) overlay.handleInput(key);
+						return promise;
+					},
+				},
+				resolvePlanReview: (reviewId: string, choice: string, input?: { feedback?: string; role?: string }) => {
+					resolved.push({ reviewId, choice, input });
+					return true;
+				},
+				getPendingPlanReview: (): PlanReviewRequestedEvent => ({
+					type: "plan_review_requested",
+					reviewId: "rev-tier",
+					sessionId: "sess-tier",
+					title: "Tier Plan",
+					planFilePath: "plan.md",
+					planContent: "# Tier Plan",
+					options: [
+						{ id: "execute", label: "Execute", disabled: false },
+						{ id: "compact", label: "Compact", disabled: false },
+					],
+					tiers: [
+						{ role: "smol", provider: "openai", model: "gpt-4o-mini" },
+						{ role: "default", provider: "anthropic", model: "claude-3-7-sonnet" },
+					],
+				}),
+			} as unknown as ExtensionContext;
+
+			await commands.get("plan-council")!.handler("", ctx);
+			expect(resolved).toEqual([{ reviewId: "rev-tier", choice: "compact", input: { role: "smol" } }]);
+		} finally {
+			projectDir.removeSync();
+			isolation.restore();
+		}
+	});
 });
 
 describe("plugin package discovery", () => {
