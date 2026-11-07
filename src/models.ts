@@ -257,24 +257,49 @@ export function resolveCouncilRoster(models: ExtensionModelQuery, settings: Plan
 	};
 }
 
-export function resolveSynthesizerModel(
+export interface ResolvedSynthesizer {
+	model: Model;
+	thinkingLevel?: ConfiguredThinkingLevel;
+}
+
+/** retain the synthesizer model and its explicit supported thinking level */
+export function resolveSynthesizer(
 	models: ExtensionModelQuery,
 	settings: PlanCouncilSettings,
 	activeReviewers: readonly ReviewerMember[],
-): Model | undefined {
+): ResolvedSynthesizer | undefined {
 	if (settings.synthesizerModel) {
-		const resolved = resolveRoleWithBackup(models, settings.synthesizerModel)?.model;
+		const spec = settings.synthesizerModel.trim();
+		const { base, level } = splitThinkingSuffix(spec, -1, MAX_THINKING_SUFFIX_OPTIONS);
+		// resolve the full selector first to preserve model ids with a literal thinking suffix
+		const resolved = (resolveRoleWithBackup(models, spec) ?? (level ? resolveRoleWithBackup(models, base) : undefined))?.model;
 		if (resolved) {
-			return resolved;
+			const literalId = spec.toLowerCase() === resolved.id.toLowerCase() || spec.toLowerCase() === modelKey(resolved).toLowerCase();
+			return {
+				model: resolved,
+				thinkingLevel: level && !literalId
+					? resolveThinkingLevelForModel(resolved, concreteThinkingLevel(level))
+					: undefined,
+			};
 		}
 	}
 
 	for (const candidate of COUNCIL_ROLE_CHAINS.synthesizer) {
 		const resolved = resolveModelSpec(models, candidate)?.model;
 		if (resolved) {
-			return resolved;
+			return { model: resolved };
 		}
 	}
 
-	return models.current() ?? activeReviewers[0]?.model;
+	const model = models.current() ?? activeReviewers[0]?.model;
+	return model ? { model } : undefined;
+}
+
+/** preserve the model only lookup for existing callers */
+export function resolveSynthesizerModel(
+	models: ExtensionModelQuery,
+	settings: PlanCouncilSettings,
+	activeReviewers: readonly ReviewerMember[],
+): Model | undefined {
+	return resolveSynthesizer(models, settings, activeReviewers)?.model;
 }

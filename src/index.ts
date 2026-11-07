@@ -7,7 +7,7 @@ import type {
 import { matchesKey, type KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import { CouncilSession, extractSessionGoalContext } from "./council-session";
-import { resolveCouncilRoster, resolveSynthesizerModel } from "./models";
+import { resolveCouncilRoster, resolveSynthesizer } from "./models";
 import { type CouncilOverlayOutcome, PlanCouncilOverlay } from "./overlay";
 import { DEFAULT_PLAN_COUNCIL_SETTINGS, loadPlanCouncilSettings, type PlanCouncilSettings } from "./settings";
 
@@ -54,6 +54,7 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 		});
 	}
 
+	/** open the council with the latest reviewer and synthesizer selections */
 	async function launchCouncilOverlay(
 		ctx: ExtensionContext | ExtensionCommandContext,
 		review: PlanReviewRequestedEvent,
@@ -69,7 +70,7 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 		try {
 			currentSettings = await loadPlanCouncilSettings(ctx.cwd);
 			const roster = resolveCouncilRoster(ctx.models, currentSettings);
-			const synthModel = resolveSynthesizerModel(ctx.models, currentSettings, roster.reviewers);
+			const synthesizer = resolveSynthesizer(ctx.models, currentSettings, roster.reviewers);
 
 			const sessionCacheKey = `${review.sessionId}:${review.planFilePath}:${Bun.hash(review.planContent)}`;
 			let session: CouncilSession;
@@ -115,7 +116,8 @@ export default function planCouncilExtension(pi: ExtensionAPI): void {
 						session,
 						{
 							reviewOptions: review.options,
-							synthesizerModel: synthModel,
+							synthesizerModel: synthesizer?.model,
+							synthesizerThinkingLevel: synthesizer?.thinkingLevel,
 							warnings: roster.warnings,
 							autoProceed,
 							autoDebate: currentSettings.autoDebate,

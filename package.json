@@ -70,7 +70,7 @@
 			"synthesizerModel": {
 				"type": "string",
 				"default": "",
-				"description": "Model selector or role name used to synthesize discussion into Refine feedback (empty uses slow role, then session model)"
+				"description": "Model selector or role name with an optional thinking suffix such as :xhigh for synthesis (empty uses the configured role fallback chain)"
 			},
 			"shortcut": {
 				"type": "string",

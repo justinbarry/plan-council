@@ -18,6 +18,7 @@ import { discoverAndLoadExtensions } from "@oh-my-pi/pi-coding-agent/extensibili
 import { __closeExtensionParseCacheForTests } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
 import type { Theme, TUI } from "@oh-my-pi/pi-tui";
 import { theme } from "@oh-my-pi/pi-tui/theme";
+import { parseThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { getAgentDir, getPluginsDir, removeSyncWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { CouncilSession, type ModelStreamFn } from "../src/council-session";
 import planCouncilExtension from "../src/index";
@@ -329,6 +330,70 @@ describe("PlanCouncilOverlay UI component", () => {
 		expect(resolvedOutcome?.action).toBe("refine");
 		if (resolvedOutcome && resolvedOutcome.action === "refine") {
 			expect(resolvedOutcome.feedback).toContain("## Required Plan Revisions");
+		}
+	});
+
+	// all synthesis actions must forward the selected effort through the real session
+	it.each(["s", "f", "auto"])("retains synthesizer reasoning for %s", async action => {
+		const { tui } = createFakeTui();
+		const calls: Array<Parameters<ModelStreamFn>[2]> = [];
+		// capture request options while completing every model stream locally
+		const streamFn: ModelStreamFn = (_model, context, options) => {
+			calls.push(options);
+			// reviewer turns (which offer report_position) report, so no forced report request is made
+			const reviewer = Boolean(context.tools?.length);
+			return {
+				async *[Symbol.asyncIterator]() {},
+				result: async () => ({
+					role: "assistant",
+					content: reviewer
+						? [
+								{ type: "text", text: "Approve" },
+								{ type: "toolCall", id: "call-0", name: "report_position", arguments: { verdict: "APPROVE", revisions: [], positions: [] } },
+							]
+						: [{ type: "text", text: "Synthesized feedback" }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: claude.model.id,
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+					stopReason: reviewer ? "toolUse" : "stop",
+					timestamp: Date.now(),
+				}),
+			};
+		};
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude],
+			initialReviewers: [claude],
+			streamFn,
+		});
+		const finished = Promise.withResolvers<void>();
+		// resolve on synthesis completion so the assertion waits for the actual request
+		const unsubscribe = session.subscribe(() => {
+			if (session.latestSynthesis?.status === "done") finished.resolve();
+		});
+		const overlay = new PlanCouncilOverlay(tui, session, {
+			reviewOptions: defaultReviewOptions,
+			synthesizerModel: claude.model,
+			synthesizerThinkingLevel: parseThinkingLevel("high"),
+			autoProceed: action === "auto",
+		}, () => {});
+
+		try {
+			if (action !== "auto") {
+				await session.startInitialCritiques();
+				overlay.handleInput(action);
+			}
+			await finished.promise;
+			expect(calls).toHaveLength(2);
+			expect(calls[0]?.reasoning).toBeUndefined();
+			expect(calls[1]?.reasoning?.toString()).toBe("high");
+		} finally {
+			unsubscribe();
+			overlay.dispose();
+			session.dispose();
 		}
 	});
 
