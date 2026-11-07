@@ -133,15 +133,22 @@ openai-codex/gpt-6.1-sol:xhigh, anthropic/claude-opus-5-5:high
 ```
 
 An explicit suffix also works with a role selector, such as `council1:xhigh` or
-`@advisor:high`. Put the suffix in `reviewerModels`; OMP's model-query API does
-not expose the thinking level stored inside a role definition.
+`@advisor:high`, and overrides any level configured on the role.
+
+Without a suffix, a reviewer picked through a role (in `reviewerModels`, the
+`council1`–`council6` roles, or automatic selection) uses the thinking level
+configured on that role, such as `plan: provider/model:high` in `modelRoles`.
+This needs an OMP version whose extension API includes
+`ctx.models.resolveSelection`; on older versions, put the suffix in
+`reviewerModels` instead, because their model-query API does not expose role
+levels.
 
 The chosen setting applies to initial critiques, debate rounds, and operator
 questions, including targeted replies and reviewers toggled in the Models tab.
 The selected effort follows OMP's normal adjustment to the model's supported
 reasoning levels. Use `:off` to request that reasoning be disabled. Selectors
-without a suffix keep the existing request defaults. Synthesis keeps its
-existing behavior.
+with neither a suffix nor a role level keep the existing request defaults.
+Synthesis keeps its existing behavior.
 
 ### Custom Model Roles
 

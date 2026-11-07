@@ -43,13 +43,26 @@ const limited: Model = {
 };
 
 /** resolve selectors through omp while keeping the model catalog local to the test */
-function makeModelQuery(roles: Record<string, string> = {}, available: Model[] = [sol, opus]): ExtensionModelQuery {
-	return {
+function makeModelQuery(
+	roles: Record<string, string> = {},
+	available: Model[] = [sol, opus],
+	host: { resolveSelection?: boolean } = {},
+): ExtensionModelQuery {
+	const resolveRole = (spec: string) => resolveModelRoleValue(spec, available, { roleLookup: { getModelRole: role => roles[role] } });
+	const query: ExtensionModelQuery = {
 		list: () => available,
 		current: () => sol,
-		resolve: spec => resolveModelRoleValue(spec, available, { roleLookup: { getModelRole: role => roles[role] } }).model,
+		resolve: spec => resolveRole(spec).model,
 		family: model => model.identity.class,
 	};
+	if (!host.resolveSelection) return query;
+	// newer omp hosts also expose the level a role or suffix configures
+	return Object.assign(query, {
+		resolveSelection: (spec: string) => {
+			const { model, thinkingLevel } = resolveRole(spec);
+			return model ? { model, thinkingLevel } : undefined;
+		},
+	});
 }
 
 /** complete a model request, reporting an approving position, without calling a provider */
@@ -123,6 +136,50 @@ describe("per-reviewer reasoning selection", () => {
 		const query = makeModelQuery({ plan: modelKey(sol), smol: modelKey(opus) });
 		const model = resolveSynthesizerModel(query, parsePlanCouncilSettings({ synthesizerModel: "council2:high" }), []);
 		expect(model).toBe(sol);
+	});
+});
+
+// a role's configured level reaches reviewers when the omp host reports it
+describe("role thinking levels", () => {
+	const withSelection = { resolveSelection: true };
+	const levels = (reviewers: { key: string; thinkingLevel?: unknown }[]) =>
+		reviewers.map(reviewer => [reviewer.key, reviewer.thinkingLevel?.toString()]);
+
+	it("uses the role's level for a selector without a suffix, and keeps defaults on older hosts", () => {
+		const roles = { plan: `${modelKey(sol)}:high` };
+		const settings = parsePlanCouncilSettings({ reviewerModels: "plan" });
+		expect(levels(resolveCouncilRoster(makeModelQuery(roles, [sol, opus], withSelection), settings).reviewers)).toEqual([
+			[modelKey(sol), "high"],
+		]);
+		expect(levels(resolveCouncilRoster(makeModelQuery(roles), settings).reviewers)).toEqual([[modelKey(sol), undefined]]);
+	});
+
+	it("lets an explicit suffix override the role's level", () => {
+		const query = makeModelQuery({ plan: `${modelKey(sol)}:high` }, [sol, opus], withSelection);
+		const roster = resolveCouncilRoster(query, parsePlanCouncilSettings({ reviewerModels: "plan:medium" }));
+		expect(levels(roster.reviewers)).toEqual([[modelKey(sol), "medium"]]);
+	});
+
+	it("limits a role's level to what the model supports", () => {
+		const query = makeModelQuery({ plan: `${modelKey(limited)}:xhigh` }, [sol, opus, limited], withSelection);
+		const roster = resolveCouncilRoster(query, parsePlanCouncilSettings({ reviewerModels: "plan" }));
+		expect(levels(roster.reviewers)).toEqual([[modelKey(limited), "high"]]);
+	});
+
+	it("applies role levels to council roles and auto-selected reviewers", () => {
+		const council = makeModelQuery(
+			{ council1: `${modelKey(sol)}:xhigh`, council2: `${modelKey(opus)}:low` },
+			[sol, opus],
+			withSelection,
+		);
+		expect(levels(resolveCouncilRoster(council, parsePlanCouncilSettings({})).reviewers)).toEqual([
+			[modelKey(sol), "xhigh"],
+			[modelKey(opus), "low"],
+		]);
+
+		// the session model (sol) is skipped, so the @plan role's model is auto-selected with its level
+		const auto = makeModelQuery({ plan: `${modelKey(opus)}:high` }, [sol, opus], withSelection);
+		expect(levels(resolveCouncilRoster(auto, parsePlanCouncilSettings({})).reviewers)).toEqual([[modelKey(opus), "high"]]);
 	});
 });
 

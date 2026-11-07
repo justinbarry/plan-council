@@ -22,10 +22,33 @@ export function modelKey(model: Pick<Model, "provider" | "id">): string {
 	return `${model.provider}/${model.id}`;
 }
 
-export function resolveModelSpec(models: ExtensionModelQuery, spec: string): Model | undefined {
+export interface ModelSelection {
+	model: Model;
+	/** level from an explicit suffix or the matched role pattern; only OMP hosts with `ctx.models.resolveSelection` report it */
+	thinkingLevel?: ConfiguredThinkingLevel;
+}
+
+/** `ctx.models.resolveSelection` exists on newer OMP hosts; older ones resolve only the model */
+type SelectionModelQuery = ExtensionModelQuery & {
+	resolveSelection?: (spec: string) => ModelSelection | undefined;
+};
+
+function querySelection(models: ExtensionModelQuery, spec: string): ModelSelection | undefined {
+	const query = models as SelectionModelQuery;
+	if (query.resolveSelection) return query.resolveSelection(spec);
+	const model = models.resolve(spec);
+	return model ? { model } : undefined;
+}
+
+/** a requested level limited to what the model supports; `auto` and unset keep request defaults */
+function supportedThinkingLevel(model: Model, level: ConfiguredThinkingLevel | undefined) {
+	return resolveThinkingLevelForModel(model, concreteThinkingLevel(level));
+}
+
+export function resolveModelSpec(models: ExtensionModelQuery, spec: string): ModelSelection | undefined {
 	const trimmed = spec.trim();
 	if (!trimmed) return undefined;
-	return models.resolve(trimmed) ?? (trimmed.startsWith("@") ? undefined : models.resolve(`@${trimmed}`));
+	return querySelection(models, trimmed) ?? (trimmed.startsWith("@") ? undefined : querySelection(models, `@${trimmed}`));
 }
 
 function isOutdatedSnapshot(id: string): boolean {
@@ -40,7 +63,7 @@ export const COUNCIL_ROLE_CHAINS = {
 };
 
 /** resolve a council role through its existing model fallback chain */
-export function resolveRoleWithBackup(models: ExtensionModelQuery, roleName: string): Model | undefined {
+export function resolveRoleWithBackup(models: ExtensionModelQuery, roleName: string): ModelSelection | undefined {
 	const normalized = roleName.startsWith("@") ? roleName.slice(1) : roleName;
 	const roleChains: Readonly<Record<string, readonly string[] | undefined>> = COUNCIL_ROLE_CHAINS;
 	const chain = roleChains[normalized];
@@ -91,11 +114,12 @@ export function resolveCouncilRoster(models: ExtensionModelQuery, settings: Plan
 			const trimmed = spec.trim();
 			const { base, level } = splitThinkingSuffix(trimmed, -1, MAX_THINKING_SUFFIX_OPTIONS);
 			// try the full selector first so literal model ids keep their existing meaning
-			const resolved = resolveRoleWithBackup(models, trimmed) ?? (level ? resolveRoleWithBackup(models, base) : undefined);
-			if (!resolved) {
+			const selection = resolveRoleWithBackup(models, trimmed) ?? (level ? resolveRoleWithBackup(models, base) : undefined);
+			if (!selection) {
 				warnings.push(`Unknown or unauthenticated reviewer model: "${spec}"`);
 				continue;
 			}
+			const resolved = selection.model;
 			const key = modelKey(resolved);
 			if (!resolvedMap.has(key)) {
 				const existing = availableMap.get(key);
@@ -106,7 +130,8 @@ export function resolveCouncilRoster(models: ExtensionModelQuery, settings: Plan
 					model: resolved,
 				};
 				if (trimmed !== resolved.id && trimmed !== key) {
-					reviewer.thinkingLevel = resolveThinkingLevelForModel(resolved, concreteThinkingLevel(level));
+					// an explicit suffix wins; without one, use the level the role configures
+					reviewer.thinkingLevel = supportedThinkingLevel(resolved, level ?? selection.thinkingLevel);
 				}
 				// keep the same reviewer object for model toggles and targeted replies
 				resolvedMap.set(key, reviewer);
@@ -122,19 +147,20 @@ export function resolveCouncilRoster(models: ExtensionModelQuery, settings: Plan
 	// If explicit council roles are configured (e.g. @council1, @council2, @council3), use them directly
 	const explicitCouncilMembers: ReviewerMember[] = [];
 	for (const role of ["@council1", "@council2", "@council3", "@council4", "@council5", "@council6"]) {
-		const resolved = models.resolve(role);
-		if (resolved) {
+		const selection = querySelection(models, role);
+		if (selection) {
+			const resolved = selection.model;
 			const key = modelKey(resolved);
-			const existing = availableMap.get(key);
 			if (!explicitCouncilMembers.some(m => m.key === key)) {
-				explicitCouncilMembers.push(
-					existing ?? {
-						key,
-						label: `${resolved.id} (${resolved.provider})`,
-						family: models.family(resolved),
-						model: resolved,
-					},
-				);
+				const member: ReviewerMember = availableMap.get(key) ?? {
+					key,
+					label: `${resolved.id} (${resolved.provider})`,
+					family: models.family(resolved),
+					model: resolved,
+				};
+				const roleLevel = supportedThinkingLevel(resolved, selection.thinkingLevel);
+				if (roleLevel) member.thinkingLevel = roleLevel;
+				explicitCouncilMembers.push(member);
 			}
 		}
 	}
@@ -150,11 +176,15 @@ export function resolveCouncilRoster(models: ExtensionModelQuery, settings: Plan
 	const planningModel = models.current();
 	const planningKey = planningModel ? modelKey(planningModel) : undefined;
 	const candidateModels: Model[] = [];
+	// auto-selected reviewers found through a role keep that role's level (first role wins)
+	const roleLevels = new Map<string, ConfiguredThinkingLevel>();
 
 	for (const role of CANDIDATE_ROLES) {
-		const m = resolveModelSpec(models, role);
-		if (m) {
-			candidateModels.push(m);
+		const selection = resolveModelSpec(models, role);
+		if (selection) {
+			candidateModels.push(selection.model);
+			const key = modelKey(selection.model);
+			if (selection.thinkingLevel !== undefined && !roleLevels.has(key)) roleLevels.set(key, selection.thinkingLevel);
 		}
 	}
 
@@ -171,16 +201,15 @@ export function resolveCouncilRoster(models: ExtensionModelQuery, settings: Plan
 			continue;
 		}
 		if (!dedupedCandidates.has(key)) {
-			const existing = availableMap.get(key);
-			dedupedCandidates.set(
+			const member: ReviewerMember = availableMap.get(key) ?? {
 				key,
-				existing ?? {
-					key,
-					label: `${m.id} (${m.provider})`,
-					family: models.family(m),
-					model: m,
-				},
-			);
+				label: `${m.id} (${m.provider})`,
+				family: models.family(m),
+				model: m,
+			};
+			const roleLevel = supportedThinkingLevel(m, roleLevels.get(key));
+			if (roleLevel) member.thinkingLevel = roleLevel;
+			dedupedCandidates.set(key, member);
 		}
 	}
 
@@ -234,14 +263,14 @@ export function resolveSynthesizerModel(
 	activeReviewers: readonly ReviewerMember[],
 ): Model | undefined {
 	if (settings.synthesizerModel) {
-		const resolved = resolveRoleWithBackup(models, settings.synthesizerModel);
+		const resolved = resolveRoleWithBackup(models, settings.synthesizerModel)?.model;
 		if (resolved) {
 			return resolved;
 		}
 	}
 
 	for (const candidate of COUNCIL_ROLE_CHAINS.synthesizer) {
-		const resolved = resolveModelSpec(models, candidate);
+		const resolved = resolveModelSpec(models, candidate)?.model;
 		if (resolved) {
 			return resolved;
 		}
