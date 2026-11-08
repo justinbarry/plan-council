@@ -27,12 +27,12 @@ import {
 	type ConvergenceReport,
 	formatConvergence,
 	formatReportedPositions,
+	isUnanimousApproval,
 	parseReviewerPosition,
 	REPORT_POSITION_TOOL,
 	REPORT_POSITION_TOOL_NAME,
 	type ReviewerPosition,
 	type RevisionItem,
-	shouldStartDebate,
 	validateReportedPosition,
 } from "./position";
 import {
@@ -1143,6 +1143,14 @@ export class CouncilSession {
 		return computeConvergence(this.#reviewerPositions());
 	}
 
+	/** every active reviewer currently approves and requires no change, so there is nothing to debate or refine */
+	approvedUnanimously(): boolean {
+		return isUnanimousApproval(
+			this.getConvergence(),
+			this.#activeReviewers.map(r => this.#latestPosition(r.key)?.verdict),
+		);
+	}
+
 	/** run the council stages while retaining the synthesizer thinking selection */
 	async runAutoPipeline(
 		synthesizerModel: Model | undefined,
@@ -1170,8 +1178,7 @@ export class CouncilSession {
 
 			const maxDebateRounds = options.maxDebateRounds ?? 3;
 			if (options.autoDebate !== false) {
-				const verdicts = this.#activeReviewers.map(r => this.#latestPosition(r.key)?.verdict);
-				if (shouldStartDebate(this.getConvergence(), verdicts)) {
+				if (!this.approvedUnanimously()) {
 					for (let i = 0; i < maxDebateRounds; i++) {
 						if (this.#completedReviewerCount() < 2) break;
 						stage(`Round ${this.#round + 1} Debate`);

@@ -41,6 +41,14 @@
 				"default": false,
 				"description": "Automatically run critiques, debate disagreements, synthesize, and refine without manual steps"
 			},
+			"maxAutoRefines": {
+				"type": "number",
+				"default": 2,
+				"min": 0,
+				"max": 10,
+				"step": 1,
+				"description": "Consecutive automatic refines of one plan before autoProceed stops and waits for you"
+			},
 			"autoDebate": {
 				"type": "boolean",
 				"default": true,

@@ -22,7 +22,8 @@ export type ApprovalChoice = "execute" | "compact" | "keep";
 
 export type CouncilOverlayOutcome =
 	| { action: "close" }
-	| { action: "refine"; feedback: string }
+	/** `auto` marks a refine the auto pipeline applied without an operator keypress */
+	| { action: "refine"; feedback: string; auto?: boolean }
 	| {
 			action: "approve";
 			choice: ApprovalChoice;
@@ -38,6 +39,9 @@ export interface PlanCouncilOverlayOptions {
 	synthesizerThinkingLevel?: ConfiguredThinkingLevel;
 	warnings?: string[];
 	autoProceed?: boolean;
+	/** automatic refines already applied to this plan in a row; with `maxAutoRefines`, caps unattended refine loops */
+	autoRefinesUsed?: number;
+	maxAutoRefines?: number;
 	autoDebate?: boolean;
 	maxDebateRounds?: number;
 }
@@ -101,6 +105,8 @@ export class PlanCouncilOverlay implements Component, Focusable {
 	/** bumped by each manual refine request and by opening the picker, superseding in-flight requests */
 	#manualRefineSeq = 0;
 	#autoProceed: boolean;
+	#autoRefinesUsed: number;
+	#maxAutoRefines: number;
 	#autoDebate: boolean;
 	#maxDebateRounds: number;
 	#autoStage?: string;
@@ -155,6 +161,8 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		this.#synthesizerThinkingLevel = options.synthesizerThinkingLevel;
 		this.#warnings = options.warnings ?? [];
 		this.#autoProceed = options.autoProceed ?? false;
+		this.#autoRefinesUsed = options.autoRefinesUsed ?? 0;
+		this.#maxAutoRefines = options.maxAutoRefines ?? Number.POSITIVE_INFINITY;
 		this.#autoDebate = options.autoDebate ?? true;
 		this.#maxDebateRounds = options.maxDebateRounds ?? 3;
 		this.#done = done;
@@ -1210,23 +1218,24 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			// never pull the tab out from under an open approval picker
 			if (this.#mode !== "approve") this.#tabBar.selectTab("synthesis");
 
-			if (
-				autoApplyRefine &&
-				!this.#autoRefineDisarmed &&
-				this.#mode !== "approve" &&
-				synth.status === "done" &&
-				synth.text.trim()
-			) {
-				this.#finish({ action: "refine", feedback: synth.text.trim() });
-			} else {
-				this.#statusBanner = {
-					text: this.#autoRefineDisarmed
-						? SYNTHESIS_READY_BANNER
-						: "Council complete! Press f to apply revisions to plan, or a to approve.",
-					isError: false,
-				};
-				this.#tui.requestRender();
+			const feedback = synth.status === "done" ? synth.text.trim() : "";
+			let banner: string | undefined;
+			if (this.#autoRefineDisarmed) {
+				banner = SYNTHESIS_READY_BANNER;
+			} else if (this.#session.approvedUnanimously()) {
+				// nothing to change: refining would only start another review of the same plan
+				banner = "Council approves unanimously — press a to approve, or f to refine anyway.";
+			} else if (!autoApplyRefine || !feedback) {
+				banner = "Council complete! Press f to apply revisions to plan, or a to approve.";
+			} else if (this.#autoRefinesUsed >= this.#maxAutoRefines) {
+				banner = `Auto-refine limit (${this.#maxAutoRefines}) reached — press f to refine, or a to approve.`;
 			}
+			if (banner === undefined) {
+				this.#finish({ action: "refine", feedback, auto: true });
+				return;
+			}
+			this.#statusBanner = { text: banner, isError: false };
+			this.#tui.requestRender();
 		} catch (err) {
 			if (this.#resolved) return;
 			this.#autoStage = undefined;

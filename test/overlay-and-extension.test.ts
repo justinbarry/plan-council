@@ -593,6 +593,37 @@ describe("PlanCouncilOverlay UI component", () => {
 		expect(outcomes).toEqual([{ action: "approve", choice: "execute" }]);
 	});
 
+	it("leaves a unanimously approved plan to the operator instead of auto-refining it", async () => {
+		const { tui } = createFakeTui();
+		const { streamFn, releaseSynthesis } = gatedSynthesisStream();
+		releaseSynthesis();
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn,
+		});
+		const outcomes: CouncilOverlayOutcome[] = [];
+		const overlay = new PlanCouncilOverlay(
+			tui,
+			session,
+			{ reviewOptions: defaultReviewOptions, synthesizerModel: claude.model, autoProceed: true },
+			res => outcomes.push(res),
+		);
+
+		for (let i = 0; i < 50 && session.isActive(); i++) await delay(5);
+		await delay(5);
+		expect(session.latestSynthesis?.status).toBe("done");
+		expect(outcomes).toEqual([]);
+		// both reviewers approved in Round 1 with nothing to change, so no debate round ran either
+		expect(session.round).toBe(1);
+		expect(plain(overlay.render(100).slice(-3))).toContain(
+			"Council approves unanimously — press a to approve, or f to refine anyway.",
+		);
+	});
+
 	it.each(["auto", "f"])("reports only the approval when Enter lands as the %s synthesis settles", async trigger => {
 		const { tui } = createFakeTui();
 		const { streamFn, synthesisStarted, releaseSynthesis } = gatedSynthesisStream();
@@ -1670,6 +1701,128 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 			await commands.get("plan-council")!.handler("", ctx);
 			expect(resolved).toEqual([{ reviewId: "rev-tier", choice: "compact", input: { role: "smol" } }]);
 		} finally {
+			projectDir.removeSync();
+			isolation.restore();
+		}
+	});
+
+	it("stops auto-refining a plan after maxAutoRefines in a row until the operator refines it", async () => {
+		const isolation = isolateOmpHome("pi-council-autocap-home-");
+		const projectDir = TempDir.createSync("@pi-council-autocap-proj-");
+		fs.mkdirSync(projectDir.join(".omp"));
+		fs.writeFileSync(
+			projectDir.join(".omp", "plugin-overrides.json"),
+			JSON.stringify({ settings: { "plan-council": { maxAutoRefines: 1, enableCodeReader: false } } }),
+		);
+		const synthesis = "## Required Plan Revisions\n1. Add a rollback step";
+		// reviewers always want a change, so the council never approves on its own
+		const streamSpy = spyOn(ai, "streamSimple").mockImplementation(((_model: Model, context: Context) => {
+			const last = context.messages[context.messages.length - 1];
+			const prompt = last.role === "user" && typeof last.content === "string" ? last.content : "";
+			const isSynthesis = (context.systemPrompt?.[0] ?? "").includes("Synthesizer");
+			const peerIds = [...prompt.matchAll(/^- `([^`]+)`: /gm)].map(m => m[1]);
+			const content: AssistantMessage["content"] = isSynthesis
+				? [{ type: "text", text: synthesis }]
+				: [
+						{ type: "text", text: "### Verdict\nNEEDS REVISION" },
+						{
+							type: "toolCall",
+							id: "call-0",
+							name: "report_position",
+							arguments: {
+								verdict: "NEEDS REVISION",
+								revisions: [{ summary: "Add a rollback step" }],
+								positions: peerIds.map(id => ({ id, stance: "agree", reason: "" })),
+							},
+						},
+					];
+			const msg = { role: "assistant", content, stopReason: isSynthesis ? "stop" : "toolUse" } as unknown as AssistantMessage;
+			return {
+				async *[Symbol.asyncIterator](): AsyncGenerator<AssistantMessageEvent> {},
+				result: async () => msg,
+			} as unknown as ReturnType<typeof ai.streamSimple>;
+		}) as typeof ai.streamSimple);
+
+		try {
+			const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+			planCouncilExtension({
+				registerCommand: (name: string, opts: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => {
+					commands.set(name, opts);
+				},
+				registerShortcut: () => {},
+				registerFlag: () => {},
+				on: () => {},
+				events: { emit: () => {}, on: () => () => {} },
+			} as unknown as ExtensionAPI);
+
+			const gpt = makeFakeModel("openai", "gpt-4o");
+			// each refine makes the agent propose a revised plan: same session and plan file, new review
+			const reviewFor = (n: number): PlanReviewRequestedEvent => ({
+				type: "plan_review_requested",
+				reviewId: `rev-${n}`,
+				sessionId: "sess-autocap",
+				title: "Cap Plan",
+				planFilePath: "plan.md",
+				planContent: `# Cap Plan v${n}`,
+				options: [{ id: "execute", label: "Execute", disabled: false }],
+			});
+			let pending = reviewFor(1);
+			const overlays: PlanCouncilOverlay[] = [];
+			const resolved: Array<{ reviewId: string; choice: string }> = [];
+			const ctx = {
+				cwd: projectDir.path(),
+				hasUI: true,
+				agent: { kind: "main", id: "main", name: "main", depth: 0 },
+				models: { list: () => [claude, gpt], current: () => claude, resolve: () => undefined, family: (m: Model) => m.provider },
+				modelRegistry: { resolver: () => undefined },
+				ui: {
+					theme,
+					notify: () => {},
+					setStatus: () => {},
+					custom: (factory: (tui: TUI, theme: Theme, keybindings: KeybindingsManager, done: (res: unknown) => void) => unknown) => {
+						const { promise, resolve } = Promise.withResolvers<unknown>();
+						const fakeTui = { terminal: { rows: 24, cols: 100 }, requestRender: () => {} } as unknown as TUI;
+						overlays.push(factory(fakeTui, theme as unknown as Theme, {} as unknown as KeybindingsManager, resolve) as PlanCouncilOverlay);
+						return promise;
+					},
+				},
+				resolvePlanReview: (reviewId: string, choice: string) => {
+					resolved.push({ reviewId, choice });
+					return true;
+				},
+				getPendingPlanReview: () => pending,
+			} as unknown as ExtensionContext;
+			const openAuto = () =>
+				Promise.race([
+					commands.get("plan-council")!.handler("--auto", ctx),
+					delay(3000).then(() => {
+						throw new Error("auto launch never resolved the review");
+					}),
+				]);
+
+			await openAuto();
+			expect(resolved).toEqual([{ reviewId: "rev-1", choice: "refine" }]);
+
+			// the revised plan gets a full council, but the budget is spent, so it waits instead of refining
+			pending = reviewFor(2);
+			const second = commands.get("plan-council")!.handler("--auto", ctx);
+			const footer = () => Bun.stripANSI(overlays[1]?.render(100).join("\n") ?? "");
+			for (let i = 0; i < 300 && !footer().includes("Auto-refine limit (1) reached"); i++) await delay(10);
+			expect(footer()).toContain("Auto-refine limit (1) reached — press f to refine, or a to approve.");
+			expect(resolved).toHaveLength(1);
+
+			// an operator refine restores the budget for the next revision
+			overlays[1].handleInput("f");
+			await second;
+			pending = reviewFor(3);
+			await openAuto();
+			expect(resolved).toEqual([
+				{ reviewId: "rev-1", choice: "refine" },
+				{ reviewId: "rev-2", choice: "refine" },
+				{ reviewId: "rev-3", choice: "refine" },
+			]);
+		} finally {
+			streamSpy.mockRestore();
 			projectDir.removeSync();
 			isolation.restore();
 		}

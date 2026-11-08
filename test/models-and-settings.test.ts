@@ -86,6 +86,13 @@ describe("settings parser", () => {
 		expect(parsePlanCouncilSettings({ maxDebateRounds: "invalid" }).maxDebateRounds).toBe(3);
 	});
 
+	it("parses and clamps maxAutoRefines, where 0 turns automatic refining off", () => {
+		const parsed = [undefined, 0, -3, 11, "4", 1.6, "bad"].map(
+			raw => parsePlanCouncilSettings(raw === undefined ? {} : { maxAutoRefines: raw }).maxAutoRefines,
+		);
+		expect(parsed).toEqual([2, 0, 0, 10, 4, 2, 2]);
+	});
+
 	it("splits CSV reviewerModels and trims whitespace", () => {
 		const parsed = parsePlanCouncilSettings({ reviewerModels: " anthropic/claude-3-5-sonnet, , openai/gpt-4o " });
 		expect(parsed.reviewerModels).toEqual(["anthropic/claude-3-5-sonnet", "openai/gpt-4o"]);

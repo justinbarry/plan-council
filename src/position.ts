@@ -175,12 +175,12 @@ export function computeConvergence(reviewers: { label: string; position?: Review
 	return report;
 }
 
-/** skip debate only when every reviewer reported, approves, and requires no change */
-export function shouldStartDebate(
+/** at least one reviewer, every reviewer reported APPROVE, and none requires a change */
+export function isUnanimousApproval(
 	report: ConvergenceReport,
 	verdicts: (ReviewerPosition["verdict"] | undefined)[],
 ): boolean {
-	return !(report.converged && report.items.length === 0 && verdicts.every(v => v === "APPROVE"));
+	return report.converged && report.items.length === 0 && verdicts.length > 0 && verdicts.every(v => v === "APPROVE");
 }
 
 export function openDisagreementCount(report: ConvergenceReport): number {

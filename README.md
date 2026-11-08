@@ -38,7 +38,7 @@ When OMP creates a plan (`write xd://propose`), Plan Council convenes a panel of
 - **Multi-Model Parallel Critiques**: Runs Round 1 critiques simultaneously across distinct model families (e.g. OpenAI, Google, Anthropic).
 - **Cross-Model Debate Rounds**: In Round 2+, models receive peer critiques plus each peer's numbered required revisions, debate discrepancies, retract refuted points, and report an agree/dispute stance on every peer revision.
 - **Convergence Tracking**: Every reviewer turn records its verdict, required revisions, and stances through a `report_position` tool call. The overlay title shows `· converged` or `· N open`, and the synthesizer is told which revisions are still contested.
-- **Autonomous & Coax-Free Mode**: Set `autoProceed: true` to have the council automatically critique, debate until no reviewer disputes a peer revision (or `maxDebateRounds` is reached), synthesize, and submit revisions to `Refine plan` without touching a key.
+- **Autonomous & Coax-Free Mode**: Set `autoProceed: true` to have the council automatically critique, debate until no reviewer disputes a peer revision (or `maxDebateRounds` is reached), synthesize, and submit revisions to `Refine plan` without touching a key. Auto mode stops and waits for you when every reviewer approves with no required revisions, or after `maxAutoRefines` refines of the same plan in a row (default 2). Refining or approving yourself, in the council or the native review, resets that count.
 - **Operator Steering**: Jump in at any time to steer the council via broadcast questions (`Ask council > ...`) or targeted mentions (`Ask council > @gpt ...`).
 - **Shared Codebase Reader**: Reviewers verify file paths, signatures, line anchors, and callers against the repository through an `ask_codebase` tool backed by one persistent read-only subagent (`read`, `grep`, `glob`, `find`, `ast_grep`, `lsp`). Queries run one at a time so files the reader already inspected stay warm across reviewers and rounds, and identical questions are answered once. Ask it yourself with `@reader <question>` (or `@scout`), or by typing on the `Reader` tab; your reader findings travel with the next debate round.
 - **Pre-Attached Plan Files**: Repository files the plan names (`src/foo.ts`, `src/foo.ts:10-20`, `lines 30–40 of src/bar.ts`) are attached to every reviewer's Round 1 prompt as numbered excerpts, so reviewers read them without spending `ask_codebase` calls. A file of up to 200 lines that fits in 8,000 characters is attached whole. A larger file shows windows around its cited lines, or its first lines when none are cited. At most 8 files and 24,000 characters are attached in total. Paths outside the repository, symlinks that resolve outside it, the plan file, binaries, lockfiles, build output, `node_modules`, and secret files such as `.env` or `*.pem` are never attached. The `Reader` tab lists what was attached. This works whether or not `enableCodeReader` is on.
@@ -124,6 +124,9 @@ omp plugin config set plan-council maxReviewers 2
 
 # Cap automatic debate rounds after Round 1 (1-5, default 3)
 omp plugin config set plan-council maxDebateRounds 2
+
+# Auto-refine a plan at most this many times in a row before waiting for you (0-10, default 2; 0 never auto-refines)
+omp plugin config set plan-council maxAutoRefines 3
 
 # Change the activation shortcut
 omp plugin config set plan-council shortcut "ctrl+p"

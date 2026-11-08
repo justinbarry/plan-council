@@ -10,6 +10,8 @@ export interface PlanCouncilSettings {
 	reviewerModels: string[];
 	maxReviewers: number;
 	maxDebateRounds: number;
+	/** consecutive automatic refines of one plan before auto mode waits for the operator */
+	maxAutoRefines: number;
 	synthesizerModel: string | undefined;
 	shortcut: string;
 	includeSessionContext: boolean;
@@ -25,6 +27,7 @@ export const DEFAULT_PLAN_COUNCIL_SETTINGS: PlanCouncilSettings = {
 	reviewerModels: [],
 	maxReviewers: 3,
 	maxDebateRounds: 3,
+	maxAutoRefines: 2,
 	synthesizerModel: undefined,
 	shortcut: "ctrl+n",
 	includeSessionContext: true,
@@ -70,6 +73,13 @@ export function parsePlanCouncilSettings(raw: Record<string, unknown>): PlanCoun
 		}
 	}
 
+	let maxAutoRefines = DEFAULT_PLAN_COUNCIL_SETTINGS.maxAutoRefines;
+	const rawAutoRefines =
+		typeof raw.maxAutoRefines === "string" ? Number.parseInt(raw.maxAutoRefines, 10) : raw.maxAutoRefines;
+	if (typeof rawAutoRefines === "number" && Number.isFinite(rawAutoRefines)) {
+		maxAutoRefines = Math.min(10, Math.max(0, Math.round(rawAutoRefines)));
+	}
+
 	const synthesizerModel =
 		typeof raw.synthesizerModel === "string" && raw.synthesizerModel.trim()
 			? raw.synthesizerModel.trim()
@@ -110,6 +120,7 @@ export function parsePlanCouncilSettings(raw: Record<string, unknown>): PlanCoun
 		reviewerModels,
 		maxReviewers,
 		maxDebateRounds,
+		maxAutoRefines,
 		synthesizerModel,
 		shortcut,
 		includeSessionContext,

@@ -33,6 +33,9 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 	let overlayAbort: AbortController | undefined;
 	let unsubscribeInput: (() => void) | undefined;
 	let cachedCouncil: { key: string; session: CouncilSession } | undefined;
+	/** automatic refines applied in a row, per agent session and plan file; an operator decision resets it */
+	const autoRefineCounts = new Map<string, number>();
+	const autoRefineKey = (review: PlanReviewRequestedEvent) => `${review.sessionId}:${review.planFilePath}`;
 
 	function ensureInputListener(ctx: ExtensionContext, shortcut: string): void {
 		if (unsubscribeInput || !ctx.hasUI || ctx.agent.kind === "sub") {
@@ -170,6 +173,8 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 							synthesizerThinkingLevel: synthesizer?.thinkingLevel,
 							warnings,
 							autoProceed,
+							autoRefinesUsed: autoRefineCounts.get(autoRefineKey(review)) ?? 0,
+							maxAutoRefines: currentSettings.maxAutoRefines,
 							autoDebate: currentSettings.autoDebate,
 							maxDebateRounds: currentSettings.maxDebateRounds,
 						},
@@ -194,6 +199,11 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 				const resolved = ctx.resolvePlanReview(review.reviewId, "refine", { feedback: outcome.feedback });
 				if (!resolved) {
 					ctx.ui.notify("Failed to apply refined plan feedback.", "warning");
+				} else if (outcome.auto) {
+					const key = autoRefineKey(review);
+					autoRefineCounts.set(key, (autoRefineCounts.get(key) ?? 0) + 1);
+				} else {
+					autoRefineCounts.delete(autoRefineKey(review));
 				}
 			} else if (outcome.action === "approve") {
 				// the overlay only reports a role when the review offers a tier slider; the host rejects one otherwise
@@ -204,6 +214,8 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 				);
 				if (!resolved) {
 					ctx.ui.notify(`Failed to approve plan with choice "${outcome.choice}".`, "warning");
+				} else {
+					autoRefineCounts.delete(autoRefineKey(review));
 				}
 			}
 		} catch (err) {
@@ -292,6 +304,8 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 
 	pi.on("plan_review_resolved", (event, ctx) => {
 		if (activeReview?.reviewId === event.reviewId) {
+			// the operator answered in the native review: auto mode may refine on its own again
+			if (event.by === "local" && event.choice !== undefined) autoRefineCounts.delete(autoRefineKey(activeReview));
 			activeReview = undefined;
 			if (overlayAbort) {
 				overlayAbort.abort();
@@ -319,6 +333,7 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 			cachedCouncil.session.dispose();
 			cachedCouncil = undefined;
 		}
+		autoRefineCounts.clear();
 		activeReview = undefined;
 		overlayOpen = false;
 		ctx.ui.setStatus("plan-council", undefined);
