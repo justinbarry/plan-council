@@ -1171,6 +1171,61 @@ describe("PlanCouncilOverlay UI component", () => {
 		expect(Bun.stripANSI(rows[0])).toContain("[Split: narrow]");
 		expect(plain(rows)).not.toContain("plan step");
 	});
+
+	it("scrolls the pane under the pointer with the wheel and focuses the pane that is clicked", async () => {
+		const tui = { terminal: { rows: 24, cols: 140 }, requestRender: () => {} } as unknown as TUI;
+		const critique = Array.from({ length: 40 }, (_, i) => `- critique point ${i}`).join("\n");
+		const streamFn: ModelStreamFn = () => ({
+			async *[Symbol.asyncIterator]() {},
+			result: async () =>
+				({
+					role: "assistant",
+					content: [
+						{ type: "text", text: critique },
+						{ type: "toolCall", id: "call-0", name: "report_position", arguments: { verdict: "APPROVE", revisions: [], positions: [] } },
+					],
+					stopReason: "toolUse",
+				}) as unknown as AssistantMessage,
+		});
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "docs/plan.md",
+			planContent: Array.from({ length: 40 }, (_, i) => `- plan step ${i}`).join("\n"),
+			availableReviewers: [claude],
+			initialReviewers: [claude],
+			streamFn,
+		});
+		await session.startInitialCritiques();
+		const overlay = new PlanCouncilOverlay(tui, session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+		overlay.handleInput("p");
+		// at 140 columns the discussion takes columns 1-78 and the plan starts after the divider; SGR coordinates are 1-based
+		const wheelDown = (col: number) => `\x1b[<65;${col};9M`;
+		const click = (col: number) => `\x1b[<0;${col};9M`;
+		const panes = () => {
+			const rows = overlay.render(140);
+			const top = bodyRows(rows)[0];
+			return { title: Bun.stripANSI(rows[0]), main: top.slice(0, 70), plan: top.slice(81) };
+		};
+
+		const before = panes();
+		expect(before.plan).toContain("Plan Reference");
+		overlay.handleInput(wheelDown(121));
+		const afterPlanWheel = panes();
+		expect(afterPlanWheel.main).toBe(before.main);
+		expect(afterPlanWheel.plan).toMatch(/plan step \d+/);
+		// scrolling does not move keyboard focus
+		expect(afterPlanWheel.title).toContain("[Split · Main]");
+
+		overlay.handleInput(wheelDown(11));
+		const afterMainWheel = panes();
+		expect(afterMainWheel.main).not.toBe(before.main);
+		expect(afterMainWheel.plan).toBe(afterPlanWheel.plan);
+
+		overlay.handleInput(click(121));
+		expect(panes().title).toContain("[Split · Plan]");
+		overlay.handleInput(click(11));
+		expect(panes().title).toContain("[Split · Main]");
+	});
 });
 
 describe("planCouncilExtension lifecycle & shortcut wiring", () => {

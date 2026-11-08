@@ -189,7 +189,6 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 						maxHeight: "100%",
 						margin: 0,
 						fullscreen: true,
-						mouseTracking: false,
 					},
 				},
 			);

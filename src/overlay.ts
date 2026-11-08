@@ -120,6 +120,10 @@ export class PlanCouncilOverlay implements Component, Focusable {
 	#focusedPane: "left" | "right" = "left";
 	/** whether the last render had room to show both panes */
 	#lastShowingSplit = false;
+	/** where the last render drew the body and the split divider, to route mouse events to the pane under the pointer */
+	#lastBodyTop = 0;
+	#lastBodyHeight = 0;
+	#lastDividerCol = 0;
 	#input: Input;
 	#modelCursor = 0;
 	#statusBanner?: StatusBanner;
@@ -452,6 +456,9 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		const geometry = splitActive ? this.#splitPane.measure(safeWidth) : undefined;
 		const showingSplit = geometry?.mode === "split";
 		this.#lastShowingSplit = showingSplit;
+		this.#lastBodyTop = headerRows;
+		this.#lastBodyHeight = bodyHeight;
+		this.#lastDividerCol = geometry?.dividerCol ?? safeWidth;
 		const leftWidth = showingSplit ? (geometry.left?.width ?? safeWidth) : safeWidth;
 		const contentWidth = Math.max(10, leftWidth - 4);
 
@@ -840,14 +847,23 @@ export class PlanCouncilOverlay implements Component, Focusable {
 
 	/** dispatch council controls with the configured synthesizer model and thinking level */
 	handleInput(data: string): void {
-		// SGR mouse scroll support
+		// SGR mouse: with the split shown, the wheel scrolls the pane under the pointer and a click focuses it
 		if (data.startsWith("\x1b[<")) {
 			const m = parseSgrMouse(data);
-			if (m?.wheel) {
-				const target = this.#lastShowingSplit && this.#focusedPane === "right" ? this.#planScrollView : this.#scrollView;
+			if (!m) return;
+			const inBody = m.row >= this.#lastBodyTop && m.row < this.#lastBodyTop + this.#lastBodyHeight;
+			const pointerPane =
+				this.#lastShowingSplit && inBody ? (m.col >= this.#lastDividerCol ? "right" : "left") : undefined;
+			if (m.wheel) {
+				// outside the body (header, footer) the wheel follows keyboard focus
+				const pane = pointerPane ?? this.#focusedPane;
+				const target = this.#lastShowingSplit && pane === "right" ? this.#planScrollView : this.#scrollView;
 				const prevOffset = target.getScrollOffset();
 				target.scroll(m.wheel * 3);
 				this.#updateTailPause(target, prevOffset, data);
+				this.#tui.requestRender();
+			} else if (m.leftClick && pointerPane && pointerPane !== this.#focusedPane) {
+				this.#focusedPane = pointerPane;
 				this.#tui.requestRender();
 			}
 			return;

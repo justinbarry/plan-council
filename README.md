@@ -92,16 +92,18 @@ omp --plugin-dir /path/to/plan-council
 | **`r`** | Run Round 1 critiques across active models. |
 | **`d`** | Run a debate round (models cross-examine peer critiques); the banner then reports convergence or the number of open disagreements. |
 | **`Tab` / `]`** | Cycle tabs: `Council`, individual model tabs, `Reader`, `Synthesis`, `Plan`, `Models`. Each tab keeps its own scroll position; narrow terminals shorten tab labels and wrap the bar. |
-| **`j`/`k`, `g`/`G`, arrows, PgUp/PgDn** | Scroll. While a round streams, scrolling up pauses tail-follow until you return to the bottom (`G`) or start a new run. |
+| **`j`/`k`, `g`/`G`, arrows, PgUp/PgDn, mouse wheel** | Scroll. While a round streams, scrolling up pauses tail-follow until you return to the bottom (`G`) or start a new run. |
 | **`i`** | Enter composer mode to ask questions or give operator instructions. |
 | **`m`** | Open Models tab (`Space` toggles models on/off). |
 | **`o`** | Collapse or expand the Consensus Scorecard on the `Council` tab: each reviewer's verdict (`✓ APPROVE`, `△ NEEDS REVISION`, `✗ BLOCK`), required revisions, disputes, and revisions still awaiting debate. |
-| **`p`** | Show the plan beside the current tab (needs 120+ columns; narrower terminals show the current tab alone). `←`/`→`, `h`/`l`, or `w` switch the focused pane; scrolling moves the focused pane. |
+| **`p`** | Show the plan beside the current tab (needs 120+ columns; narrower terminals show the current tab alone). `←`/`→`, `h`/`l`, `w`, or a click switch the focused pane; keys scroll the focused pane, and the mouse wheel scrolls the pane under the pointer. |
 | **`s`** | Synthesize council discussion into actionable revisions. |
 | **`f`** | **Refine Plan**: Synthesizes and applies feedback straight to the plan. |
 | **`a`** | **Approve Plan**: Opens an approval bar. `←`/`→` picks Execute, Compact, or Keep (whichever the review allows); when the review offers execution tiers, `Tab`/`t` cycles them. `Enter` approves, `Esc` cancels. Opening the bar stops a pending synthesis from closing the overlay with a refine. |
 | **`x`** | Stop active model streams. |
 | **`Esc`** | Close Council overlay (discussion history is preserved on reopen). |
+
+The overlay receives mouse input, so to select text inside it hold `Shift` while dragging (most terminals, including Ghostty, bypass mouse reporting with `Shift`).
 
 ---
 
