@@ -848,6 +848,37 @@ describe("report_position convergence", () => {
 		]);
 		expect(synthPrompt).toContain(`- No position reported: ${claude.label}`);
 	});
+
+	it("reports silent reviewers as stalled and ends the auto run before synthesis when none finished", async () => {
+		// a model that never sends an event; its stream ends only when the request is aborted
+		const silent: ModelStreamFn = (_model, _context, options) => ({
+			async *[Symbol.asyncIterator]() {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				options.signal.addEventListener("abort", () => resolve(), { once: true });
+				await promise;
+			},
+			result: async () => ({ role: "assistant", content: [], stopReason: "aborted" }) as unknown as AssistantMessage,
+		});
+		// real time: the stall window runs on the platform clock
+		const session = new CouncilSession({
+			planTitle: "Stall Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn: silent,
+			modelStallMs: 20,
+		});
+
+		await expect(session.runAutoPipeline(claude.model)).rejects.toThrow(
+			"No reviewer finished Round 1 (see the Council tab) — press r to retry.",
+		);
+		const critiques = session.entries.filter(isReviewerTurnEntry);
+		expect(critiques.map(e => e.status)).toEqual(["error", "error"]);
+		expect(critiques.map(e => e.errorMessage?.startsWith(`Stalled: no response from ${e.reviewerKey.split("/")[1]}`))).toEqual([true, true]);
+		expect(session.latestSynthesis).toBeUndefined();
+		expect(session.isActive()).toBe(false);
+	});
 });
 
 interface FakeReader {
@@ -887,7 +918,11 @@ describe("codebase reader", () => {
 	const claude = makeFakeReviewer("anthropic", "claude-3-7-sonnet", "claude");
 	const gpt = makeFakeReviewer("openai", "gpt-4o", "gpt");
 
-	function newSession(streamFn: ModelStreamFn, codeReader: CodebaseReader | undefined, extra: { maxReaderQueriesPerTurn?: number; reviewers?: ReviewerMember[] } = {}) {
+	function newSession(
+		streamFn: ModelStreamFn,
+		codeReader: CodebaseReader | undefined,
+		extra: { maxReaderQueriesPerTurn?: number; reviewers?: ReviewerMember[]; modelStallMs?: number } = {},
+	) {
 		const reviewers = extra.reviewers ?? [claude, gpt];
 		return new CouncilSession({
 			planTitle: "Reader Plan",
@@ -898,6 +933,7 @@ describe("codebase reader", () => {
 			streamFn,
 			codeReader,
 			maxReaderQueriesPerTurn: extra.maxReaderQueriesPerTurn,
+			modelStallMs: extra.modelStallMs,
 		});
 	}
 
@@ -1005,6 +1041,26 @@ describe("codebase reader", () => {
 			},
 		]);
 		expect(session.readerEntries).toMatchObject([{ status: "error", errorMessage: "reader crashed" }]);
+	});
+
+	it("waits out a reader slower than the stall window without stalling the reviewer", async () => {
+		// real time: the reviewer's stall window runs on the platform clock while the reader answers
+		const { reader } = makeFakeReader(async input => {
+			await Bun.sleep(80);
+			return `Reader: ${input.question}`;
+		});
+		const { streamFn } = makeMockStreamFn((_model, context) =>
+			readerAnswered(context)
+				? { text: "Verified review", toolCalls: [reportPosition("APPROVE")] }
+				: { text: "Checking", toolCalls: [{ name: "ask_codebase", arguments: { question: "where is foo?" } }] },
+		);
+		const session = newSession(streamFn, reader, { reviewers: [claude], modelStallMs: 20 });
+
+		await session.startInitialCritiques();
+
+		const critique = critiqueOf(session, claude.key);
+		expect([critique.status, critique.readerQueryCount, critique.position?.verdict]).toEqual(["done", 1, "APPROVE"]);
+		expect(critique.text).toContain("Verified review");
 	});
 
 	it("stops a reviewer waiting on the reader when the round is aborted", async () => {

@@ -3,6 +3,7 @@ import { AgentRegistry, createAgentSession, SessionManager } from "@oh-my-pi/pi-
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { renderReaderQuery, renderReaderSystem } from "./prompts/render";
+import { StallTimer } from "./stall-timer";
 
 export const ASK_CODEBASE_TOOL_NAME = "ask_codebase";
 
@@ -70,13 +71,16 @@ export interface CouncilCodeReaderOptions {
 	sessionId?: string;
 	modelRegistry?: ExtensionContext["modelRegistry"];
 	localProtocolOptions?: ExtensionContext["localProtocolOptions"];
-	/** per-query budget once dequeued; default 90s */
-	queryTimeoutMs?: number;
+	/** a running query is abandoned after this long without any session event (tool call, text); default 120s */
+	queryStallMs?: number;
+	/** backstop for a query that stays busy but never finishes, counted once dequeued; default 10 min */
+	queryMaxMs?: number;
 	/** test seam; defaults to an in-memory SDK agent session restricted to read-only tools */
 	createSession?: () => Promise<ReaderSessionHandle>;
 }
 
-const DEFAULT_QUERY_TIMEOUT_MS = 90_000;
+const DEFAULT_QUERY_STALL_MS = 120_000;
+const DEFAULT_QUERY_MAX_MS = 600_000;
 const NO_FINDINGS_ANSWER = "(No relevant codebase findings returned.)";
 const READER_TOOL_NAMES = ["read", "grep", "glob", "find", "ast_grep", "lsp"];
 
@@ -145,7 +149,8 @@ interface SharedQueryExecution {
 export class CouncilCodeReader implements CodebaseReader {
 	readonly modelLabel: string;
 	#options: CouncilCodeReaderOptions;
-	#queryTimeoutMs: number;
+	#queryStallMs: number;
+	#queryMaxMs: number;
 	#createSession: () => Promise<ReaderSessionHandle>;
 	#sessionPromise?: Promise<ReaderSessionHandle>;
 	#cache = new Map<string, string>();
@@ -158,7 +163,8 @@ export class CouncilCodeReader implements CodebaseReader {
 	constructor(options: CouncilCodeReaderOptions) {
 		this.#options = options;
 		this.modelLabel = `${options.model.id} (${options.model.provider})`;
-		this.#queryTimeoutMs = options.queryTimeoutMs ?? DEFAULT_QUERY_TIMEOUT_MS;
+		this.#queryStallMs = options.queryStallMs ?? DEFAULT_QUERY_STALL_MS;
+		this.#queryMaxMs = options.queryMaxMs ?? DEFAULT_QUERY_MAX_MS;
 		this.#createSession = options.createSession ?? (() => this.#createDefaultSession());
 	}
 
@@ -300,8 +306,9 @@ export class CouncilCodeReader implements CodebaseReader {
 		exec.status = "reading";
 		for (const waiter of this.#liveWaiters(exec)) waiter.input.onStatusChange?.("reading");
 
-		const timeoutSignal = AbortSignal.timeout(this.#queryTimeoutMs);
-		const signal = AbortSignal.any([exec.controller.signal, timeoutSignal]);
+		const stall = new StallTimer(this.#queryStallMs);
+		const maxSignal = AbortSignal.timeout(this.#queryMaxMs);
+		const signal = AbortSignal.any([exec.controller.signal, stall.signal, maxSignal]);
 		let unsubscribe: (() => void) | undefined;
 		let onAbort: (() => void) | undefined;
 
@@ -310,7 +317,10 @@ export class CouncilCodeReader implements CodebaseReader {
 			if (signal.aborted) throw abortError();
 
 			const startMessageIndex = session.state.messages.length;
-			unsubscribe = session.subscribe(event => this.#handleSessionEvent(exec, event));
+			unsubscribe = session.subscribe(event => {
+				stall.touch();
+				this.#handleSessionEvent(exec, event);
+			});
 			onAbort = () => {
 				void session.abort().catch(() => {});
 			};
@@ -342,9 +352,14 @@ export class CouncilCodeReader implements CodebaseReader {
 			this.#settle(exec, { answer });
 		} catch (err) {
 			let error = err;
-			if (timeoutSignal.aborted && !exec.controller.signal.aborted) {
+			if (!exec.controller.signal.aborted && stall.stalled) {
 				error = new DOMException(
-					`Codebase reader query timed out after ${Math.round(this.#queryTimeoutMs / 1000)}s`,
+					`Codebase reader stalled: no activity for ${Math.round(this.#queryStallMs / 1000)}s`,
+					"TimeoutError",
+				);
+			} else if (!exec.controller.signal.aborted && maxSignal.aborted) {
+				error = new DOMException(
+					`Codebase reader query exceeded ${Math.round(this.#queryMaxMs / 1000)}s`,
 					"TimeoutError",
 				);
 			} else if (signal.aborted) {
@@ -352,6 +367,7 @@ export class CouncilCodeReader implements CodebaseReader {
 			}
 			this.#settle(exec, { error });
 		} finally {
+			stall.dispose();
 			unsubscribe?.();
 			if (onAbort) signal.removeEventListener("abort", onAbort);
 		}

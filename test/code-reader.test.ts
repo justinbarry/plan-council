@@ -95,15 +95,56 @@ function makeFakeSessions(script: (prompt: string, index: number) => FakeTurn): 
 	};
 }
 
-function newReader(fake: FakeSessions, queryTimeoutMs?: number): CouncilCodeReader {
+function newReader(fake: FakeSessions, limits: { queryStallMs?: number; queryMaxMs?: number } = {}): CouncilCodeReader {
 	return new CouncilCodeReader({
 		cwd: process.cwd(),
 		model: readerModel,
 		planTitle: "Reader Plan",
 		planFilePath: "plan.md",
-		queryTimeoutMs,
+		...limits,
 		createSession: fake.createSession,
 	});
+}
+
+/**
+ * a reader session that reports a tool call every `everyMs` until it answers after `answerAfterMs` or is aborted;
+ * real timers, because the reader's limits run on the platform clock (AbortSignal.timeout), which fake timers do not drive
+ */
+function busySession(answerAfterMs: number, everyMs: number): FakeSessions {
+	const stats = { created: 0, aborts: 0, beginDispose: 0, disposed: 0 };
+	const createSession = async (): Promise<ReaderSessionHandle> => {
+		stats.created++;
+		const messages: FakeMessage[] = [];
+		const listeners = new Set<(event: unknown) => void>();
+		let abort: (() => void) | undefined;
+		return {
+			state: { messages },
+			subscribe: listener => {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+			abort: async () => {
+				stats.aborts++;
+				abort?.();
+			},
+			dispose: async () => {
+				stats.disposed++;
+			},
+			prompt: async () => {
+				const { promise, resolve } = Promise.withResolvers<FakeMessage>();
+				const ticker = setInterval(() => {
+					for (const listener of listeners) listener({ type: "tool_execution_start", toolName: "grep" });
+				}, everyMs);
+				const done = setTimeout(() => resolve(assistant("found it after a long search")), answerAfterMs);
+				abort = () => resolve(assistant("", "aborted"));
+				messages.push(await promise);
+				clearInterval(ticker);
+				clearTimeout(done);
+				return true;
+			},
+		};
+	};
+	return { createSession, prompts: [], stats, prompted: () => Promise.resolve(), release: () => {} };
 }
 
 describe("CouncilCodeReader", () => {
@@ -259,12 +300,27 @@ describe("CouncilCodeReader", () => {
 		expect(result.answer).toBe("Found it in src/a.ts.");
 	});
 
-	it("times out a stuck query, aborting the session turn", async () => {
+	it("abandons a query whose session goes silent, aborting the session turn", async () => {
 		const fake = makeFakeSessions(() => ({ hang: true }));
-		// the budget is an AbortSignal.timeout on the platform clock, which fake timers do not drive
-		const reader = newReader(fake, 20);
+		// the limits run on the platform clock, which fake timers do not drive
+		const reader = newReader(fake, { queryStallMs: 20 });
 
-		await expect(reader.query({ requesterLabel: "A", question: "slow?" })).rejects.toThrow("timed out");
+		await expect(reader.query({ requesterLabel: "A", question: "slow?" })).rejects.toThrow("stalled");
+		expect(fake.stats.aborts).toBe(1);
+	});
+
+	it("lets a query that keeps reporting activity run past the stall window", async () => {
+		const reader = newReader(busySession(120, 10), { queryStallMs: 40 });
+		expect(await reader.query({ requesterLabel: "A", question: "deep search?" })).toEqual({
+			answer: "found it after a long search",
+			cached: false,
+		});
+	});
+
+	it("stops a query that stays busy past the per-query ceiling", async () => {
+		const fake = busySession(10_000, 10);
+		const reader = newReader(fake, { queryStallMs: 40, queryMaxMs: 80 });
+		await expect(reader.query({ requesterLabel: "A", question: "endless?" })).rejects.toThrow("exceeded");
 		expect(fake.stats.aborts).toBe(1);
 	});
 

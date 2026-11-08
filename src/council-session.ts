@@ -20,6 +20,7 @@ import {
 	type CodebaseReader,
 	type CodeReaderQueryInput,
 } from "./code-reader";
+import { StallTimer } from "./stall-timer";
 import type { ReviewerMember } from "./models";
 import type { PlanFileExcerpt } from "./plan-files";
 import {
@@ -96,8 +97,8 @@ export function isReviewerTurnEntry(e: CouncilTurnEntry): e is ReviewerTurnEntry
 /** composer target key that routes an operator question to the codebase reader */
 export const READER_TARGET_KEY = "@reader";
 
-/** operator questions wait in the reader's queue behind reviewer checks, so the budget covers both */
-const OPERATOR_READER_TIMEOUT_MS = 90_000;
+/** a model request is abandoned after this long without any stream event (text, reasoning, or tool call) */
+const DEFAULT_MODEL_STALL_MS = 180_000;
 
 export interface ReaderTurnEntry {
 	id: string;
@@ -156,6 +157,8 @@ export interface CouncilSessionOptions {
 	maxReaderQueriesPerTurn?: number;
 	/** plan-referenced file excerpts attached to every reviewer's Round 1 prompt */
 	referencedFiles?: readonly PlanFileExcerpt[];
+	/** how long a model stream may go without any event before its request is abandoned; default 180s */
+	modelStallMs?: number;
 }
 
 export function extractSessionGoalContext(entries: readonly SessionEntry[], maxChars = 2000): string | undefined {
@@ -218,6 +221,7 @@ export class CouncilSession {
 	#maxReaderQueriesPerTurn: number;
 	#readerEntries: ReaderTurnEntry[] = [];
 	#referencedFiles: PlanFileExcerpt[];
+	#modelStallMs: number;
 
 	/** preserve reviewer request options when forwarding to the native model stream */
 	constructor(options: CouncilSessionOptions) {
@@ -232,6 +236,7 @@ export class CouncilSession {
 		this.#codeReader = options.codeReader;
 		this.#maxReaderQueriesPerTurn = Math.min(6, Math.max(1, Math.round(options.maxReaderQueriesPerTurn ?? 3)));
 		this.#referencedFiles = [...(options.referencedFiles ?? [])];
+		this.#modelStallMs = options.modelStallMs ?? DEFAULT_MODEL_STALL_MS;
 
 		this.#streamFn =
 			options.streamFn ??
@@ -660,12 +665,12 @@ export class CouncilSession {
 		this.#readerEntries.push(readerEntry);
 		this.#emitChange();
 
-		const timeoutSignal = AbortSignal.timeout(OPERATOR_READER_TIMEOUT_MS);
+		// the reader abandons a silent or overlong query itself, so waiting in its queue never times out here
 		try {
 			const result = await reader.query({
 				requesterLabel: readerEntry.requesterLabel,
 				question,
-				signal: AbortSignal.any([controller.signal, timeoutSignal]),
+				signal: controller.signal,
 				...this.#readerProgress(readerEntry),
 			});
 			readerEntry.status = "done";
@@ -676,11 +681,7 @@ export class CouncilSession {
 				readerEntry.status = "aborted";
 			} else {
 				readerEntry.status = "error";
-				readerEntry.errorMessage = timeoutSignal.aborted
-					? `Codebase reader query timed out after ${OPERATOR_READER_TIMEOUT_MS / 1000}s`
-					: err instanceof Error
-						? err.message
-						: String(err);
+				readerEntry.errorMessage = err instanceof Error ? err.message : String(err);
 			}
 		} finally {
 			readerEntry.activeTool = undefined;
@@ -728,8 +729,9 @@ export class CouncilSession {
 		const { reviewer, entry } = turn;
 		const reader = this.#codeReader;
 		const maxQueries = this.#maxReaderQueriesPerTurn;
-		// reader round trips share the turn budget, so reader-enabled turns get more of it
-		const combinedSignal = AbortSignal.any([turn.signal, AbortSignal.timeout(reader ? 240_000 : 120_000)]);
+		// a turn may run as long as it keeps making progress; it is abandoned only when the model goes silent
+		const stall = new StallTimer(this.#modelStallMs);
+		const combinedSignal = AbortSignal.any([turn.signal, stall.signal]);
 		const systemPrompt = renderCritiqueSystem({ hasCodeReader: Boolean(reader), maxReaderQueriesPerTurn: maxQueries });
 		const turnPrompt = createUserMessage(turn.promptText);
 		const stepMessages: Message[] = [];
@@ -760,6 +762,7 @@ export class CouncilSession {
 				const separator = stepMessages.length > 0 && entry.text.trim() && !entry.text.endsWith("\n\n") ? "\n\n" : "";
 				let stepText = "";
 				for await (const event of stream) {
+					stall.touch();
 					if (event.type === "text_delta" && event.delta) {
 						entry.text += (stepText ? "" : separator) + event.delta;
 						stepText += event.delta;
@@ -790,6 +793,7 @@ export class CouncilSession {
 						signal: combinedSignal,
 						apiKey,
 						force: turn.forcePosition,
+						onActivity: () => stall.touch(),
 					});
 					// abortActiveRound marks streaming entries aborted while a report follow-up runs
 					if (entry.status === "streaming") {
@@ -873,6 +877,8 @@ export class CouncilSession {
 					this.#readerEntries.push(readerEntry);
 					entry.readerStatus = "queued";
 					this.#emitChange();
+					// the reader enforces its own inactivity limit, so queueing behind other reviewers is not a stall
+					stall.pause();
 					try {
 						const result = await reader.query({
 							requesterLabel: reviewer.label,
@@ -902,6 +908,7 @@ export class CouncilSession {
 							),
 						);
 					} finally {
+						stall.touch();
 						readerEntry.activeTool = undefined;
 						readerEntry.finishedAt = Date.now();
 						this.#emitChange();
@@ -922,6 +929,11 @@ export class CouncilSession {
 				entry.errorMessage = err instanceof Error ? err.message : String(err);
 			}
 		} finally {
+			stall.dispose();
+			if (entry.status === "aborted" && stall.stalled && !turn.signal.aborted) {
+				entry.status = "error";
+				entry.errorMessage = `Stalled: no response from ${reviewer.model.id} for ${Math.round(this.#modelStallMs / 1000)}s`;
+			}
 			entry.readerStatus = undefined;
 			entry.finishedAt = Date.now();
 			this.#emitChange();
@@ -985,8 +997,9 @@ export class CouncilSession {
 		this.#latestSynthesis = entry;
 		this.#emitChange();
 
-		const timeoutSignal = AbortSignal.timeout(120_000);
-		const combinedSignal = AbortSignal.any([controller.signal, timeoutSignal]);
+		// long syntheses are fine while they stream; only a silent synthesizer is abandoned
+		const stall = new StallTimer(this.#modelStallMs);
+		const combinedSignal = AbortSignal.any([controller.signal, stall.signal]);
 
 		try {
 			const apiKey = this.#getApiKey ? await this.#getApiKey(synthesizerModel) : undefined;
@@ -1003,6 +1016,7 @@ export class CouncilSession {
 				disableReasoning: shouldDisableReasoning(level),
 			});
 			for await (const event of stream) {
+				stall.touch();
 				if (event.type === "text_delta") {
 					entry.text += event.delta;
 					this.#emitChange();
@@ -1032,6 +1046,11 @@ export class CouncilSession {
 				entry.errorMessage = err instanceof Error ? err.message : String(err);
 			}
 		} finally {
+			stall.dispose();
+			if (entry.status === "aborted" && stall.stalled && !controller.signal.aborted) {
+				entry.status = "error";
+				entry.errorMessage = `Stalled: no response from ${synthesizerModel.id} for ${Math.round(this.#modelStallMs / 1000)}s`;
+			}
 			entry.finishedAt = Date.now();
 			this.#endRound(controller);
 			this.#emitChange();
@@ -1050,7 +1069,7 @@ export class CouncilSession {
 		context: Context,
 		msg: AssistantMessage,
 		promptedItemIds: string[],
-		request: { signal: AbortSignal; apiKey: ApiKey | undefined; force: boolean },
+		request: { signal: AbortSignal; apiKey: ApiKey | undefined; force: boolean; onActivity: () => void },
 	): Promise<{ position?: ReviewerPosition; positionError?: string; messages: Message[] }> {
 		// the error for an unknown call names the tools the turn actually offered
 		const offeredTools = context.tools?.map(t => t.name);
@@ -1076,6 +1095,7 @@ export class CouncilSession {
 			);
 			// the forced report is bookkeeping, not part of the visible review text
 			for await (const _event of stream) {
+				request.onActivity();
 			}
 			const followUp = await stream.result();
 			if (followUp.stopReason === "error" || followUp.stopReason === "aborted") {
@@ -1175,6 +1195,10 @@ export class CouncilSession {
 		try {
 			stage("Round 1 Critiques");
 			await this.startInitialCritiques();
+			// synthesis needs a finished critique: say why the run ends here instead of failing on an empty council
+			if (!run.stopped && this.#completedReviewerCount() === 0) {
+				throw new Error("No reviewer finished Round 1 (see the Council tab) — press r to retry.");
+			}
 
 			const maxDebateRounds = options.maxDebateRounds ?? 3;
 			if (options.autoDebate !== false) {
