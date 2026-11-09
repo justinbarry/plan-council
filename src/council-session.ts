@@ -48,6 +48,7 @@ import {
 	formatConvergence,
 	formatReportedPositions,
 	isUnanimousApproval,
+	openDisagreementCount,
 	parseReviewerPosition,
 	type PositionDelta,
 	REPORT_POSITION_TOOL,
@@ -98,6 +99,8 @@ export type CouncilTurnEntry =
 			positionDelta?: PositionDelta;
 			/** the moderator's question this debate turn answered */
 			moderation?: { topicId?: string; question: string };
+			/** the run (see `CouncilSession.runs`) this turn belongs to */
+			runId?: number;
 	  }
 	| {
 			id: string;
@@ -107,6 +110,8 @@ export type CouncilTurnEntry =
 			targetLabel?: string;
 			text: string;
 			createdAt: number;
+			/** the run it shows in: the one it was queued during, else the Q&A run that answers it */
+			runId?: number;
 	  }
 	| {
 			id: string;
@@ -118,6 +123,7 @@ export type CouncilTurnEntry =
 			errorMessage?: string;
 			startedAt: number;
 			finishedAt?: number;
+			runId?: number;
 	  };
 
 export type ReviewerTurnEntry = CouncilTurnEntry & { kind: "critique" | "rebuttal" | "reply" };
@@ -133,6 +139,49 @@ export interface ActiveSpeaker {
 	label: string;
 	kind: "rebuttal" | "reply";
 	step: number;
+}
+
+export type CouncilRunKind = "critiques" | "debate" | "qa" | "synthesis";
+
+/** the council's state when a critique or debate run ended or was stopped */
+export interface RunSummary {
+	/** reviewer turns of this run that finished */
+	turns: number;
+	converged: boolean;
+	/** open disagreements: disputes, unjudged reviewer/item pairs, and unreported reviewers */
+	open: number;
+	revisions: number;
+	disputes: { id: string; by: string; reason: string }[];
+	/** reviewer/item pairs not yet judged */
+	unjudged: number;
+	unreported: string[];
+}
+
+/** one critique, debate, operator Q&A, or synthesis pass; entries carry its `id` as `runId` */
+export interface CouncilRun {
+	id: number;
+	kind: CouncilRunKind;
+	/** 1 for critiques; the debate round; the round in progress for Q&A and synthesis */
+	round: number;
+	status: "running" | "done" | "stopped";
+	/** a later critique run is a retry of the first */
+	retry?: boolean;
+	/** open disagreements when a debate run started */
+	openBefore?: number;
+	/** set when a critique or debate run ends or is stopped */
+	summary?: RunSummary;
+	/** the operator message a Q&A run answers */
+	userEntryId?: string;
+}
+
+/** why a reviewer is queued to speak in the running debate round */
+export type QueueReason = "operator" | "handoff" | "disputed" | "confirm" | "order";
+
+export interface QueuedSpeaker {
+	reviewerKey: string;
+	modelId: string;
+	label: string;
+	reason: QueueReason;
 }
 
 /** `queued`: the council was busy; `target` names the reviewer an `@model` message gives the next turn */
@@ -344,6 +393,16 @@ export class CouncilSession {
 	/** the round whose moderator call is in flight */
 	#moderatingController?: AbortController;
 	#moderatorError?: string;
+	#runs: CouncilRun[] = [];
+	#nextRunId = 1;
+	/** the run that owns the session; a stopped run is finalized at once and loses ownership */
+	#currentRun?: { run: CouncilRun; controller: AbortController };
+	/** the debate queue as of its last change, read live by `queuedSpeakers` */
+	#queueState?: {
+		runId: number;
+		queue: ReviewerMember[];
+		reasons: Map<string, QueueReason>;
+	};
 
 	/** preserve reviewer request options when forwarding to the native model stream */
 	constructor(options: CouncilSessionOptions) {
@@ -438,6 +497,34 @@ export class CouncilSession {
 		return this.#pendingAsks.length;
 	}
 
+	/** every critique, debate, Q&A, and synthesis run in start order */
+	get runs(): readonly CouncilRun[] {
+		return this.#runs;
+	}
+
+	/**
+	 * who is queued to speak in the running debate round, in the order the loop would pick them: a queued `@model`
+	 * message's reviewer first, then the queue. Convergence can still end the round first.
+	 */
+	get queuedSpeakers(): QueuedSpeaker[] {
+		const state = this.#queueState;
+		const current = this.#currentRun;
+		if (!state || current?.run.id !== state.runId || current.run.kind !== "debate") return [];
+		const ordered = new Map<string, { reviewer: ReviewerMember; reason: QueueReason }>();
+		const preempt = this.#preemptableAsk();
+		if (preempt) ordered.set(preempt.reviewer.key, { reviewer: preempt.reviewer, reason: "operator" });
+		// the moderator's pick is applied in the same tick it arrives, so the queue never shows it pending
+		for (const reviewer of state.queue) {
+			if (!ordered.has(reviewer.key)) ordered.set(reviewer.key, { reviewer, reason: state.reasons.get(reviewer.key) ?? "order" });
+		}
+		return [...ordered.values()].map(({ reviewer, reason }) => ({
+			reviewerKey: reviewer.key,
+			modelId: reviewer.model.id,
+			label: reviewer.label,
+			reason,
+		}));
+	}
+
 	/** the moderator model, e.g. `gpt-4o-mini (openai) · thinking: low`; undefined without a moderator */
 	get moderatorLabel(): string | undefined {
 		const moderator = this.#moderator;
@@ -521,6 +608,7 @@ export class CouncilSession {
 		}
 
 		const controller = this.#beginRound();
+		const run = this.#startRun(controller, "critiques", this.#runs.some(r => r.kind === "critiques") ? { retry: true } : {});
 		this.#emitChange();
 
 		const userPrompt = this.#renderInitialPlanPrompt();
@@ -535,6 +623,7 @@ export class CouncilSession {
 				status: "streaming",
 				text: "",
 				startedAt: Date.now(),
+				runId: run.id,
 			};
 			this.#entries.push(entry);
 			this.#emitChange();
@@ -552,6 +641,7 @@ export class CouncilSession {
 		try {
 			await Promise.allSettled(tasks);
 		} finally {
+			this.#finishRun(controller);
 			this.#endRound(controller);
 			this.#emitChange();
 			this.#afterRound();
@@ -586,13 +676,18 @@ export class CouncilSession {
 		}
 
 		// an operator-requested round on an already converged council runs every speaker
-		const startedConverged = this.getConvergence().converged;
+		const startReport = this.getConvergence();
+		const startedConverged = startReport.converged;
 		this.#round++;
 		const controller = this.#beginRound();
+		const run = this.#startRun(controller, "debate", { openBefore: openDisagreementCount(startReport) });
 		this.#emitChange();
 
 		const roundNum = this.#round;
 		const queue = this.#orderDebateSpeakers();
+		const reasons = new Map<string, QueueReason>(
+			queue.map(r => [r.key, startReport.disputes.some(d => d.id.startsWith(`${r.key}#`)) ? "disputed" : "order"]),
+		);
 		const turnsStarted = new Map<string, number>();
 		let step = 0;
 		// one failed moderator call benches the moderator for the rest of the round
@@ -641,6 +736,7 @@ export class CouncilSession {
 					if (framing?.speakerKey === reviewer.key) turnFraming = framing;
 				}
 				framing = undefined;
+				this.#publishQueue(run.id, queue, reasons);
 				step++;
 				turnsStarted.set(reviewer.key, (turnsStarted.get(reviewer.key) ?? 0) + 1);
 				const before = this.#latestDefinedPosition(reviewer.key);
@@ -705,6 +801,7 @@ export class CouncilSession {
 					text: "",
 					startedAt: Date.now(),
 					roundtableTurn: { step },
+					runId: run.id,
 					...(turnFraming
 						? { moderation: { ...(framedTopic ? { topicId: framedTopic.id } : {}), question: turnFraming.question } }
 						: {}),
@@ -728,7 +825,8 @@ export class CouncilSession {
 				this.#pendingAsks = this.#pendingAsks.filter(
 					p => p.kind === "reader" || p.reviewers.some(r => !this.#seenSet(r.key).has(p.userEntry.id)),
 				);
-				handedOff = this.#enqueueReactions(queue, reviewer, before, entry, turnsStarted);
+				handedOff = this.#enqueueReactions(queue, reviewer, before, entry, turnsStarted, reasons);
+				this.#publishQueue(run.id, queue, reasons);
 
 				if (
 					moderatorOn &&
@@ -770,6 +868,7 @@ export class CouncilSession {
 				}
 			}
 		} finally {
+			this.#finishRun(controller);
 			this.#endRound(controller);
 			this.#emitChange();
 			this.#afterRound();
@@ -869,6 +968,8 @@ export class CouncilSession {
 			targetLabel: ask.target?.label,
 			text: ask.text,
 			createdAt: Date.now(),
+			// queued guidance shows inside the run that delivers it; between auto-run stages, the latest run
+			...(this.isActive() ? { runId: this.#currentRun?.run.id ?? this.#runs.at(-1)?.id } : {}),
 		};
 		this.#entries.push(userEntry);
 		const queued = this.isActive();
@@ -892,6 +993,8 @@ export class CouncilSession {
 		reviewers: readonly ReviewerMember[],
 	): Promise<void> {
 		const controller = this.#beginRound();
+		const run = this.#startRun(controller, "qa", { userEntryId: userEntry.id });
+		userEntry.runId ??= run.id;
 		this.#emitChange();
 		try {
 			for (let i = 0; i < reviewers.length; i++) {
@@ -936,6 +1039,7 @@ export class CouncilSession {
 					status: "streaming",
 					text: "",
 					startedAt: Date.now(),
+					runId: run.id,
 				};
 				this.#entries.push(entry);
 				this.#emitChange();
@@ -954,6 +1058,7 @@ export class CouncilSession {
 				}
 			}
 		} finally {
+			this.#finishRun(controller);
 			this.#endRound(controller);
 			this.#emitChange();
 			this.#afterRound();
@@ -1319,6 +1424,7 @@ export class CouncilSession {
 
 		this.#reconcileAgenda();
 		const controller = this.#beginRound();
+		const run = this.#startRun(controller, "synthesis");
 
 		const historyLines: string[] = [];
 		for (const e of this.#entries) {
@@ -1353,6 +1459,7 @@ export class CouncilSession {
 			status: "streaming",
 			text: "",
 			startedAt: Date.now(),
+			runId: run.id,
 		};
 		this.#entries.push(entry);
 		this.#latestSynthesis = entry;
@@ -1414,6 +1521,7 @@ export class CouncilSession {
 				entry.errorMessage = `Stalled: no response from ${synthesizerModel.id} for ${Math.round(this.#modelStallMs / 1000)}s`;
 			}
 			entry.finishedAt = Date.now();
+			this.#finishRun(controller);
 			this.#endRound(controller);
 			this.#emitChange();
 			this.#afterRound();
@@ -1668,6 +1776,7 @@ export class CouncilSession {
 		before: ReviewerPosition | undefined,
 		entry: ReviewerTurnEntry,
 		turnsStarted: ReadonlyMap<string, number>,
+		reasons: Map<string, QueueReason>,
 	): boolean {
 		const position = entry.position;
 		if (!position) return false;
@@ -1678,7 +1787,10 @@ export class CouncilSession {
 		const peers = this.#activeReviewers.filter(r => r.key !== speaker.key);
 		const handoff = position.nextSpeaker ? matchReviewerHandle(position.nextSpeaker, peers) : undefined;
 		const handedOff = handoff !== undefined && canSpeak(handoff);
-		if (handoff && handedOff) front.push(handoff);
+		if (handoff && handedOff) {
+			front.push(handoff);
+			reasons.set(handoff.key, "handoff");
+		}
 
 		const disputedIds = position.positions.filter(p => p.stance === "dispute").map(p => p.id);
 		for (const owner of this.#activeReviewers) {
@@ -1686,6 +1798,7 @@ export class CouncilSession {
 			const held = this.#latestPosition(owner.key)?.revisions ?? [];
 			if (disputedIds.some(id => id.startsWith(`${owner.key}#`) && held.some(item => item.id === id))) {
 				front.push(owner);
+				reasons.set(owner.key, "disputed");
 			}
 		}
 
@@ -1700,6 +1813,7 @@ export class CouncilSession {
 					!front.some(f => f.key === peer.key)
 				) {
 					queue.push(peer);
+					reasons.set(peer.key, "confirm");
 				}
 			}
 		}
@@ -1948,6 +2062,51 @@ export class CouncilSession {
 		throw new OperatorQuestionPending(open);
 	}
 
+	/** record a run and make it the session's owner */
+	#startRun(
+		controller: AbortController,
+		kind: CouncilRunKind,
+		extra: Pick<CouncilRun, "retry" | "openBefore" | "userEntryId"> = {},
+	): CouncilRun {
+		const run: CouncilRun = {
+			id: this.#nextRunId++,
+			kind,
+			round: kind === "critiques" ? 1 : this.#round,
+			status: "running",
+			...extra,
+		};
+		this.#runs.push(run);
+		this.#currentRun = { run, controller };
+		return run;
+	}
+
+	/** a run's own ending; a run already stopped by abortActiveRound no longer owns the session and is left alone */
+	#finishRun(controller: AbortController): void {
+		const current = this.#currentRun;
+		if (!current || current.controller !== controller) return;
+		this.#closeRun(current.run, "done");
+		this.#currentRun = undefined;
+	}
+
+	#closeRun(run: CouncilRun, status: "done" | "stopped"): void {
+		run.status = status;
+		if (run.kind !== "critiques" && run.kind !== "debate") return;
+		const report = this.getConvergence();
+		run.summary = {
+			turns: this.#entries.filter(e => isReviewerTurnEntry(e) && e.runId === run.id && e.status === "done").length,
+			converged: report.converged,
+			open: openDisagreementCount(report),
+			revisions: report.items.length,
+			disputes: report.disputes.map(d => ({ ...d })),
+			unjudged: report.uncovered.length,
+			unreported: [...report.unreported],
+		};
+	}
+
+	#publishQueue(runId: number, queue: readonly ReviewerMember[], reasons: ReadonlyMap<string, QueueReason>): void {
+		this.#queueState = { runId, queue: [...queue], reasons: new Map(reasons) };
+	}
+
 	/** claim the session for one round; the returned controller identifies the round to #endRound */
 	#beginRound(): AbortController {
 		const controller = new AbortController();
@@ -1966,6 +2125,7 @@ export class CouncilSession {
 		this.#roundAbortController = null;
 		this.#activeSpeaker = undefined;
 		if (this.#moderatingController === controller) this.#moderatingController = undefined;
+		this.#queueState = undefined;
 	}
 
 	abortActiveRound(): void {
@@ -1991,6 +2151,12 @@ export class CouncilSession {
 				readerEntry.finishedAt = Date.now();
 			}
 		}
+		// snapshot the stopped run now: its own finally may run after a restarted run has changed positions
+		if (this.#currentRun) {
+			this.#closeRun(this.#currentRun.run, "stopped");
+			this.#currentRun = undefined;
+		}
+		this.#queueState = undefined;
 		// unsent messages stay in the transcript; any later turn still delivers them as unseen input
 		this.#pendingAsks = [];
 		this.#busy = false;

@@ -264,6 +264,23 @@ export function parseReviewerPosition(
 	return parsed;
 }
 
+export type ItemStance =
+	| { stance: "agree" }
+	| { stance: "dispute"; reason: string }
+	/** not shown the item yet, or shown it without taking a stance */
+	| { stance: "unjudged" }
+	/** the reviewer has no current report */
+	| { stance: "unreported" };
+
+/** a reviewer's stance on a peer item as convergence counts it: only prompted IDs, and the first stance per ID */
+export function stanceOn(position: ReviewerPosition | undefined, itemId: string): ItemStance {
+	if (!position) return { stance: "unreported" };
+	if (!position.promptedItemIds.includes(itemId)) return { stance: "unjudged" };
+	const first = position.positions.find(p => p.id === itemId);
+	if (!first) return { stance: "unjudged" };
+	return first.stance === "dispute" ? { stance: "dispute", reason: first.reason } : { stance: "agree" };
+}
+
 export function computeConvergence(reviewers: { label: string; position?: ReviewerPosition }[]): ConvergenceReport {
 	const report: ConvergenceReport = { converged: false, items: [], disputes: [], uncovered: [], unreported: [] };
 
@@ -282,11 +299,11 @@ export function computeConvergence(reviewers: { label: string; position?: Review
 		// stances on IDs outside the prompt, or on items their owner has since dropped, are moot
 		for (const id of position.promptedItemIds) {
 			if (!heldIds.has(id)) continue;
-			const stance = position.positions.find(p => p.id === id);
-			if (!stance) {
+			const judged = stanceOn(position, id);
+			if (judged.stance === "unjudged") {
 				report.uncovered.push({ id, by: reviewer.label });
-			} else if (stance.stance === "dispute") {
-				report.disputes.push({ id, by: reviewer.label, reason: stance.reason });
+			} else if (judged.stance === "dispute") {
+				report.disputes.push({ id, by: reviewer.label, reason: judged.reason });
 			}
 		}
 		// a peer item this reviewer was never shown has not been agreed to

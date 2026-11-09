@@ -17,10 +17,12 @@ import {
 	isEmptyPositionDelta,
 	type ReviewerPosition,
 	formatReportedPositions,
+	stanceOn,
 	stabilizeRevisionIds,
 	validateReportedPosition,
 } from "../src/position";
 import type { ReviewerMember } from "../src/models";
+import { buildTranscript } from "../src/transcript";
 
 function makeFakeReviewer(provider: string, id: string, family: string): ReviewerMember {
 	const model: Model = {
@@ -274,6 +276,26 @@ describe("position deltas and report_position extras", () => {
 			revisions: [{ id: "a#2", summary: "Log errors", concern: "logging" }],
 			nextNumber: 3,
 		});
+	});
+
+	it("reads a stance the way convergence counts it: prompted IDs only, first stance wins", () => {
+		const judge: ReviewerPosition = {
+			verdict: "APPROVE",
+			revisions: [],
+			positions: [
+				{ id: "b#1", stance: "dispute", reason: "too broad" },
+				{ id: "b#1", stance: "agree", reason: "" },
+				{ id: "c#1", stance: "agree", reason: "" },
+				{ id: "d#1", stance: "agree", reason: "" },
+			],
+			promptedItemIds: ["b#1", "c#1", "e#1"],
+		};
+		expect(stanceOn(judge, "b#1")).toEqual({ stance: "dispute", reason: "too broad" });
+		expect(stanceOn(judge, "c#1")).toEqual({ stance: "agree" });
+		// a stance on an ID the reviewer was never shown does not count
+		expect(stanceOn(judge, "d#1")).toEqual({ stance: "unjudged" });
+		expect(stanceOn(judge, "e#1")).toEqual({ stance: "unjudged" });
+		expect(stanceOn(undefined, "b#1")).toEqual({ stance: "unreported" });
 	});
 
 	it("shows concern labels to the synthesizer only for labeled revisions", () => {
@@ -1567,6 +1589,11 @@ describe("roundtable debate rounds", () => {
 			expect(followUps(calls).map(c => c.model.id)).toEqual([gpt.model.id]);
 			expect(turnPrompt(followUps(calls)[0].context)).toContain("Is step 2 safe?");
 			expect(session.pendingAskCount).toBe(0);
+			// queued during the critiques, it shows in their run; the drained Q&A run answers it from there
+			const [critiques, qa] = session.runs;
+			const message = session.entries.find(e => e.kind === "user")!;
+			expect(message.runId).toBe(critiques.id);
+			expect(qa).toMatchObject({ kind: "qa", userEntryId: message.id });
 		});
 
 		it("gives an @model message the next debate turn, so it needs no reply pass", async () => {
@@ -1644,6 +1671,228 @@ describe("roundtable debate rounds", () => {
 		expect(geminiPrompt).toContain(`**${gpt.label} · Round 1 reply**:\ngpt-4o answers\n`);
 		// the first to answer has no peer answers yet
 		expect(replies[0][1]).not.toContain("· Round 1 reply**");
+	});
+
+	describe("runs and the speaking queue", () => {
+		it("records each run in order, tags its entries, and summarizes where each critique and debate run ended", async () => {
+			const { streamFn } = makeMockStreamFn(
+				scriptedCouncil((model, { round, peerIds, prompt }) => {
+					if (prompt.startsWith("# Operator Follow-up")) return [];
+					if (model === claude.model) return [reportPosition("NEEDS REVISION", ["Clamp budgets"])];
+					return [reportPosition("APPROVE", [], round === 1 ? [] : peerIds.map(id => ({ id, stance: "dispute", reason: "not needed" })))];
+				}),
+			);
+			const session = newSession(streamFn, [claude, gpt]);
+			await session.startInitialCritiques();
+			await session.askCouncil("@gpt Why approve?");
+			await session.runDebateRound();
+			await session.synthesizeFeedback(claude.model);
+
+			const runs = session.runs;
+			expect(runs.map(r => [r.kind, r.round, r.status])).toEqual([
+				["critiques", 1, "done"],
+				["qa", 1, "done"],
+				["debate", 2, "done"],
+				["synthesis", 2, "done"],
+			]);
+			const runIdsOf = (kind: string) => session.entries.filter(e => e.kind === kind).map(e => e.runId);
+			expect(runIdsOf("critique")).toEqual([runs[0].id, runs[0].id]);
+			expect(runIdsOf("user")).toEqual([runs[1].id]);
+			expect(runIdsOf("reply")).toEqual([runs[1].id]);
+			expect(runIdsOf("rebuttal")).toEqual([runs[2].id, runs[2].id]);
+			expect(runIdsOf("synthesis")).toEqual([runs[3].id]);
+
+			expect(runs[0].summary).toEqual({ turns: 2, converged: false, open: 1, revisions: 1, disputes: [], unjudged: 1, unreported: [] });
+			expect(runs[2].openBefore).toBe(1);
+			expect(runs[2].summary).toEqual({
+				turns: 2,
+				converged: false,
+				open: 1,
+				revisions: 1,
+				disputes: [{ id: "anthropic/claude-3-7-sonnet#1", by: gpt.label, reason: "not needed" }],
+				unjudged: 0,
+				unreported: [],
+			});
+			expect(runs[1].summary).toBeUndefined();
+		});
+
+		it("keeps a message queued while no run exists in the transcript, even when the council stops before answering", async () => {
+			const readerGate = Promise.withResolvers<string>();
+			const readerStarted = Promise.withResolvers<void>();
+			const { reader } = makeFakeReader(() => {
+				readerStarted.resolve();
+				return readerGate.promise;
+			});
+			const { streamFn, calls } = makeMockStreamFn(() => ({ text: "unused" }));
+			const session = newSession(streamFn, [claude, gpt], reader);
+
+			// only a reader query is running, so the queued message belongs to no run; stopping drops its reply pass
+			const lookup = session.askCouncil("@reader Where is the clamp?");
+			await readerStarted.promise;
+			expect(await session.askCouncil("@gpt Is step 2 safe?")).toEqual({ status: "queued", target: gpt });
+			session.abortActiveRound();
+			readerGate.resolve("late answer");
+			await lookup;
+
+			expect(calls).toEqual([]);
+			expect(session.runs).toEqual([]);
+			const sections = buildTranscript(session.runs, session.entries);
+			expect(sections.map(s => [s.unassigned === true, s.entries.map(e => e.text)])).toEqual([[true, ["Is step 2 safe?"]]]);
+		});
+
+		it("gives a Round 1 retry its own run and summary", async () => {
+			const { streamFn, calls } = makeMockStreamFn(model =>
+				model === gpt.model && calls.filter(c => c.model === gpt.model).length === 1
+					? { text: "", stopReason: "error", error: "Rate limit" }
+					: { text: `${model.id} critique`, toolCalls: [reportPosition("APPROVE")] },
+			);
+			const session = newSession(streamFn, [claude, gpt]);
+			await session.startInitialCritiques();
+			await session.startInitialCritiques();
+
+			const [first, retry] = session.runs;
+			expect(session.runs.map(r => [r.kind, r.retry === true, r.status, r.summary?.turns])).toEqual([
+				["critiques", false, "done", 1],
+				["critiques", true, "done", 1],
+			]);
+			expect(session.entries.filter(isReviewerTurnEntry).map(e => [e.reviewerKey, e.status, e.runId])).toEqual([
+				[claude.key, "done", first.id],
+				[gpt.key, "error", first.id],
+				[gpt.key, "done", retry.id],
+			]);
+		});
+
+		it("snapshots a stopped run at once, so its late settlement never picks up the restarted run's state", async () => {
+			const gates = new Map([2, 3].map(round => [round, Promise.withResolvers<void>()]));
+			const started = new Map([2, 3].map(round => [round, Promise.withResolvers<void>()]));
+			// Round 2 stalls on claude, the first speaker; Round 3 stalls on gpt after claude has added an item
+			const gated = (model: Model, round: number) => (round === 2 && model === claude.model) || (round === 3 && model === gpt.model);
+			const script = scriptedCouncil((model, { round, peerIds }) =>
+				model === claude.model && round === 3
+					? [reportPosition("NEEDS REVISION", ["Clamp budgets"])]
+					: [reportPosition("APPROVE", [], peerIds.map(id => ({ id, stance: "agree" })))],
+			);
+			const { streamFn } = makeMockStreamFn(async (model, context) => {
+				const round = debateRound(context);
+				if (round !== undefined && gated(model, round)) {
+					started.get(round)?.resolve();
+					// ignores the abort signal: the stopped request settles only when its gate opens
+					await gates.get(round)?.promise;
+				}
+				return script(model, context);
+			});
+			const session = newSession(streamFn, [claude, gpt]);
+			await session.startInitialCritiques();
+
+			const stopped = session.runDebateRound();
+			await started.get(2)?.promise;
+			expect(session.queuedSpeakers.map(q => q.reviewerKey)).toEqual([gpt.key]);
+			session.abortActiveRound();
+			expect(session.queuedSpeakers).toEqual([]);
+			const stoppedRun = session.runs.at(-1)!;
+			expect(stoppedRun).toMatchObject({ kind: "debate", round: 2, status: "stopped", summary: { turns: 0, revisions: 0 } });
+			const snapshot = structuredClone(stoppedRun.summary);
+
+			const restarted = session.runDebateRound();
+			await started.get(3)?.promise;
+			gates.get(2)?.resolve();
+			await stopped;
+			// claude's Round 3 item exists now; the stopped run's late finally must not record it
+			expect(session.getConvergence().items.map(i => i.id)).toEqual(["anthropic/claude-3-7-sonnet#1"]);
+			expect(stoppedRun.status).toBe("stopped");
+			expect(stoppedRun.summary).toEqual(snapshot);
+			expect(session.runs.at(-1)).toMatchObject({ kind: "debate", round: 3, status: "running" });
+
+			gates.get(3)?.resolve();
+			await restarted;
+			expect(session.runs.at(-1)).toMatchObject({ round: 3, status: "done", summary: { turns: 2, converged: true, revisions: 1 } });
+		});
+
+		/** gates each reviewer's first Round 2 request; later requests run at once */
+		function gateFirstDebateTurns(script: (model: Model, context: Context) => MockResponse) {
+			const gates = new Map([claude, gpt, gemini].map(r => [r.model, Promise.withResolvers<void>()]));
+			const started = new Map([claude, gpt, gemini].map(r => [r.model, Promise.withResolvers<void>()]));
+			const mock = makeMockStreamFn(async (model, context) => {
+				const first = mock.calls.filter(c => c.model === model && debateRound(c.context) === 2).length === 1;
+				if (debateRound(context) === 2 && first) {
+					started.get(model)?.resolve();
+					await gates.get(model)?.promise;
+				}
+				return script(model, context);
+			});
+			return {
+				...mock,
+				started: (r: ReviewerMember) => started.get(r.model)!.promise,
+				release: (r: ReviewerMember) => gates.get(r.model)!.resolve(),
+			};
+		}
+		const queueOf = (session: CouncilSession) => session.queuedSpeakers.map(q => [q.reviewerKey, q.reason]);
+
+		it("shows the queue without the speaker, and a disputed author queued behind a handoff", async () => {
+			// gpt disputes claude's item and hands the floor to gemini
+			const { streamFn, started, release } = gateFirstDebateTurns(
+				scriptedCouncil((model, { round, peerIds }) => {
+					if (model === claude.model) return [reportPosition("NEEDS REVISION", ["Clamp budgets"])];
+					if (model === gpt.model && round === 2) {
+						const disputes = peerIds.map(id => ({ id, stance: "dispute" as const, reason: "too broad" }));
+						return [withReportFields(reportPosition("APPROVE", [], disputes), { nextSpeaker: "@gemini-2.5-pro" })];
+					}
+					return [reportPosition("APPROVE", [], peerIds.map(id => ({ id, stance: "agree" })))];
+				}),
+			);
+			const session = newSession(streamFn, [claude, gpt, gemini]);
+			await session.startInitialCritiques();
+			const round = session.runDebateRound();
+
+			await started(gpt);
+			expect(queueOf(session)).toEqual([
+				[gemini.key, "order"],
+				[claude.key, "order"],
+			]);
+			release(gpt);
+			await started(gemini);
+			expect(queueOf(session)).toEqual([[claude.key, "disputed"]]);
+			release(gemini);
+			release(claude);
+			await round;
+			expect(debateTurns(session, 2).map(t => t.reviewerKey)).toEqual([gpt.key, gemini.key, claude.key]);
+			expect(session.queuedSpeakers).toEqual([]);
+		});
+
+		it("puts a queued @model message first, then a handoff, then peers confirming new wording", async () => {
+			// gpt disputes claude's item and hands gemini the floor; claude narrows its item, so gpt must confirm it
+			const { streamFn, started, release } = gateFirstDebateTurns(
+				scriptedCouncil((model, { round, peerIds }) => {
+					if (model === claude.model) return [reportPosition("NEEDS REVISION", [round === 1 ? "Clamp budgets" : "Clamp only negative budgets"])];
+					if (model === gpt.model && round === 2 && peerIds.includes("anthropic/claude-3-7-sonnet#1")) {
+						const disputes = peerIds.map(id => ({ id, stance: "dispute" as const, reason: "too broad" }));
+						return [withReportFields(reportPosition("APPROVE", [], disputes), { nextSpeaker: "@gemini-2.5-pro" })];
+					}
+					return [reportPosition("APPROVE", [], peerIds.map(id => ({ id, stance: "agree" })))];
+				}),
+			);
+			const session = newSession(streamFn, [claude, gpt, gemini]);
+			await session.startInitialCritiques();
+			const round = session.runDebateRound();
+
+			await started(gpt);
+			expect(await session.askCouncil("@claude Answer gpt first")).toEqual({ status: "queued", target: claude });
+			expect(queueOf(session)).toEqual([
+				[claude.key, "operator"],
+				[gemini.key, "order"],
+			]);
+			release(gpt);
+			await started(claude);
+			expect(queueOf(session)).toEqual([[gemini.key, "handoff"]]);
+			release(claude);
+			await started(gemini);
+			expect(queueOf(session)).toEqual([[gpt.key, "confirm"]]);
+			release(gemini);
+			await round;
+
+			// each time, the head of the queue was the next to speak
+			expect(debateTurns(session, 2).map(t => t.reviewerKey)).toEqual([gpt.key, claude.key, gemini.key, gpt.key]);
+		});
 	});
 
 	describe("moderator", () => {
@@ -1923,6 +2172,8 @@ describe("roundtable debate rounds", () => {
 			const turns = debateTurns(session, 2);
 			expect(turns.map(t => t.reviewerKey)).toEqual([gpt.key, claude.key, gemini.key]);
 			expect(turns[1].moderation).toBeUndefined();
+			// sent while the moderator framed the next turn, the message belongs to the debate run
+			expect(session.entries.find(e => e.kind === "user")?.runId).toBe(session.runs.find(r => r.kind === "debate")?.id);
 			expect(promptOf(calls, claude, "Council Debate: Round 2")).not.toContain("### Moderator");
 		});
 
@@ -1997,6 +2248,8 @@ describe("roundtable debate rounds", () => {
 			const restarted = session.runDebateRound();
 			await stopped;
 			expect(debateTurns(session, 2)).toEqual([]);
+			// stopped during its opening moderator call: a run with no turns, still recorded
+			expect(session.runs.find(r => r.kind === "debate" && r.round === 2)).toMatchObject({ status: "stopped", summary: { turns: 0 } });
 
 			await started[1].promise;
 			gates[0].resolve();

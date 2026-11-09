@@ -975,7 +975,9 @@ describe("PlanCouncilOverlay UI component", () => {
 		let rows = overlay.render(120);
 		expect(Bun.stripANSI(rows[0])).toContain("[Round 2 · turn 1 @claude-3-7-so… ⏳]");
 		let body = bodyRows(rows).join("\n");
-		expect(body).toContain("[claude-3-7-sonnet (anthropic) · Round 1 critique] ✓ APPROVE");
+		// Round 1 is finished once Round 2 runs, so it folds to one line per reviewer
+		expect(body).toContain("── Round 1 · Critiques");
+		expect(body).toContain("✓ claude-3-7-sonnet · 0 revisions  Review");
 		expect(body).toContain("[claude-3-7-sonnet (anthropic) · Round 2 turn 1] ⏳ streaming...");
 		expect(body).not.toContain("Round 2 turn 2");
 
@@ -1276,9 +1278,7 @@ describe("PlanCouncilOverlay UI component", () => {
 
 		const rendered = plain(overlay.render(120));
 		expect(rendered).toContain(`Moderator → @${gpt.model.id} · T1: ${modQuestion}`);
-		expect(rendered).toContain("Agenda");
-		expect(rendered).toContain(" · possibly the same change");
-		expect(rendered).toMatch(/T1 · Retry and timeout handling · (✓ settled|○ open|⚡ contested) · .* · possibly the same change/);
+		expect(rendered).toMatch(/T1 · Retry and timeout handling · (✓ settled|○ open|⚡ contested) · possibly the same change/);
 
 		const lines = rendered.split("\n");
 		const modIdx = lines.findIndex(l => l.includes(`Moderator → @${gpt.model.id} · T1: ${modQuestion}`));
@@ -1693,6 +1693,446 @@ describe("PlanCouncilOverlay UI component", () => {
 		expect(panes().title).toContain("[Split · Plan]");
 		overlay.handleInput(click(11));
 		expect(panes().title).toContain("[Split · Main]");
+	});
+
+	it("renders section rules in order with stats, debate recaps, and reply headers without 'Round 1 reply'", async () => {
+		let convergedRound = false;
+		const streamFn = reportingStream((modelId, prompt) => {
+			if (!prompt.includes("Council Debate") && !prompt.startsWith("# Operator Follow-up")) {
+				return modelId === gpt.model.id
+					? { args: { verdict: "NEEDS REVISION", revisions: [{ summary: "Clamp budgets" }], positions: [] } }
+					: {
+							args: {
+								verdict: "NEEDS REVISION",
+								revisions: [],
+								positions: [{ id: `${gpt.key}#1`, stance: "dispute", reason: "too broad" }],
+							},
+						};
+			}
+			if (prompt.startsWith("# Operator Follow-up")) {
+				return { text: "Clarification on budgets." };
+			}
+			if (convergedRound) {
+				return modelId === claude.model.id
+					? {
+							args: {
+								verdict: "APPROVE",
+								revisions: [],
+								positions: [{ id: `${gpt.key}#1`, stance: "agree" }],
+							},
+						}
+					: {
+							args: {
+								verdict: "NEEDS REVISION",
+								revisions: [{ summary: "Clamp budgets" }],
+								positions: [],
+							},
+						};
+			}
+			return modelId === claude.model.id
+				? {
+						args: {
+							verdict: "NEEDS REVISION",
+							revisions: [],
+							positions: [{ id: `${gpt.key}#1`, stance: "dispute", reason: "too broad" }],
+						},
+					}
+				: {
+						args: {
+							verdict: "NEEDS REVISION",
+							revisions: [{ summary: "Clamp budgets" }],
+							positions: [],
+						},
+					};
+		});
+
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		await session.startInitialCritiques();
+		await session.askCouncil("@gpt Can you clarify step 2?");
+		await session.runDebateRound();
+
+		const openRendered = plain(overlay.render(120));
+
+		const critiquesIdx = openRendered.indexOf("── Round 1 · Critiques");
+		const qaIdx = openRendered.indexOf("── Q&A");
+		const debate2Idx = openRendered.indexOf("── Round 2 · Debate");
+
+		expect(critiquesIdx).toBeGreaterThanOrEqual(0);
+		expect(qaIdx).toBeGreaterThan(critiquesIdx);
+		expect(debate2Idx).toBeGreaterThan(qaIdx);
+
+		expect(openRendered).toContain("2 reviewers · 1 revision · 1 open");
+		expect(openRendered).toContain("1 reply");
+		expect(openRendered).toContain("open 1 → 1");
+
+		expect(openRendered).toContain("Result: 1 open · ⚡ gpt-4o#1 disputed by claude-3-7-sonnet (anthropic): too broad");
+
+		overlay.handleInput("z");
+		const expanded = plain(overlay.render(120));
+		expect(expanded).toContain("· reply]");
+		expect(expanded).not.toContain("Round 1 reply");
+
+		convergedRound = true;
+		await session.runDebateRound();
+		const convergedRendered = plain(overlay.render(120));
+		expect(convergedRendered).toContain("── Round 3 · Debate");
+		expect(convergedRendered).toContain("Result: converged · 1 revision agreed");
+
+		overlay.dispose();
+	});
+
+	it("folds earlier rounds after Round 2 and toggles full view on 'z'", async () => {
+		const streamFn = reportingStream((modelId, prompt) => {
+			if (!prompt.includes("Council Debate")) {
+				return modelId === gpt.model.id
+					? {
+							text: "### Blocking Issues\n\nFirst issue with details.\nMore details.",
+							args: { verdict: "NEEDS REVISION", revisions: [{ summary: "Fix step 1" }], positions: [] },
+						}
+					: {
+							text: "### Blocking Issues\n\nSecond issue with details.\nMore details.",
+							args: approve,
+						};
+			}
+			return {
+				text: "### Debate Arguments\n\nRound 2 discussion line.",
+				args: approve,
+			};
+		});
+
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		await session.startInitialCritiques();
+		await session.runDebateRound();
+
+		const foldedText = plain(overlay.render(120));
+		expect(foldedText).not.toContain("### Blocking Issues");
+		expect(foldedText).not.toContain("More details.");
+		expect(foldedText).toContain("gpt-4o");
+		expect(foldedText).toContain("claude-3-7-sonnet");
+		expect(foldedText).toContain("### Debate Arguments");
+		expect(foldedText).toContain("Round 2 discussion line.");
+
+		overlay.handleInput("z");
+		const expandedText = plain(overlay.render(120));
+		expect(expandedText).toContain("Showing earlier rounds in full");
+		expect(expandedText).toContain("### Blocking Issues");
+		expect(expandedText).toContain("More details.");
+
+		overlay.handleInput("z");
+		const refoldedText = plain(overlay.render(120));
+		expect(refoldedText).toContain("Folded earlier rounds");
+		expect(refoldedText).not.toContain("### Blocking Issues");
+		expect(refoldedText).not.toContain("More details.");
+		expect(refoldedText).toContain("### Debate Arguments");
+
+		overlay.dispose();
+	});
+
+	it("keeps earlier rounds shown in full while reading paused above the tail, and folds on 'G'", async () => {
+		const { tui } = createFakeTui();
+		const gates: Array<() => void> = [];
+		let call = 0;
+		const streamFn: ModelStreamFn = (model, context) => {
+			const turn = ++call;
+			const reviewer = Boolean(context.tools?.length);
+			const text = `Turn ${turn}\n\n${Array.from({ length: 8 }, (_, i) => `- t${turn} detail ${i}`).join("\n")}`;
+			const gate = Promise.withResolvers<void>();
+			gates.push(gate.resolve);
+			const position =
+				model.id === gpt.model.id
+					? { verdict: "NEEDS REVISION", revisions: [{ summary: "Fix item" }], positions: [] }
+					: { verdict: "APPROVE", revisions: [], positions: [] };
+			return {
+				async *[Symbol.asyncIterator]() {
+					yield { type: "text_delta", delta: text } as unknown as AssistantMessageEvent;
+				},
+				result: async () => {
+					await gate.promise;
+					return {
+						role: "assistant",
+						content: reviewer
+							? [{ type: "text", text }, { type: "toolCall", id: `call-${turn}`, name: "report_position", arguments: position }]
+							: [{ type: "text", text }],
+						stopReason: reviewer ? "toolUse" : "stop",
+					} as unknown as AssistantMessage;
+				},
+			};
+		};
+
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(
+			tui,
+			session,
+			{ reviewOptions: defaultReviewOptions, synthesizerModel: claude.model, maxDebateRounds: 1 },
+			() => {},
+		);
+		const visible = () => bodyRows(overlay.render(80));
+
+		try {
+			overlay.handleInput("o");
+			overlay.handleInput(" ");
+			await delay(5);
+
+			expect(visible().join("\n")).toContain("t2 detail 7");
+
+			gates[0]();
+			await delay(5);
+
+			for (let i = 0; i < 4; i++) overlay.handleInput("k");
+			const pausedTop = visible()[0];
+			expect(visible().join("\n")).toContain("- t1 detail");
+
+			gates[1]();
+			await delay(5);
+
+			expect(session.round).toBe(2);
+			expect(visible()[0]).toBe(pausedTop);
+			expect(visible().join("\n")).toContain("- t1 detail");
+
+			overlay.handleInput("G");
+			overlay.render(80);
+
+			// Navigate to top (Round 1) to verify Round 1 is folded
+			overlay.handleInput("g");
+			const topView = visible().join("\n");
+			expect(topView).toContain("── Round 1 · Critiques");
+			expect(topView).toMatch(/[✓•△]\s+claude-3-7-sonnet/);
+			expect(topView).not.toContain("- t1 detail");
+		} finally {
+			session.abortActiveRound();
+			for (const g of gates) g();
+			overlay.dispose();
+		}
+	});
+
+	it("lists queued reviewers with reasons during a gated debate turn and removes the queue line after the round", async () => {
+		const gemini = makeFakeReviewer("google", "gemini-2.5-pro");
+		const gate = Promise.withResolvers<void>();
+		const gptStarted = Promise.withResolvers<void>();
+
+		const streamFn = reportingStream((modelId, prompt) => {
+			if (!prompt.includes("Council Debate")) {
+				if (modelId === claude.model.id) {
+					return { args: { verdict: "NEEDS REVISION", revisions: [{ summary: "Limit retries" }], positions: [] } };
+				}
+				if (modelId === gpt.model.id) {
+					return { args: { verdict: "NEEDS REVISION", revisions: [{ summary: "Bound timeouts" }], positions: [] } };
+				}
+				return { args: approve };
+			}
+			// Debate turn 1: gemini (0 revisions from round 1) disputes claude and hands off to gpt
+			if (modelId === gemini.model.id && prompt.includes("turn 1")) {
+				return {
+					args: {
+						verdict: "APPROVE",
+						revisions: [],
+						positions: [{ id: `${claude.key}#1`, stance: "dispute", reason: "too restrictive" }],
+						nextSpeaker: `@${gpt.model.id}`,
+					},
+				};
+			}
+			// Debate turn 2: gpt holds the floor and waits on the gate
+			if (modelId === gpt.model.id) {
+				gptStarted.resolve();
+				return {
+					args: approve,
+					wait: gate.promise,
+				};
+			}
+			return { args: approve };
+		});
+
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt, gemini],
+			initialReviewers: [claude, gpt, gemini],
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		await session.startInitialCritiques();
+		const debate = session.runDebateRound();
+		await gptStarted.promise;
+
+		overlay.handleInput("i");
+		for (const ch of "@gemini Check timeouts") overlay.handleInput(ch);
+		overlay.handleInput("\r");
+		await flushMicrotasks();
+
+		const duringDebate = bodyRows(overlay.render(120)).join("\n");
+		expect(duringDebate).toContain("Queued:");
+		expect(duringDebate).toContain("@gemini-2.5-pro (your message)");
+		expect(duringDebate).toContain("@claude-3-7-sonnet (disputed author)");
+		expect(duringDebate).not.toMatch(/Queued:.*@gpt-4o/);
+
+		gate.resolve();
+		await debate;
+
+		const afterDebate = bodyRows(overlay.render(120)).join("\n");
+		expect(afterDebate).not.toContain("Queued:");
+		expect(session.queuedSpeakers).toHaveLength(0);
+
+		overlay.dispose();
+	});
+
+	it("renders 'Result: stopped after 0 turns' when round is aborted during a gated debate turn", async () => {
+		const gate = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+
+		const streamFn = reportingStream((modelId, prompt) => {
+			if (!prompt.includes("Council Debate")) return { args: approve };
+			started.resolve();
+			return { args: approve, wait: gate.promise };
+		});
+
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		await session.startInitialCritiques();
+		const debate = session.runDebateRound();
+		await started.promise;
+
+		overlay.handleInput("x");
+		gate.resolve();
+		await debate;
+
+		const text = plain(overlay.render(120));
+		expect(text).toContain("Result: stopped after 0 turns");
+		expect(session.runs.find(r => r.kind === "debate")?.status).toBe("stopped");
+
+		overlay.dispose();
+	});
+
+	it("renders topic scorecard with moderator configured showing ✓, ⚡, ○ stance marks and dispute reason line", async () => {
+		const gemini = makeFakeReviewer("google", "gemini-2.5-pro");
+		const codestral = makeFakeReviewer("mistral", "codestral");
+		const moderatorModel = makeFakeModel("openai", "gpt-4o-mini");
+
+		const streamFn = reportingStream((modelId, prompt, toolName) => {
+			if (toolName === "set_agenda") {
+				return {
+					args: {
+						topics: [
+							{
+								id: "T1",
+								title: "Retry logic",
+								itemIds: [`${claude.key}#1`],
+								duplicates: false,
+							},
+						],
+						nextSpeaker: `@${gpt.model.id}`,
+						topicId: "T1",
+						question: "Can we unify retries?",
+					},
+				};
+			}
+			if (toolName === "moderate_turn") {
+				return {
+					args: {
+						nextSpeaker: `@${gemini.model.id}`,
+						topicId: "T1",
+						question: "Do you agree with the retry logic?",
+					},
+				};
+			}
+			if (!prompt.includes("Council Debate")) {
+				if (modelId === claude.model.id) {
+					return { args: { verdict: "NEEDS REVISION", revisions: [{ summary: "Limit retries" }], positions: [] } };
+				}
+				if (modelId === gpt.model.id) {
+					return { args: { verdict: "NEEDS REVISION", revisions: [], positions: [{ id: `${claude.key}#1`, stance: "agree" }] } };
+				}
+				if (modelId === gemini.model.id) {
+					return { args: { verdict: "NEEDS REVISION", revisions: [], positions: [{ id: `${claude.key}#1`, stance: "dispute", reason: "contradicts spec" }] } };
+				}
+				return { args: approve };
+			}
+			if (modelId === gpt.model.id) {
+				return { args: { verdict: "NEEDS REVISION", revisions: [], positions: [{ id: `${claude.key}#1`, stance: "agree" }] } };
+			}
+			if (modelId === gemini.model.id) {
+				return { args: { verdict: "NEEDS REVISION", revisions: [], positions: [{ id: `${claude.key}#1`, stance: "dispute", reason: "contradicts spec" }] } };
+			}
+			if (modelId === codestral.model.id) {
+				return { args: approve };
+			}
+			return { args: { verdict: "NEEDS REVISION", revisions: [{ summary: "Limit retries" }], positions: [] } };
+		});
+
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt, gemini, codestral],
+			initialReviewers: [claude, gpt, gemini, codestral],
+			moderator: { model: moderatorModel },
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		await session.startInitialCritiques();
+		await session.runDebateRound();
+
+		const rendered = plain(overlay.render(120));
+
+		expect(rendered).toContain("T1 · Retry logic");
+		expect(rendered).toMatch(/claude-3-7-sonnet#1.*✓.*gpt-4o.*⚡.*gemini-2\.5-pro.*○.*codestral/);
+		expect(rendered).toContain("⚡ gemini-2.5-pro (google): contradicts spec");
+
+		overlay.dispose();
+	});
+
+	it("renders hint bar ending with 'Esc close' at both 120 and 80 columns", () => {
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		const row120 = plain([overlay.render(120).at(-1)!]).trim();
+		const row80 = plain([overlay.render(80).at(-1)!]).trim();
+
+		expect(row120.endsWith("Esc close")).toBe(true);
+		expect(row80.endsWith("Esc close")).toBe(true);
+
+		overlay.dispose();
 	});
 });
 

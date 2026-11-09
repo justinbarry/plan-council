@@ -16,20 +16,27 @@ import {
 import { getMarkdownTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import {
+	type CouncilRun,
 	CouncilSession,
+	type CouncilTurnEntry,
 	isReviewerTurnEntry,
 	OperatorQuestionPending,
+	type QueueReason,
 	READER_TARGET_KEY,
 	type ReviewerTurnEntry,
 } from "./council-session";
+import type { AgendaTopicStatus } from "./moderator";
 import {
 	isEmptyPositionDelta,
+	type ItemStance,
 	openDisagreementCount,
 	type PositionDelta,
 	positionDeltaSegments,
 	type ReviewerPosition,
 	shortRevisionId,
+	stanceOn,
 } from "./position";
+import { buildTranscript, firstProseLine, type TranscriptSection } from "./transcript";
 
 export type ApprovalChoice = "execute" | "compact" | "keep";
 
@@ -114,6 +121,43 @@ function formatPositionDelta(delta: PositionDelta, verdict: ReviewerPosition["ve
 	return segments.join(theme.fg("muted", " · "));
 }
 
+/** `1 turn`, `3 turns` */
+function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
+	return `${count} ${count === 1 ? singular : pluralForm}`;
+}
+
+/** a reviewer's stance on a peer item in the topic scorecard */
+function stanceMark(stance: ItemStance["stance"]): string {
+	switch (stance) {
+		case "agree":
+			return theme.fg("success", "✓");
+		case "dispute":
+			return theme.fg("error", "⚡");
+		case "unjudged":
+			return theme.fg("muted", "○");
+		case "unreported":
+			return theme.fg("warning", "?");
+	}
+}
+
+/** why a reviewer is queued, as the Council tab's `Queued:` line says it; plain speaking order needs no note */
+const QUEUE_REASON_TEXT: Record<QueueReason, string | undefined> = {
+	operator: "your message",
+	handoff: "handed the floor",
+	disputed: "disputed author",
+	confirm: "confirms new wording",
+	order: undefined,
+};
+
+/** key hints in priority order, dropping the lowest-priority ones until they fit; `last` is always kept */
+function fitHints(parts: readonly string[], last: string, width: number): string {
+	const kept: string[] = [];
+	for (const part of parts) {
+		if (visibleWidth([...kept, part, last].join(" · ")) <= width) kept.push(part);
+	}
+	return [...kept, last].join(" · ");
+}
+
 export class PlanCouncilOverlay implements Component, Focusable {
 	#tui: TUI;
 	#session: CouncilSession;
@@ -157,6 +201,10 @@ export class PlanCouncilOverlay implements Component, Focusable {
 	/** Tab completion state while the operator cycles through `@` mention candidates */
 	#mentionCycle?: { prefixValue: string; candidates: string[]; index: number };
 	#scorecardExpanded = true;
+	/** finished runs folded to one line per turn; frozen while the operator reads above the tail during a run */
+	#foldedRunIds = new Set<number>();
+	/** `z` shows finished runs in full */
+	#expandFinished = false;
 
 	#planMarkdown: Markdown;
 	#markdownCache = new Map<string, { text: string; md: Markdown }>();
@@ -370,9 +418,10 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		}
 		const elapsed = entry.readerStatus ? undefined : formatElapsed(entry.startedAt, entry.finishedAt);
 		if (elapsed) badge += theme.fg("muted", ` · ${elapsed}`);
-		const turn = entry.roundtableTurn
-			? `Round ${entry.round} turn ${entry.roundtableTurn.step}`
-			: `Round ${entry.round} ${entry.kind}`;
+		let turn: string;
+		if (entry.roundtableTurn) turn = `Round ${entry.round} turn ${entry.roundtableTurn.step}`;
+		else if (entry.kind === "reply") turn = "reply";
+		else turn = `Round ${entry.round} ${entry.kind}`;
 		return theme.bold(theme.fg("accent", `[${entry.reviewerLabel} · ${turn}]`)) + badge;
 	}
 
@@ -380,8 +429,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 	#renderReviewerEntry(entry: ReviewerTurnEntry, contentWidth: number): string[] {
 		const lines: string[] = [];
 		if (entry.moderation) {
-			const modelId =
-				this.#session.availableReviewers.find(r => r.key === entry.reviewerKey)?.model.id ?? entry.reviewerLabel;
+			const modelId = this.#modelIdOf(entry.reviewerKey) ?? entry.reviewerLabel;
 			const topic = entry.moderation.topicId ? ` · ${entry.moderation.topicId}` : "";
 			lines.push(
 				truncateToWidth(
@@ -411,6 +459,223 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			}
 		}
 		lines.push("");
+		return lines;
+	}
+
+	#modelIdOf(reviewerKey: string): string | undefined {
+		return (
+			this.#session.availableReviewers.find(r => r.key === reviewerKey) ??
+			this.#session.activeReviewers.find(r => r.key === reviewerKey)
+		)?.model.id;
+	}
+
+	/** an operator message: `[Operator → target]` and its text */
+	#renderOperatorEntry(entry: CouncilTurnEntry & { kind: "user" }): string[] {
+		const target = entry.targetLabel ? ` → ${entry.targetLabel}` : " → Council";
+		return [
+			theme.bold(theme.fg("accent", `[Operator${target}]`)),
+			...entry.text.split("\n").map(line => `  ${replaceTabs(line)}`),
+			"",
+		];
+	}
+
+	#renderSynthesisEntry(entry: CouncilTurnEntry & { kind: "synthesis" }, contentWidth: number): string[] {
+		let badge = "";
+		if (entry.status === "streaming") badge = theme.fg("warning", " ⏳ synthesizing...");
+		else if (entry.status === "error") badge = theme.fg("error", " ✗ error");
+		const elapsed = formatElapsed(entry.startedAt, entry.finishedAt);
+		if (elapsed) badge += theme.fg("muted", ` · ${elapsed}`);
+		const lines = [theme.bold(theme.fg("accent", `[Synthesis · ${entry.modelLabel}]`)) + badge];
+		if (entry.text) lines.push(...this.#getEntryMarkdown(entry.id, entry.text).render(contentWidth));
+		lines.push("");
+		return lines;
+	}
+
+	/** the Council tab body: one section per run (finished ones folded unless expanded), then the speaking queue */
+	#renderTranscript(contentWidth: number): string[] {
+		const sections = buildTranscript(this.#session.runs, this.#session.entries);
+		this.#refreshFolds(sections);
+		const lines: string[] = [];
+		for (const section of sections) {
+			const folded = !this.#expandFinished && this.#foldedRunIds.has(section.run.id);
+			lines.push(this.#sectionRule(section, contentWidth));
+			if (section.answering) {
+				const question = firstProseLine(section.answering.text);
+				lines.push(
+					truncateToWidth(
+						theme.fg("muted", `  Answering your message from Round ${section.answering.round}: ${replaceTabs(question)}`),
+						contentWidth,
+					),
+				);
+			}
+			for (const entry of section.entries) {
+				if (entry.kind === "user") {
+					if (!folded) lines.push(...this.#renderOperatorEntry(entry));
+					else {
+						const target = entry.targetLabel ?? "Council";
+						const text = `  Operator → ${replaceTabs(target)}: ${replaceTabs(firstProseLine(entry.text))}`;
+						lines.push(truncateToWidth(theme.fg("accent", text), contentWidth));
+					}
+				} else if (entry.kind === "synthesis") {
+					if (!folded) lines.push(...this.#renderSynthesisEntry(entry, contentWidth));
+					else {
+						const text = `  Synthesis by ${entry.modelLabel}: ${firstProseLine(entry.text)}`;
+						lines.push(truncateToWidth(replaceTabs(text), contentWidth));
+					}
+				} else if (folded) {
+					lines.push(this.#foldedTurnLine(entry, contentWidth));
+				} else {
+					lines.push(...this.#renderReviewerEntry(entry, contentWidth));
+				}
+			}
+			const recap = this.#recapLine(section.run, contentWidth);
+			if (recap) lines.push(recap);
+			if (lines.at(-1) !== "") lines.push("");
+		}
+		const queued = this.#session.queuedSpeakers;
+		if (queued.length > 0) {
+			const names = queued.map(q => {
+				const why = QUEUE_REASON_TEXT[q.reason];
+				return `@${q.modelId}${why ? theme.fg("muted", ` (${why})`) : ""}`;
+			});
+			lines.push(truncateToWidth(`  ${theme.fg("accent", "Queued:")} ${names.join(theme.fg("muted", " · "))}`, contentWidth));
+		}
+		return lines;
+	}
+
+	/**
+	 * runs before the latest critique or debate run fold once none of their turns is streaming. While the operator has
+	 * scrolled up during a run the previous set is kept, so no rows above or inside the viewport disappear.
+	 */
+	#refreshFolds(sections: readonly TranscriptSection[]): void {
+		if (this.#session.isActive() && this.#tailPausedByUser) return;
+		const latestRound = sections.findLastIndex(s => s.run.kind === "critiques" || s.run.kind === "debate");
+		this.#foldedRunIds = new Set(
+			sections
+				.slice(0, Math.max(0, latestRound))
+				.filter(s => !s.entries.some(e => e.kind !== "user" && e.status === "streaming"))
+				.map(s => s.run.id),
+		);
+	}
+
+	/** `── Round 2 · Debate ───── 4 turns · open 2 → 1` across the content width */
+	#sectionRule(section: TranscriptSection, width: number): string {
+		const { run } = section;
+		let title: string;
+		if (section.unassigned) title = "Operator";
+		else if (run.kind === "critiques") title = `Round 1 · Critiques${run.retry ? " (retry)" : ""}`;
+		else if (run.kind === "debate") title = `Round ${run.round} · Debate`;
+		else if (run.kind === "qa") title = "Q&A";
+		else title = "Synthesis";
+
+		let stats = "";
+		const summary = run.summary;
+		if (run.status === "running") stats = "in progress";
+		else if (run.kind === "critiques" && summary) {
+			const open = summary.converged ? "converged" : `${summary.open} open`;
+			stats = `${plural(summary.turns, "reviewer")} · ${plural(summary.revisions, "revision")} · ${open}`;
+		} else if (run.kind === "debate" && summary) {
+			stats = `${plural(summary.turns, "turn")} · open ${run.openBefore ?? "?"} → ${summary.open}`;
+		} else if (run.kind === "qa" && !section.unassigned) {
+			stats = plural(section.entries.filter(e => e.kind === "reply").length, "reply", "replies");
+		}
+
+		const tail = stats ? ` ${stats}` : "";
+		const fill = Math.max(2, width - visibleWidth(`── ${title} `) - visibleWidth(tail));
+		return truncateToWidth(
+			`${theme.fg("muted", "── ")}${theme.bold(theme.fg("accent", title))} ${theme.fg("muted", `${"─".repeat(fill)}${tail}`)}`,
+			width,
+		);
+	}
+
+	/** a finished critique or debate run's outcome as its summary recorded it */
+	#recapLine(run: CouncilRun, width: number): string | undefined {
+		const summary = run.summary;
+		if (!summary || run.status === "running") return undefined;
+		let text: string;
+		if (run.status === "stopped") {
+			text = theme.fg("warning", `Result: stopped after ${plural(summary.turns, "turn")}`);
+		} else if (summary.converged) {
+			const agreed = summary.revisions === 0 ? "no revisions required" : `${plural(summary.revisions, "revision")} agreed`;
+			text = theme.fg("success", `Result: converged · ${agreed}`);
+		} else {
+			const parts = [`Result: ${summary.open} open`];
+			for (const d of summary.disputes) {
+				parts.push(`⚡ ${shortRevisionId(d.id)} disputed by ${d.by}${d.reason.trim() ? `: ${d.reason.trim()}` : ""}`);
+			}
+			if (summary.unjudged > 0) parts.push(`${summary.unjudged} not yet judged`);
+			if (summary.unreported.length > 0) parts.push(`no report: ${summary.unreported.join(", ")}`);
+			text = theme.fg("warning", parts.join(" · "));
+		}
+		return truncateToWidth(`  ${replaceTabs(text)}`, width);
+	}
+
+	/** a folded turn: status or verdict, model, turn number, revision count, then the first line of prose */
+	#foldedTurnLine(entry: ReviewerTurnEntry, width: number): string {
+		let mark: string;
+		if (entry.status === "streaming") mark = theme.fg("warning", "⏳");
+		else if (entry.status === "error") mark = theme.fg("error", "!");
+		else if (entry.status === "aborted") mark = theme.fg("dim", "⊘");
+		else mark = entry.position ? formatVerdictGlyph(entry.position.verdict) : theme.fg("muted", "•");
+		const meta = [
+			...(entry.roundtableTurn ? [`turn ${entry.roundtableTurn.step}`] : entry.kind === "reply" ? ["reply"] : []),
+			...(entry.position ? [plural(entry.position.revisions.length, "revision")] : []),
+		];
+		const model = this.#modelIdOf(entry.reviewerKey) ?? entry.reviewerLabel;
+		const prose = firstProseLine(entry.text);
+		return truncateToWidth(
+			`  ${mark} ${theme.fg("accent", replaceTabs(model))}${meta.length > 0 ? theme.fg("muted", ` · ${meta.join(" · ")}`) : ""}${prose ? `  ${replaceTabs(prose)}` : ""}`,
+			width,
+		);
+	}
+
+	/** with an agenda: one verdict line, then each topic's items with every other reviewer's stance and dispute reasons */
+	#renderTopicRows(
+		agenda: readonly AgendaTopicStatus[],
+		positions: ReadonlyArray<{ reviewer: { key: string; label: string; model: { id: string } }; position?: ReviewerPosition }>,
+		shortIdByFullId: ReadonlyMap<string, string>,
+		width: number,
+	): string[] {
+		const verdicts = positions.map(({ reviewer, position }) => {
+			let mark: string;
+			if (position) mark = formatVerdictGlyph(position.verdict);
+			else {
+				const status = this.#latestTurn(reviewer.key)?.status;
+				if (status === "streaming") mark = theme.fg("warning", "⏳");
+				else if (status === "error") mark = theme.fg("error", "!");
+				else mark = theme.fg("muted", "•");
+			}
+			return `${mark} ${replaceTabs(reviewer.model.id)}`;
+		});
+		const lines = [truncateToWidth(`    ${verdicts.join(theme.fg("muted", " · "))}`, width)];
+		const summaries = new Map(positions.flatMap(({ position }) => (position?.revisions ?? []).map(item => [item.id, item.summary] as const)));
+
+		for (const topic of agenda) {
+			let status: string;
+			if (topic.status === "contested") status = theme.fg("error", "⚡ contested");
+			else if (topic.status === "open") status = theme.fg("warning", "○ open");
+			else status = theme.fg("success", "✓ settled");
+			const same = topic.duplicates ? theme.fg("muted", " · possibly the same change") : "";
+			lines.push(truncateToWidth(`    ${theme.fg("accent", topic.id)} · ${replaceTabs(topic.title)} · ${status}${same}`, width));
+			for (const id of topic.itemIds) {
+				const owner = id.slice(0, id.lastIndexOf("#"));
+				const judges = positions.filter(({ reviewer }) => reviewer.key !== owner);
+				const stances = judges.map(({ reviewer, position }) => ({ reviewer, judged: stanceOn(position, id) }));
+				const marks = stances.map(({ reviewer, judged }) => `${stanceMark(judged.stance)} ${shortModelId(reviewer.model.id)}`);
+				const shortId = shortIdByFullId.get(id) ?? shortRevisionId(id);
+				lines.push(
+					truncateToWidth(
+						`      ${theme.fg("accent", shortId)} ${marks.join(" ")}${theme.fg("muted", " · ")}${replaceTabs(summaries.get(id) ?? "")}`,
+						width,
+					),
+				);
+				for (const { reviewer, judged } of stances) {
+					if (judged.stance !== "dispute") continue;
+					const reason = judged.reason.trim() ? `: ${replaceTabs(judged.reason.trim())}` : "";
+					lines.push(truncateToWidth(`        ${theme.fg("error", "⚡")} ${replaceTabs(reviewer.label)}${reason}`, width));
+				}
+			}
+		}
 		return lines;
 	}
 
@@ -449,45 +714,41 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			}
 		}
 
-		for (const { reviewer, position } of positions) {
-			const label = replaceTabs(reviewer.label);
-			if (!position) {
-				const status = this.#latestTurn(reviewer.key)?.status;
-				let stateText: string;
-				if (status === "streaming") stateText = theme.fg("warning", "⏳ streaming...");
-				else if (status === "error") stateText = theme.fg("error", "! error");
-				else stateText = theme.fg("muted", "no position reported");
-				lines.push(truncateToWidth(`    ${theme.fg("muted", "•")} ${label}: ${stateText}`, contentWidth));
-				continue;
-			}
-			const count = position.revisions.length;
-			const countText =
-				count === 0 ? "no required revisions" : `${count} required ${count === 1 ? "revision" : "revisions"}`;
-			lines.push(
-				truncateToWidth(
-					`    ${formatVerdictBadge(position.verdict)} · ${label} ${theme.fg("muted", `(${countText})`)}`,
-					contentWidth,
-				),
-			);
-			for (const item of position.revisions) {
-				const shortId = shortIdByFullId.get(item.id) ?? item.id;
-				lines.push(truncateToWidth(`      • ${theme.fg("accent", shortId)}: ${replaceTabs(item.summary)}`, contentWidth));
-			}
-		}
-
 		const agenda = this.#session.getAgenda();
 		if (agenda.length > 0) {
-			lines.push(`    ${theme.fg("accent", "Agenda")}`);
-			for (const topic of agenda) {
-				let status: string;
-				if (topic.status === "contested") status = theme.fg("error", "⚡ contested");
-				else if (topic.status === "open") status = theme.fg("warning", "○ open");
-				else status = theme.fg("success", "✓ settled");
-				const ids = topic.itemIds.map(id => shortIdByFullId.get(id) ?? shortRevisionId(id)).join(", ");
-				const same = topic.duplicates ? " · possibly the same change" : "";
+			lines.push(...this.#renderTopicRows(agenda, positions, shortIdByFullId, contentWidth));
+		} else {
+			for (const { reviewer, position } of positions) {
+				const label = replaceTabs(reviewer.label);
+				if (!position) {
+					const status = this.#latestTurn(reviewer.key)?.status;
+					let stateText: string;
+					if (status === "streaming") stateText = theme.fg("warning", "⏳ streaming...");
+					else if (status === "error") stateText = theme.fg("error", "! error");
+					else stateText = theme.fg("muted", "no position reported");
+					lines.push(truncateToWidth(`    ${theme.fg("muted", "•")} ${label}: ${stateText}`, contentWidth));
+					continue;
+				}
+				const count = position.revisions.length;
+				const countText =
+					count === 0 ? "no required revisions" : `${count} required ${count === 1 ? "revision" : "revisions"}`;
 				lines.push(
 					truncateToWidth(
-						`      ${theme.fg("accent", topic.id)} · ${replaceTabs(topic.title)} · ${status}${theme.fg("muted", ` · ${ids}${same}`)}`,
+						`    ${formatVerdictBadge(position.verdict)} · ${label} ${theme.fg("muted", `(${countText})`)}`,
+						contentWidth,
+					),
+				);
+				for (const item of position.revisions) {
+					const shortId = shortIdByFullId.get(item.id) ?? item.id;
+					lines.push(truncateToWidth(`      • ${theme.fg("accent", shortId)}: ${replaceTabs(item.summary)}`, contentWidth));
+				}
+			}
+			for (const d of convergence.disputes) {
+				const id = shortIdByFullId.get(d.id) ?? shortRevisionId(d.id);
+				const reason = d.reason ? `: ${replaceTabs(d.reason)}` : "";
+				lines.push(
+					truncateToWidth(
+						`    ${theme.fg("error", "⚡ Dispute")} on ${theme.fg("accent", id)} by ${replaceTabs(d.by)}${reason}`,
 						contentWidth,
 					),
 				);
@@ -498,17 +759,6 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			lines.push(
 				truncateToWidth(
 					theme.fg("muted", `    ⚠ Moderator unavailable (${replaceTabs(moderatorError)}); default speaking order`),
-					contentWidth,
-				),
-			);
-		}
-
-		for (const d of convergence.disputes) {
-			const id = shortIdByFullId.get(d.id) ?? shortRevisionId(d.id);
-			const reason = d.reason ? `: ${replaceTabs(d.reason)}` : "";
-			lines.push(
-				truncateToWidth(
-					`    ${theme.fg("error", "⚡ Dispute")} on ${theme.fg("accent", id)} by ${replaceTabs(d.by)}${reason}`,
 					contentWidth,
 				),
 			);
@@ -625,30 +875,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 				);
 			} else {
 				if (hasDoneReviewer) lines.push(...this.#renderScorecard(contentWidth));
-				for (const entry of this.#session.entries) {
-					if (entry.kind === "user") {
-						const target = entry.targetLabel ? ` → ${entry.targetLabel}` : " → Council";
-						lines.push(theme.bold(theme.fg("accent", `[Operator${target}]`)));
-						for (const l of entry.text.split("\n")) {
-							lines.push(`  ${replaceTabs(l)}`);
-						}
-						lines.push("");
-					} else if (entry.kind === "synthesis") {
-						let badge = "";
-						if (entry.status === "streaming") badge = theme.fg("warning", " ⏳ synthesizing...");
-						else if (entry.status === "error") badge = theme.fg("error", " ✗ error");
-						const elapsed = formatElapsed(entry.startedAt, entry.finishedAt);
-						if (elapsed) badge += theme.fg("muted", ` · ${elapsed}`);
-						lines.push(theme.bold(theme.fg("accent", `[Synthesis · ${entry.modelLabel}]`)) + badge);
-						if (entry.text) {
-							const md = this.#getEntryMarkdown(entry.id, entry.text);
-							lines.push(...md.render(contentWidth));
-						}
-						lines.push("");
-					} else {
-						lines.push(...this.#renderReviewerEntry(entry, contentWidth));
-					}
-				}
+				lines.push(...this.#renderTranscript(contentWidth));
 			}
 		} else if (activeTab.startsWith("reviewer:")) {
 			const reviewerKey = activeTab.slice("reviewer:".length);
@@ -664,12 +891,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			} else {
 				for (const entry of matchingEntries) {
 					if (entry.kind === "user") {
-						const target = entry.targetLabel ? ` → ${entry.targetLabel}` : " → Council";
-						lines.push(theme.bold(theme.fg("accent", `[Operator${target}]`)));
-						for (const l of entry.text.split("\n")) {
-							lines.push(`  ${replaceTabs(l)}`);
-						}
-						lines.push("");
+						lines.push(...this.#renderOperatorEntry(entry));
 					} else if (isReviewerTurnEntry(entry)) {
 						lines.push(...this.#renderReviewerEntry(entry, contentWidth));
 					}
@@ -881,12 +1103,12 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		} else if (activeTab === "models") {
 			hints = "Tab tabs · ↑↓/jk select model · Space toggle · Enter start critiques · Esc close";
 		} else {
-			const parts = ["Space Auto-run", "r critique", "d debate", "i ask", "s synth", "f refine", "a approve", "x stop"];
+			const parts = ["Space auto", "d debate", "i ask", "a approve", "f refine", "s synth", "r critique", "x stop"];
+			if (activeTab === "council" && this.#foldedRunIds.size > 0) parts.push(this.#expandFinished ? "z fold" : "z unfold");
 			if (activeTab === "council" && hasDoneReviewer) parts.push("o scorecard");
-			parts.push("p split plan");
+			parts.push("p plan");
 			if (showingSplit) parts.push("←/→ pane");
-			parts.push("Esc close");
-			hints = parts.join(" · ");
+			hints = fitHints(parts, "Esc close", safeWidth);
 		}
 		const hintLine = truncateToWidth(theme.fg("muted", hints), safeWidth);
 
@@ -1184,6 +1406,16 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			} else {
 				this.#focusedPane = "left";
 			}
+			this.#tui.requestRender();
+			return;
+		}
+
+		if (data === "z" && activeTab === "council") {
+			this.#expandFinished = !this.#expandFinished;
+			this.#statusBanner = {
+				text: this.#expandFinished ? "Showing earlier rounds in full" : "Folded earlier rounds",
+				isError: false,
+			};
 			this.#tui.requestRender();
 			return;
 		}
