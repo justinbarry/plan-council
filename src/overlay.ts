@@ -12,6 +12,7 @@ import {
 	TabBar,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
 import { getMarkdownTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
@@ -22,6 +23,7 @@ import {
 	isReviewerTurnEntry,
 	OperatorQuestionPending,
 	type QueueReason,
+	type QueuedSpeaker,
 	READER_TARGET_KEY,
 	type ReviewerTurnEntry,
 	type StreamPhase,
@@ -37,7 +39,7 @@ import {
 	shortRevisionId,
 	stanceOn,
 } from "./position";
-import { buildTranscript, firstProseLine, type TranscriptSection } from "./transcript";
+import { buildTranscript, firstProseLine, lastProseLine, type TranscriptSection } from "./transcript";
 
 export type ApprovalChoice = "execute" | "compact" | "keep";
 
@@ -143,6 +145,16 @@ function plural(count: number, singular: string, pluralForm = `${singular}s`): s
 	return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
+/** `── Title ──────── stats` across the width */
+function ruleLine(title: string, stats: string, width: number): string {
+	const tail = stats ? ` ${stats}` : "";
+	const fill = Math.max(2, width - visibleWidth(`── ${title} `) - visibleWidth(tail));
+	return truncateToWidth(
+		`${theme.fg("muted", "── ")}${theme.bold(theme.fg("accent", title))} ${theme.fg("muted", `${"─".repeat(fill)}${tail}`)}`,
+		width,
+	);
+}
+
 /** a reviewer's stance on a peer item in the topic scorecard */
 function stanceMark(stance: ItemStance["stance"]): string {
 	switch (stance) {
@@ -157,7 +169,7 @@ function stanceMark(stance: ItemStance["stance"]): string {
 	}
 }
 
-/** why a reviewer is queued, as the Council tab's `Queued:` line says it; plain speaking order needs no note */
+/** why a reviewer is queued, as the queue lines say it; plain speaking order needs no note */
 const QUEUE_REASON_TEXT: Record<QueueReason, string | undefined> = {
 	operator: "your message",
 	handoff: "handed the floor",
@@ -217,7 +229,8 @@ export class PlanCouncilOverlay implements Component, Focusable {
 	#statusBanner?: StatusBanner;
 	/** Tab completion state while the operator cycles through `@` mention candidates */
 	#mentionCycle?: { prefixValue: string; candidates: string[]; index: number };
-	#scorecardExpanded = true;
+	/** `o` shows each settled topic's revisions in the Council summary instead of one line per topic */
+	#showSettledTopics = false;
 	/** finished runs folded to one line per turn; frozen while the operator reads above the tail during a run */
 	#foldedRunIds = new Set<number>();
 	/** `z` shows finished runs in full */
@@ -335,7 +348,10 @@ export class PlanCouncilOverlay implements Component, Focusable {
 	}
 
 	#buildTabs(): Tab[] {
-		const tabs: Tab[] = [{ id: "council", label: "Council", short: "Council" }];
+		const tabs: Tab[] = [
+			{ id: "council", label: "Council", short: "Council" },
+			{ id: "transcript", label: "Transcript", short: "Transcript" },
+		];
 
 		for (const r of this.#session.activeReviewers) {
 			const latest = this.#latestTurn(r.key);
@@ -543,7 +559,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		return lines;
 	}
 
-	/** the Council tab body: one section per run (finished ones folded unless expanded), then the speaking queue */
+	/** the Transcript tab: one section per run (finished ones folded unless expanded), then the speaking queue */
 	#renderTranscript(contentWidth: number): string[] {
 		const sections = buildTranscript(this.#session.runs, this.#session.entries);
 		this.#refreshFolds(sections);
@@ -586,13 +602,18 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		}
 		const queued = this.#session.queuedSpeakers;
 		if (queued.length > 0) {
-			const names = queued.map(q => {
-				const why = QUEUE_REASON_TEXT[q.reason];
-				return `@${q.modelId}${why ? theme.fg("muted", ` (${why})`) : ""}`;
-			});
-			lines.push(truncateToWidth(`  ${theme.fg("accent", "Queued:")} ${names.join(theme.fg("muted", " · "))}`, contentWidth));
+			lines.push(truncateToWidth(`  ${theme.fg("accent", "Queued:")} ${this.#queueNames(queued)}`, contentWidth));
 		}
 		return lines;
+	}
+
+	/** `@gemini-2.5-pro (confirms new wording) · @gpt-4o` */
+	#queueNames(queued: readonly QueuedSpeaker[]): string {
+		const names = queued.map(q => {
+			const why = QUEUE_REASON_TEXT[q.reason];
+			return `@${q.modelId}${why ? theme.fg("muted", ` (${why})`) : ""}`;
+		});
+		return names.join(theme.fg("muted", " · "));
 	}
 
 	/**
@@ -610,38 +631,40 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		);
 	}
 
+	#runTitle(section: TranscriptSection): string {
+		const { run } = section;
+		if (section.unassigned) return "Operator";
+		if (run.kind === "critiques") return `Round 1 · Critiques${run.retry ? " (retry)" : ""}`;
+		if (run.kind === "debate") return `Round ${run.round} · Debate`;
+		if (run.kind === "qa") return "Q&A";
+		return "Synthesis";
+	}
+
+	/** `4 turns · open 2 → 1`, `3 reviewers · 5 revisions · 2 open`, `1 reply`, `in progress` */
+	#runStats(section: TranscriptSection): string {
+		const { run } = section;
+		const summary = run.summary;
+		if (run.status === "running") return "in progress";
+		if (run.kind === "critiques" && summary) {
+			const open = summary.converged ? "converged" : `${summary.open} open`;
+			return `${plural(summary.turns, "reviewer")} · ${plural(summary.revisions, "revision")} · ${open}`;
+		}
+		if (run.kind === "debate" && summary) {
+			return `${plural(summary.turns, "turn")} · open ${run.openBefore ?? "?"} → ${summary.open}`;
+		}
+		if (run.kind === "qa" && !section.unassigned) {
+			return plural(section.entries.filter(e => e.kind === "reply").length, "reply", "replies");
+		}
+		return "";
+	}
+
 	/** `── Round 2 · Debate ───── 4 turns · open 2 → 1` across the content width */
 	#sectionRule(section: TranscriptSection, width: number): string {
-		const { run } = section;
-		let title: string;
-		if (section.unassigned) title = "Operator";
-		else if (run.kind === "critiques") title = `Round 1 · Critiques${run.retry ? " (retry)" : ""}`;
-		else if (run.kind === "debate") title = `Round ${run.round} · Debate`;
-		else if (run.kind === "qa") title = "Q&A";
-		else title = "Synthesis";
-
-		let stats = "";
-		const summary = run.summary;
-		if (run.status === "running") stats = "in progress";
-		else if (run.kind === "critiques" && summary) {
-			const open = summary.converged ? "converged" : `${summary.open} open`;
-			stats = `${plural(summary.turns, "reviewer")} · ${plural(summary.revisions, "revision")} · ${open}`;
-		} else if (run.kind === "debate" && summary) {
-			stats = `${plural(summary.turns, "turn")} · open ${run.openBefore ?? "?"} → ${summary.open}`;
-		} else if (run.kind === "qa" && !section.unassigned) {
-			stats = plural(section.entries.filter(e => e.kind === "reply").length, "reply", "replies");
-		}
-
-		const tail = stats ? ` ${stats}` : "";
-		const fill = Math.max(2, width - visibleWidth(`── ${title} `) - visibleWidth(tail));
-		return truncateToWidth(
-			`${theme.fg("muted", "── ")}${theme.bold(theme.fg("accent", title))} ${theme.fg("muted", `${"─".repeat(fill)}${tail}`)}`,
-			width,
-		);
+		return ruleLine(this.#runTitle(section), this.#runStats(section), width);
 	}
 
 	/** a finished critique or debate run's outcome as its summary recorded it */
-	#recapLine(run: CouncilRun, width: number): string | undefined {
+	#recapLine(run: CouncilRun, width: number, indent = "  "): string | undefined {
 		const summary = run.summary;
 		if (!summary || run.status === "running") return undefined;
 		let text: string;
@@ -659,16 +682,19 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			if (summary.unreported.length > 0) parts.push(`no report: ${summary.unreported.join(", ")}`);
 			text = theme.fg("warning", parts.join(" · "));
 		}
-		return truncateToWidth(`  ${replaceTabs(text)}`, width);
+		return truncateToWidth(`${indent}${replaceTabs(text)}`, width);
+	}
+
+	/** a turn's status, or its verdict once reported */
+	#turnMark(entry: ReviewerTurnEntry): string {
+		if (entry.status === "streaming") return theme.fg("warning", "⏳");
+		if (entry.status === "error") return theme.fg("error", "!");
+		if (entry.status === "aborted") return theme.fg("dim", "⊘");
+		return entry.position ? formatVerdictGlyph(entry.position.verdict) : theme.fg("muted", "•");
 	}
 
 	/** a folded turn: status or verdict, model, turn number, revision count, then the first line of prose */
 	#foldedTurnLine(entry: ReviewerTurnEntry, width: number): string {
-		let mark: string;
-		if (entry.status === "streaming") mark = theme.fg("warning", "⏳");
-		else if (entry.status === "error") mark = theme.fg("error", "!");
-		else if (entry.status === "aborted") mark = theme.fg("dim", "⊘");
-		else mark = entry.position ? formatVerdictGlyph(entry.position.verdict) : theme.fg("muted", "•");
 		const meta = [
 			...(entry.roundtableTurn ? [`turn ${entry.roundtableTurn.step}`] : entry.kind === "reply" ? ["reply"] : []),
 			...(entry.position ? [plural(entry.position.revisions.length, "revision")] : []),
@@ -676,7 +702,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		const model = this.#modelIdOf(entry.reviewerKey) ?? entry.reviewerLabel;
 		const prose = firstProseLine(entry.text);
 		return truncateToWidth(
-			`  ${mark} ${theme.fg("accent", replaceTabs(model))}${meta.length > 0 ? theme.fg("muted", ` · ${meta.join(" · ")}`) : ""}${prose ? `  ${replaceTabs(prose)}` : ""}`,
+			`  ${this.#turnMark(entry)} ${theme.fg("accent", replaceTabs(model))}${meta.length > 0 ? theme.fg("muted", ` · ${meta.join(" · ")}`) : ""}${prose ? `  ${replaceTabs(prose)}` : ""}`,
 			width,
 		);
 	}
@@ -708,7 +734,12 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			else if (topic.status === "open") status = theme.fg("warning", "○ open");
 			else status = theme.fg("success", "✓ settled");
 			const same = topic.duplicates ? theme.fg("muted", " · possibly the same change") : "";
-			lines.push(truncateToWidth(`    ${theme.fg("accent", topic.id)} · ${replaceTabs(topic.title)} · ${status}${same}`, width));
+			const heading = `    ${theme.fg("accent", topic.id)} · ${replaceTabs(topic.title)} · ${status}${same}`;
+			if (topic.status === "settled" && !this.#showSettledTopics) {
+				lines.push(truncateToWidth(`${heading}${theme.fg("muted", ` · ${plural(topic.itemIds.length, "revision")}`)}`, width));
+				continue;
+			}
+			lines.push(truncateToWidth(heading, width));
 			for (const id of topic.itemIds) {
 				const owner = id.slice(0, id.lastIndexOf("#"));
 				const judges = positions.filter(({ reviewer }) => reviewer.key !== owner);
@@ -731,33 +762,97 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		return lines;
 	}
 
-	/** verdicts, required revisions, disputes, and pending cross-examination at a glance */
-	#renderScorecard(contentWidth: number): string[] {
+	/** the Council tab: what the council is doing, what needs the operator, where positions stand, and the rounds */
+	#renderSummary(width: number): string[] {
+		const lines = [...this.#renderNow(width), ...this.#renderNeedsYou(width)];
+		if (this.#session.entries.some(e => isReviewerTurnEntry(e) && e.status === "done")) {
+			lines.push(...this.#renderStanding(width));
+		}
+		lines.push(...this.#renderRounds(width));
+		return lines;
+	}
+
+	/** while the council works: who holds the floor and what they are doing, then who is queued to speak */
+	#renderNow(width: number): string[] {
+		if (!this.#session.isActive()) return [];
+		const tag = (name: string) => theme.bold(theme.fg("accent", name.padEnd(4)));
+		const lines: string[] = [];
+		const speaker = this.#session.activeSpeaker;
+		const run = this.#session.runs.at(-1);
+		if (this.#session.isModerating()) {
+			lines.push(`  ${tag("Now")} ${theme.fg("muted", "moderator framing the next turn ⏳")}`);
+		} else if (speaker) {
+			const turn = this.#latestTurn(speaker.reviewerKey);
+			const streaming = turn?.status === "streaming" ? turn : undefined;
+			const who = `@${shortModelId(speaker.modelId)}`;
+			const head = speaker.kind === "rebuttal" ? `turn ${speaker.step} ${who}` : `${who} replying`;
+			const activity = streaming ? theme.fg("warning", ` · ${this.#titleActivity(streaming)}`) : "";
+			lines.push(truncateToWidth(`  ${tag("Now")} ${head}${activity}`, width));
+			if (streaming?.moderation) {
+				const topic = streaming.moderation.topicId ? ` · ${streaming.moderation.topicId}` : "";
+				lines.push(
+					truncateToWidth(theme.fg("muted", `       Moderator${topic}: ${replaceTabs(streaming.moderation.question)}`), width),
+				);
+			}
+			const latest = streaming ? lastProseLine(streaming.text) : "";
+			if (latest) lines.push(truncateToWidth(`       “${replaceTabs(latest)}”`, width));
+		} else if (run?.status === "running" && run.kind === "critiques") {
+			lines.push(truncateToWidth(`  ${tag("Now")} Round 1 critiques${this.#parallelActivity()}`, width));
+			for (const turn of this.#session.entries) {
+				if (!isReviewerTurnEntry(turn) || turn.runId !== run.id || turn.status !== "streaming") continue;
+				const model = this.#modelIdOf(turn.reviewerKey) ?? turn.reviewerLabel;
+				lines.push(
+					truncateToWidth(
+						`       ${theme.fg("warning", "⏳")} ${replaceTabs(model)} ${theme.fg("warning", `· ${this.#titleActivity(turn)}`)}`,
+						width,
+					),
+				);
+			}
+		} else if (run?.status === "running" && run.kind === "synthesis") {
+			lines.push(truncateToWidth(`  ${tag("Now")} ${this.#parallelActivity().replace(/^ · /, "") || "synthesis"}`, width));
+		} else {
+			lines.push(`  ${tag("Now")} ${theme.fg("muted", `${replaceTabs(this.#autoStage ?? "working")} ⏳`)}`);
+		}
+		const queued = this.#session.queuedSpeakers;
+		if (queued.length > 0) lines.push(truncateToWidth(`  ${tag("Next")} ${this.#queueNames(queued)}`, width));
+		lines.push("");
+		return lines;
+	}
+
+	/** reviewer questions for the operator, failed turns, and setup warnings; nothing when there are none */
+	#renderNeedsYou(width: number): string[] {
+		const rows: string[] = [];
+		// wrapped, not cut off: the operator has to read these in full to act on them
+		const wrapped = (text: string) => {
+			const [first = "", ...rest] = wrapTextWithAnsi(text, Math.max(10, width - 4));
+			return [`  ${first}`, ...rest.map(row => `    ${row}`)];
+		};
+		for (const q of this.#session.getOpenOperatorQuestions()) {
+			rows.push(
+				...wrapped(
+					`${theme.fg("warning", `❓ ${replaceTabs(q.reviewerLabel)}: ${replaceTabs(q.question)}`)}${theme.fg("muted", " (i to answer)")}`,
+				),
+			);
+		}
+		for (const reviewer of this.#session.activeReviewers) {
+			const turn = this.#latestTurn(reviewer.key);
+			if (turn?.status !== "error") continue;
+			const reason = replaceTabs(turn.errorMessage ?? "model request failed");
+			rows.push(...wrapped(theme.fg("error", `! ${replaceTabs(reviewer.label)} failed: ${reason}`)));
+		}
+		for (const warning of this.#warnings) rows.push(...wrapped(theme.fg("warning", `⚠ ${replaceTabs(warning)}`)));
+		return rows.length > 0 ? [ruleLine("Needs you", "", width), ...rows, ""] : [];
+	}
+
+	/** verdicts, then the moderator's topics (or each reviewer's revisions) with stances and disputes */
+	#renderStanding(width: number): string[] {
 		const positions = this.#session.getReviewerPositions();
 		const convergence = this.#session.getConvergence();
-		const revisionCount = convergence.items.length;
-		const revisionWord = revisionCount === 1 ? "revision" : "revisions";
-		let statusSummary: string;
-		if (this.#session.isBusy()) statusSummary = theme.fg("warning", "round in progress");
-		else if (convergence.converged) statusSummary = theme.fg("success", `converged · ${revisionCount} required ${revisionWord}`);
-		else statusSummary = theme.fg("warning", `${openDisagreementCount(convergence)} open · ${revisionCount} ${revisionWord}`);
-
-		if (!this.#scorecardExpanded) {
-			return [
-				truncateToWidth(
-					`  ${theme.bold(theme.fg("accent", "▸ Consensus Scorecard"))} · ${statusSummary} ${theme.fg("muted", "(o to expand)")}`,
-					contentWidth,
-				),
-				"",
-			];
-		}
-
-		const lines = [
-			truncateToWidth(
-				`  ${theme.bold(theme.fg("accent", "▾ Consensus Scorecard"))} · ${statusSummary} ${theme.fg("muted", "(o to collapse)")}`,
-				contentWidth,
-			),
-		];
+		const revisions = convergence.items.length;
+		const stats = convergence.converged
+			? `converged · ${plural(revisions, "required revision")}`
+			: `${openDisagreementCount(convergence)} open · ${plural(revisions, "revision")}`;
+		const lines = [ruleLine("Standing", stats, width)];
 		// item IDs are `provider/model#n`; the model id alone is enough to tell reviewers apart here
 		const shortIdByFullId = new Map<string, string>();
 		for (const { reviewer, position } of positions) {
@@ -768,7 +863,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 
 		const agenda = this.#session.getAgenda();
 		if (agenda.length > 0) {
-			lines.push(...this.#renderTopicRows(agenda, positions, shortIdByFullId, contentWidth));
+			lines.push(...this.#renderTopicRows(agenda, positions, shortIdByFullId, width));
 		} else {
 			for (const { reviewer, position } of positions) {
 				const label = replaceTabs(reviewer.label);
@@ -778,7 +873,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 					if (status === "streaming") stateText = theme.fg("warning", "⏳ streaming...");
 					else if (status === "error") stateText = theme.fg("error", "! error");
 					else stateText = theme.fg("muted", "no position reported");
-					lines.push(truncateToWidth(`    ${theme.fg("muted", "•")} ${label}: ${stateText}`, contentWidth));
+					lines.push(truncateToWidth(`    ${theme.fg("muted", "•")} ${label}: ${stateText}`, width));
 					continue;
 				}
 				const count = position.revisions.length;
@@ -787,12 +882,12 @@ export class PlanCouncilOverlay implements Component, Focusable {
 				lines.push(
 					truncateToWidth(
 						`    ${formatVerdictBadge(position.verdict)} · ${label} ${theme.fg("muted", `(${countText})`)}`,
-						contentWidth,
+						width,
 					),
 				);
 				for (const item of position.revisions) {
 					const shortId = shortIdByFullId.get(item.id) ?? item.id;
-					lines.push(truncateToWidth(`      • ${theme.fg("accent", shortId)}: ${replaceTabs(item.summary)}`, contentWidth));
+					lines.push(truncateToWidth(`      • ${theme.fg("accent", shortId)}: ${replaceTabs(item.summary)}`, width));
 				}
 			}
 			for (const d of convergence.disputes) {
@@ -801,7 +896,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 				lines.push(
 					truncateToWidth(
 						`    ${theme.fg("error", "⚡ Dispute")} on ${theme.fg("accent", id)} by ${replaceTabs(d.by)}${reason}`,
-						contentWidth,
+						width,
 					),
 				);
 			}
@@ -810,37 +905,76 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		if (moderatorError) {
 			lines.push(
 				truncateToWidth(
-					theme.fg("muted", `    ⚠ Moderator unavailable (${replaceTabs(moderatorError)}); default speaking order`),
-					contentWidth,
+					theme.fg("muted", `    ⚠ Moderator unavailable (${moderatorError.replace(/\s+/g, " ").trim()}); default speaking order`),
+					width,
 				),
 			);
 		}
-
-		for (const q of this.#session.getOpenOperatorQuestions()) {
-			lines.push(
-				truncateToWidth(
-					`${theme.fg("warning", `    ❓ ${replaceTabs(q.reviewerLabel)} asks: ${replaceTabs(q.question)}`)}${theme.fg("muted", " (press i to answer)")}`,
-					contentWidth,
-				),
-			);
-		}
-
 		if (convergence.uncovered.length > 0) {
 			// one aggregate row: after Round 1 every reviewer lacks a stance on every peer item
 			const pendingCount = new Set(convergence.uncovered.map(u => u.id)).size;
+			const next = this.#session.isBusy() ? "" : " (press d to debate)";
 			lines.push(
 				truncateToWidth(
 					theme.fg(
 						"muted",
-						`    • ${pendingCount} ${pendingCount === 1 ? "revision awaits" : "revisions await"} peer cross-examination (press d to debate)`,
+						`    • ${pendingCount} ${pendingCount === 1 ? "revision awaits" : "revisions await"} peer cross-examination${next}`,
 					),
-					contentWidth,
+					width,
 				),
 			);
 		}
-
-		lines.push(theme.fg("muted", `  ${"─".repeat(Math.max(4, contentWidth - 2))}`), "");
+		lines.push("");
 		return lines;
+	}
+
+	/** a line per run; the latest round (and what followed it) a line per turn; earlier rounds only their result */
+	#renderRounds(width: number): string[] {
+		const sections = buildTranscript(this.#session.runs, this.#session.entries);
+		if (sections.length === 0) return [];
+		const latestRound = sections.findLastIndex(s => s.run.kind === "critiques" || s.run.kind === "debate");
+		const nameWidth = Math.min(24, Math.max(0, ...this.#session.activeReviewers.map(r => visibleWidth(r.model.id))));
+		const lines = [ruleLine("Rounds", "every turn in full on the Transcript tab", width)];
+		sections.forEach((section, index) => {
+			const stats = this.#runStats(section);
+			lines.push(
+				truncateToWidth(`  ${theme.fg("accent", this.#runTitle(section))}${stats ? theme.fg("muted", ` · ${stats}`) : ""}`, width),
+			);
+			if (index >= latestRound || section.run.status === "running") {
+				for (const entry of section.entries) lines.push(this.#summaryEntryLine(entry, nameWidth, width));
+			}
+			const recap = this.#recapLine(section.run, width, "    ");
+			if (recap) lines.push(recap);
+		});
+		return lines;
+	}
+
+	/** one entry in the Rounds list: a turn's number, verdict, and model, then what changed or what it is doing */
+	#summaryEntryLine(entry: CouncilTurnEntry, nameWidth: number, width: number): string {
+		if (entry.kind === "user") {
+			const text = `    You → ${replaceTabs(entry.targetLabel ?? "council")}: ${replaceTabs(firstProseLine(entry.text))}`;
+			return truncateToWidth(theme.fg("accent", text), width);
+		}
+		if (entry.kind === "synthesis") {
+			const what =
+				entry.status === "streaming"
+					? theme.fg("warning", liveActivity(entry.phase, entry.startedAt))
+					: replaceTabs(firstProseLine(entry.text));
+			return truncateToWidth(`    Synthesis by ${replaceTabs(entry.modelLabel)}: ${what}`, width);
+		}
+		const step = entry.roundtableTurn ? `${String(entry.roundtableTurn.step).padStart(2)} ` : "";
+		const model = replaceTabs(this.#modelIdOf(entry.reviewerKey) ?? entry.reviewerLabel);
+		let change: string;
+		if (entry.status === "streaming") change = theme.fg("warning", this.#titleActivity(entry));
+		else if (entry.status === "error") change = theme.fg("error", `failed: ${replaceTabs(entry.errorMessage ?? "model request failed")}`);
+		else if (entry.status === "aborted") change = theme.fg("dim", "stopped");
+		else if (entry.position && entry.positionDelta) change = formatPositionDelta(entry.positionDelta, entry.position.verdict);
+		else {
+			const count = entry.position ? theme.fg("muted", `${plural(entry.position.revisions.length, "revision")} · `) : "";
+			change = `${count}${replaceTabs(firstProseLine(entry.text))}`;
+		}
+		const asks = entry.status === "done" && entry.position?.operatorQuestion ? theme.fg("warning", " · ❓ asks you") : "";
+		return truncateToWidth(`    ${step}${this.#turnMark(entry)} ${theme.fg("accent", model.padEnd(nameWidth))}  ${change}${asks}`, width);
 	}
 
 	#renderWarnings(contentWidth: number): string[] {
@@ -932,7 +1066,12 @@ export class PlanCouncilOverlay implements Component, Focusable {
 					"",
 				);
 			} else {
-				if (hasDoneReviewer) lines.push(...this.#renderScorecard(contentWidth));
+				lines.push(...this.#renderSummary(contentWidth));
+			}
+		} else if (activeTab === "transcript") {
+			if (this.#session.entries.length === 0) {
+				lines.push("", theme.fg("muted", "  No conversation yet: critiques, debate turns, and your messages appear here in order."), "");
+			} else {
 				lines.push(...this.#renderTranscript(contentWidth));
 			}
 		} else if (activeTab.startsWith("reviewer:")) {
@@ -1068,7 +1207,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 
 		const isStreamingTab =
 			this.#session.isActive() &&
-			(activeTab === "council" ||
+			(activeTab === "transcript" ||
 				activeTab.startsWith("reviewer:") ||
 				activeTab === "reader" ||
 				activeTab === "synthesis");
@@ -1162,8 +1301,10 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			hints = "Tab tabs · ↑↓/jk select model · Space toggle · Enter start critiques · Esc close";
 		} else {
 			const parts = ["Space auto", "d debate", "i ask", "a approve", "f refine", "s synth", "r critique", "x stop"];
-			if (activeTab === "council" && this.#foldedRunIds.size > 0) parts.push(this.#expandFinished ? "z fold" : "z unfold");
-			if (activeTab === "council" && hasDoneReviewer) parts.push("o scorecard");
+			if (activeTab === "transcript" && this.#foldedRunIds.size > 0) parts.push(this.#expandFinished ? "z fold" : "z unfold");
+			if (activeTab === "council" && this.#session.getAgenda().some(topic => topic.status === "settled")) {
+				parts.push(this.#showSettledTopics ? "o hide settled" : "o show settled");
+			}
 			parts.push("p plan");
 			if (showingSplit) parts.push("←/→ pane");
 			hints = fitHints(parts, "Esc close", safeWidth);
@@ -1468,7 +1609,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			return;
 		}
 
-		if (data === "z" && activeTab === "council") {
+		if (data === "z" && activeTab === "transcript") {
 			this.#expandFinished = !this.#expandFinished;
 			this.#statusBanner = {
 				text: this.#expandFinished ? "Showing earlier rounds in full" : "Folded earlier rounds",
@@ -1478,8 +1619,8 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			return;
 		}
 
-		if (data === "o") {
-			this.#scorecardExpanded = !this.#scorecardExpanded;
+		if (data === "o" && activeTab === "council") {
+			this.#showSettledTopics = !this.#showSettledTopics;
 			this.#tui.requestRender();
 			return;
 		}

@@ -65,20 +65,36 @@ export function buildTranscript(runs: readonly CouncilRun[], entries: readonly C
 	return sections;
 }
 
+/** a prose line without list, quote, `**bold**`, and inline-code markers; undefined for blanks and headings */
+function proseOf(raw: string): string | undefined {
+	const line = raw.trim();
+	if (!line || /^#{1,6}\s/.test(line)) return undefined;
+	return line
+		.replace(/^(?:>\s*)+/, "")
+		.replace(/^(?:[-*+]|\d+[.)])\s+/, "")
+		.replace(/`/g, "")
+		.replace(/\*\*(.+?)\*\*/g, "$1")
+		.trim();
+}
+
 /**
  * the first line of a turn worth showing folded: skips blank lines and markdown headings, drops list, quote, and
  * heading markers, `**bold**` markers, and inline backticks (single `_`/`*` stay: identifiers use them)
  */
 export function firstProseLine(text: string): string {
 	for (const raw of text.split("\n")) {
-		const line = raw.trim();
-		if (!line || /^#{1,6}\s/.test(line)) continue;
-		return line
-			.replace(/^(?:>\s*)+/, "")
-			.replace(/^(?:[-*+]|\d+[.)])\s+/, "")
-			.replace(/`/g, "")
-			.replace(/\*\*(.+?)\*\*/g, "$1")
-			.trim();
+		const prose = proseOf(raw);
+		if (prose !== undefined) return prose;
+	}
+	return "";
+}
+
+/** the latest line of a turn still being written, cleaned like {@link firstProseLine} */
+export function lastProseLine(text: string): string {
+	const lines = text.split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const prose = proseOf(lines[i]);
+		if (prose !== undefined) return prose;
 	}
 	return "";
 }
