@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,7 +23,7 @@ import { theme } from "@oh-my-pi/pi-tui/theme";
 import { parseThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { getAgentDir, getPluginsDir, logger, removeSyncWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import type { CodebaseReader } from "../src/code-reader";
-import { CouncilSession, type ModelStreamFn } from "../src/council-session";
+import { CouncilSession, isReviewerTurnEntry, type ModelStreamFn } from "../src/council-session";
 import planCouncilExtension from "../src/index";
 import type { ReviewerMember } from "../src/models";
 import { type CouncilOverlayOutcome, PlanCouncilOverlay } from "../src/overlay";
@@ -973,27 +973,113 @@ describe("PlanCouncilOverlay UI component", () => {
 		const debate = session.runDebateRound();
 		await started[0].promise;
 		let rows = overlay.render(120);
-		expect(Bun.stripANSI(rows[0])).toContain("[Round 2 · turn 1 @claude-3-7-so… ⏳]");
+		expect(Bun.stripANSI(rows[0])).toMatch(/\[Round 2 · turn 1 @claude-3-7-so… · writing \d+s ⏳\]/);
 		let body = bodyRows(rows).join("\n");
 		// Round 1 is finished once Round 2 runs, so it folds to one line per reviewer
 		expect(body).toContain("── Round 1 · Critiques");
 		expect(body).toContain("✓ claude-3-7-sonnet · 0 revisions  Review");
-		expect(body).toContain("[claude-3-7-sonnet (anthropic) · Round 2 turn 1] ⏳ streaming...");
+		expect(body).toMatch(/\[claude-3-7-sonnet \(anthropic\) · Round 2 turn 1\] ⏳ writing · \d+s/);
 		expect(body).not.toContain("Round 2 turn 2");
 
 		gates[0].resolve();
 		await started[1].promise;
 		rows = overlay.render(120);
-		expect(Bun.stripANSI(rows[0])).toContain("[Round 2 · turn 2 @gpt-4o ⏳]");
+		expect(Bun.stripANSI(rows[0])).toMatch(/\[Round 2 · turn 2 @gpt-4o · writing \d+s ⏳\]/);
 		body = bodyRows(rows).join("\n");
 		const firstAt = body.indexOf("[claude-3-7-sonnet (anthropic) · Round 2 turn 1] ✓ APPROVE");
 		expect(firstAt).toBeGreaterThan(-1);
-		expect(body.indexOf("[gpt-4o (openai) · Round 2 turn 2] ⏳ streaming...")).toBeGreaterThan(firstAt);
+		expect(body.indexOf("[gpt-4o (openai) · Round 2 turn 2] ⏳ writing · ")).toBeGreaterThan(firstAt);
 
 		gates[1].resolve();
 		await debate;
 		expect(Bun.stripANSI(overlay.render(120)[0])).toContain("[Round 2] · converged");
 		overlay.dispose();
+	});
+
+	it("shows what a streaming turn is doing and for how long, in its header and the title", async () => {
+		const start = Date.parse("2026-01-01T00:00:00Z");
+		const step = { waiting: Promise.withResolvers<void>(), thinking: Promise.withResolvers<void>(), writing: Promise.withResolvers<void>() };
+		const reached = { waiting: Promise.withResolvers<void>(), thinking: Promise.withResolvers<void>(), writing: Promise.withResolvers<void>() };
+		// claude reasons for a long time before writing; gpt answers at once
+		const streamFn: ModelStreamFn = model => {
+			const slow = model.id === claude.model.id;
+			return {
+				async *[Symbol.asyncIterator]() {
+					if (slow) {
+						reached.waiting.resolve();
+						await step.waiting.promise;
+						yield { type: "thinking_delta", delta: "weighing the retry bound" } as unknown as AssistantMessageEvent;
+						reached.thinking.resolve();
+						await step.thinking.promise;
+					}
+					yield { type: "text_delta", delta: "Review" } as unknown as AssistantMessageEvent;
+					if (slow) {
+						reached.writing.resolve();
+						await step.writing.promise;
+					}
+				},
+				result: async () =>
+					({
+						role: "assistant",
+						content: [
+							{ type: "text", text: "Review" },
+							{ type: "toolCall", id: "call-0", name: "report_position", arguments: { verdict: "APPROVE", revisions: [], positions: [] } },
+						],
+						stopReason: "toolUse",
+					}) as unknown as AssistantMessage,
+			};
+		};
+		const session = new CouncilSession({
+			planTitle: "Simplify-Notifications-Stack-Plan-For-Production",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn,
+		});
+		const gptDone = Promise.withResolvers<void>();
+		session.subscribe(() => {
+			if (session.entries.some(e => isReviewerTurnEntry(e) && e.reviewerKey === gpt.key && e.status === "done")) gptDone.resolve();
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+		const header = "[claude-3-7-sonnet (anthropic) · Round 1 critique] ⏳ ";
+		const view = () => {
+			const rows = overlay.render(120);
+			return { title: Bun.stripANSI(rows[0]), body: bodyRows(rows).join("\n") };
+		};
+
+		setSystemTime(start);
+		try {
+			const critiques = session.startInitialCritiques();
+			await reached.waiting.promise;
+			await gptDone.promise;
+			setSystemTime(start + 5_000);
+			let { title, body } = view();
+			expect(body).toContain(`${header}waiting for model · 5s`);
+			expect(title).toContain("[Round 1 · 1/2 done 5s ⏳]");
+
+			step.waiting.resolve();
+			await reached.thinking.promise;
+			setSystemTime(start + 134_000);
+			({ title, body } = view());
+			expect(body).toContain(`${header}thinking · 2m14s`);
+			expect(title).toContain("[Round 1 · 1/2 done 2m14s ⏳]");
+			// at 80 columns the plan name shortens so the clock stays on screen
+			const narrowTitle = Bun.stripANSI(overlay.render(80)[0]);
+			expect(narrowTitle).toContain("Plan Council · Simplify-Notif");
+			expect(narrowTitle).toContain("… [Round 1 · 1/2 done 2m14s ⏳]");
+
+			step.thinking.resolve();
+			await reached.writing.promise;
+			expect(view().body).toContain(`${header}writing · 2m14s`);
+
+			step.writing.resolve();
+			await critiques;
+			expect(view().title).not.toContain("done");
+		} finally {
+			setSystemTime();
+			overlay.dispose();
+		}
 	});
 
 	/** reviewers stream `text` and report `args`; a reply carrying `wait` settles only once that promise does */
@@ -1109,7 +1195,7 @@ describe("PlanCouncilOverlay UI component", () => {
 		await flushMicrotasks();
 		const rows = overlay.render(120);
 		expect(Bun.stripANSI(rows.at(-3) ?? "")).toContain("Queued: @gpt-4o takes the floor next.");
-		expect(Bun.stripANSI(rows[0])).toContain("[Round 2 · turn 1 @claude-3-7-so… ⏳] · 1 queued");
+		expect(Bun.stripANSI(rows[0])).toMatch(/\[Round 2 · turn 1 @claude-3-7-so… · writing \d+s ⏳\] · 1 queued/);
 
 		gate.resolve();
 		await debate;
@@ -1170,7 +1256,7 @@ describe("PlanCouncilOverlay UI component", () => {
 
 		const ask = session.askCouncil("@gpt Why approve?");
 		await started.promise;
-		expect(Bun.stripANSI(overlay.render(120)[0])).toContain("[Round 1 · @gpt-4o replying ⏳]");
+		expect(Bun.stripANSI(overlay.render(120)[0])).toMatch(/\[Round 1 · @gpt-4o replying · waiting \d+s ⏳\]/);
 		gate.resolve();
 		await ask;
 		overlay.dispose();

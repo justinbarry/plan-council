@@ -99,6 +99,8 @@ export type CouncilTurnEntry =
 			positionDelta?: PositionDelta;
 			/** the moderator's question this debate turn answered */
 			moderation?: { topicId?: string; question: string };
+			/** what a streaming turn's current request is doing; undefined until the model sends anything */
+			phase?: StreamPhase;
 			/** the run (see `CouncilSession.runs`) this turn belongs to */
 			runId?: number;
 	  }
@@ -124,12 +126,22 @@ export type CouncilTurnEntry =
 			startedAt: number;
 			finishedAt?: number;
 			runId?: number;
+			phase?: StreamPhase;
 	  };
 
 export type ReviewerTurnEntry = CouncilTurnEntry & { kind: "critique" | "rebuttal" | "reply" };
 
 export function isReviewerTurnEntry(e: CouncilTurnEntry): e is ReviewerTurnEntry {
 	return e.kind === "critique" || e.kind === "rebuttal" || e.kind === "reply";
+}
+
+/** `thinking` while the model reasons, `writing` once it sends prose or a tool call */
+export type StreamPhase = "thinking" | "writing";
+
+function streamPhaseOf(event: AssistantMessageEvent): StreamPhase | undefined {
+	if (event.type === "thinking_start" || event.type === "thinking_delta") return "thinking";
+	if (event.type === "text_delta" || event.type === "toolcall_start" || event.type === "toolcall_delta") return "writing";
+	return undefined;
 }
 
 /** the reviewer holding the floor in a sequential debate round or operator Q&A pass */
@@ -1213,11 +1225,18 @@ export class CouncilSession {
 				// prose from a continuation step starts its own paragraph
 				const separator = stepMessages.length > 0 && entry.text.trim() && !entry.text.endsWith("\n\n") ? "\n\n" : "";
 				let stepText = "";
+				// each request (a continuation after a reader answer too) starts out waiting for the model
+				entry.phase = undefined;
 				for await (const event of stream) {
 					stall.touch();
+					const phase = streamPhaseOf(event);
+					const phaseChanged = phase !== undefined && phase !== entry.phase;
+					if (phaseChanged) entry.phase = phase;
 					if (event.type === "text_delta" && event.delta) {
 						entry.text += (stepText ? "" : separator) + event.delta;
 						stepText += event.delta;
+						this.#emitChange();
+					} else if (phaseChanged) {
 						this.#emitChange();
 					}
 				}
@@ -1486,8 +1505,13 @@ export class CouncilSession {
 			});
 			for await (const event of stream) {
 				stall.touch();
+				const phase = streamPhaseOf(event);
+				const phaseChanged = phase !== undefined && phase !== entry.phase;
+				if (phaseChanged) entry.phase = phase;
 				if (event.type === "text_delta") {
 					entry.text += event.delta;
+					this.#emitChange();
+				} else if (phaseChanged) {
 					this.#emitChange();
 				}
 			}

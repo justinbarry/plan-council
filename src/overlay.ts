@@ -24,6 +24,7 @@ import {
 	type QueueReason,
 	READER_TARGET_KEY,
 	type ReviewerTurnEntry,
+	type StreamPhase,
 } from "./council-session";
 import type { AgendaTopicStatus } from "./moderator";
 import {
@@ -67,6 +68,8 @@ export interface PlanCouncilOverlayOptions {
 }
 
 const SYNTHESIS_READY_BANNER = "Synthesis ready — press f to refine plan, or a to approve.";
+/** the title keeps at least this much of the plan name while the live status takes the rest of the row */
+const MIN_PLAN_TITLE_WIDTH = 8;
 
 interface StatusBanner {
 	text: string;
@@ -107,6 +110,20 @@ function formatVerdictBadge(verdict: ReviewerPosition["verdict"]): string {
 function formatElapsed(startedAt: number, finishedAt: number | undefined): string | undefined {
 	if (finishedAt === undefined || finishedAt < startedAt) return undefined;
 	return `${((finishedAt - startedAt) / 1000).toFixed(1)}s`;
+}
+
+/** whole-second running time, e.g. `45s`, `2m14s`, `1h03m` */
+function formatDuration(ms: number): string {
+	const total = Math.max(0, Math.floor(ms / 1000));
+	if (total < 60) return `${total}s`;
+	const minutes = Math.floor(total / 60);
+	if (minutes < 60) return `${minutes}m${String(total % 60).padStart(2, "0")}s`;
+	return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+/** what a streaming request is doing and how long its turn has run, e.g. `thinking · 2m14s` */
+function liveActivity(phase: StreamPhase | undefined, startedAt: number): string {
+	return `${phase ?? "waiting for model"} · ${formatDuration(Date.now() - startedAt)}`;
 }
 
 /** one-line summary of how a turn moved its reviewer's position, e.g. `dropped gpt-4o#1 · added gpt-4o#2 "…"` */
@@ -209,6 +226,8 @@ export class PlanCouncilOverlay implements Component, Focusable {
 	#planMarkdown: Markdown;
 	#markdownCache = new Map<string, { text: string; md: Markdown }>();
 	#unsubscribeSession: () => void;
+	/** redraws once a second while the council works: elapsed times and waits change without session events */
+	#activityTicker: ReturnType<typeof setInterval>;
 
 	/** body scroll offset each tab had when it was last left */
 	#tabScrollOffsets = new Map<string, number>();
@@ -298,6 +317,10 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			this.#syncTabs();
 			this.#tui.requestRender();
 		});
+		this.#activityTicker = setInterval(() => {
+			if (this.#session.isActive()) this.#tui.requestRender();
+		}, 1000);
+		this.#activityTicker.unref?.();
 
 		if (this.#autoProceed) {
 			void this.#runAutoPipeline(true);
@@ -306,6 +329,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 
 	dispose(): void {
 		this.#unsubscribeSession();
+		clearInterval(this.#activityTicker);
 		// disposes both pane scroll views
 		this.#splitPane.dispose();
 	}
@@ -396,6 +420,34 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		return undefined;
 	}
 
+	/** a speaker's streaming turn for the title: `asking reader`, `thinking 2m14s`, … */
+	#titleActivity(turn: ReviewerTurnEntry): string {
+		if (turn.readerStatus === "queued") return "queued for reader";
+		if (turn.readerStatus === "reading") return "asking reader";
+		return `${turn.phase ?? "waiting"} ${formatDuration(Date.now() - turn.startedAt)}`;
+	}
+
+	/**
+	 * the title's busy segment without a single speaker: parallel critiques count finished reviewers
+	 * (` · 1/3 done 4m10s`), synthesis shows its phase; empty for anything else
+	 */
+	#parallelActivity(): string {
+		const run = this.#session.runs.at(-1);
+		if (run?.status !== "running") return "";
+		if (run.kind === "critiques") {
+			const turns = this.#session.entries.filter((e): e is ReviewerTurnEntry => isReviewerTurnEntry(e) && e.runId === run.id);
+			if (turns.length === 0) return "";
+			const done = turns.filter(t => t.status !== "streaming").length;
+			const startedAt = Math.min(...turns.map(t => t.startedAt));
+			return ` · ${done}/${turns.length} done ${formatDuration(Date.now() - startedAt)}`;
+		}
+		const synthesis = this.#session.latestSynthesis;
+		if (run.kind === "synthesis" && synthesis?.status === "streaming") {
+			return ` · synthesis ${synthesis.phase ?? "waiting"} ${formatDuration(Date.now() - synthesis.startedAt)}`;
+		}
+		return "";
+	}
+
 	/**
 	 * reviewer turn header: status badge (naming reader waits), the reported verdict once done,
 	 * and once settled how many codebase checks it made and how long it took
@@ -405,7 +457,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		if (entry.status === "streaming") {
 			if (entry.readerStatus === "queued") badge = theme.fg("warning", " ⏳ queued for reader...");
 			else if (entry.readerStatus === "reading") badge = theme.fg("warning", " ⏳ asking reader...");
-			else badge = theme.fg("warning", " ⏳ streaming...");
+			else badge = theme.fg("warning", ` ⏳ ${liveActivity(entry.phase, entry.startedAt)}`);
 		} else if (entry.status === "error") badge = theme.fg("error", " ✗ error");
 		else if (entry.status === "aborted") badge = theme.fg("dim", " ⊘ aborted");
 		else if (entry.position) badge = ` ${formatVerdictBadge(entry.position.verdict)}`;
@@ -481,7 +533,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 
 	#renderSynthesisEntry(entry: CouncilTurnEntry & { kind: "synthesis" }, contentWidth: number): string[] {
 		let badge = "";
-		if (entry.status === "streaming") badge = theme.fg("warning", " ⏳ synthesizing...");
+		if (entry.status === "streaming") badge = theme.fg("warning", ` ⏳ ${liveActivity(entry.phase, entry.startedAt)}`);
 		else if (entry.status === "error") badge = theme.fg("error", " ✗ error");
 		const elapsed = formatElapsed(entry.startedAt, entry.finishedAt);
 		if (elapsed) badge += theme.fg("muted", ` · ${elapsed}`);
@@ -827,9 +879,12 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			const speaker = this.#session.activeSpeaker;
 			let busy = "";
 			if (this.#session.isModerating()) busy = " · moderator ⏳";
-			else if (speaker?.kind === "rebuttal") busy = ` · turn ${speaker.step} @${shortModelId(speaker.modelId)} ⏳`;
-			else if (speaker) busy = ` · @${shortModelId(speaker.modelId)} replying ⏳`;
-			else if (this.#session.isBusy()) busy = " ⏳";
+			else if (speaker) {
+				const turn = this.#latestTurn(speaker.reviewerKey);
+				const activity = turn?.status === "streaming" ? ` · ${this.#titleActivity(turn)}` : "";
+				const who = `@${shortModelId(speaker.modelId)}`;
+				busy = speaker.kind === "rebuttal" ? ` · turn ${speaker.step} ${who}${activity} ⏳` : ` · ${who} replying${activity} ⏳`;
+			} else if (this.#session.isBusy()) busy = `${this.#parallelActivity()} ⏳`;
 			roundBadge = theme.fg("accent", ` [Round ${this.#session.round}${busy}]`);
 			if (!this.#session.isBusy() && hasDoneReviewer) {
 				const convergence = this.#session.getConvergence();
@@ -851,8 +906,11 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		} else if (splitActive) {
 			splitBadge = theme.fg("muted", " [Split: narrow]");
 		}
-		const rawTitle = `Plan Council · ${this.#session.planTitle}${roundBadge}${autoBadge}${splitBadge}${warnBadge}`;
-		const titleLine = truncateToWidth(replaceTabs(rawTitle), safeWidth);
+		// the plan name gives way first, so the live status (who speaks, what it is doing, for how long) stays visible
+		const titlePrefix = "Plan Council · ";
+		const status = replaceTabs(`${roundBadge}${autoBadge}${splitBadge}${warnBadge}`);
+		const planTitleWidth = Math.max(MIN_PLAN_TITLE_WIDTH, safeWidth - visibleWidth(titlePrefix) - visibleWidth(status));
+		const titleLine = truncateToWidth(`${titlePrefix}${truncateToWidth(replaceTabs(this.#session.planTitle), planTitleWidth)}${status}`, safeWidth);
 
 		// Header divider
 		const topDivider = theme.fg("muted", "─".repeat(safeWidth));
@@ -954,7 +1012,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			const latestSynth = this.#session.latestSynthesis;
 			if (latestSynth) {
 				let badge = "";
-				if (latestSynth.status === "streaming") badge = theme.fg("warning", " ⏳ synthesizing...");
+				if (latestSynth.status === "streaming") badge = theme.fg("warning", ` ⏳ ${liveActivity(latestSynth.phase, latestSynth.startedAt)}`);
 				else if (latestSynth.status === "error") badge = theme.fg("error", " ✗ error");
 				const elapsed = formatElapsed(latestSynth.startedAt, latestSynth.finishedAt);
 				if (elapsed) badge += theme.fg("muted", ` · ${elapsed}`);
