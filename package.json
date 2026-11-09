@@ -26,7 +26,7 @@
 	},
 	"devDependencies": {
 		"@types/bun": "latest",
-		"typescript": "^5.0.0"
+		"typescript": "^7.0.2"
 	},
 	"omp": {
 		"extensions": ["./src/index.ts"],
