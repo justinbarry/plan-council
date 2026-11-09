@@ -38,7 +38,7 @@ When OMP creates a plan (`write xd://propose`), Plan Council convenes a panel of
 - **Multi-Model Parallel Critiques**: Runs Round 1 critiques simultaneously across distinct model families (e.g. OpenAI, Google, Anthropic).
 - **Cross-Model Debate Rounds**: In Round 2+, models receive peer critiques plus each peer's numbered required revisions, debate discrepancies, retract refuted points, and report an agree/dispute stance on every peer revision.
 - **Convergence Tracking**: Every reviewer turn records its verdict, required revisions, and stances through a `report_position` tool call. The overlay title shows `· converged` or `· N open`, and the synthesizer is told which revisions are still contested.
-- **Autonomous & Coax-Free Mode**: Set `autoProceed: true` to have the council automatically critique, debate until no reviewer disputes a peer revision (or `maxDebateRounds` is reached), synthesize, and submit revisions to `Refine plan` without touching a key. Auto mode stops and waits for you when every reviewer approves with no required revisions, or after `maxAutoRefines` refines of the same plan in a row (default 2). Refining or approving yourself, in the council or the native review, resets that count.
+- **Autonomous & Coax-Free Mode**: Set `autoProceed: true` and, once you open the council (`Ctrl+N` or `/plan-council`), it critiques, debates until no reviewer disputes a peer revision (or `maxDebateRounds` is reached), synthesizes, and submits revisions to `Refine plan` without another keypress. `autoProceed` never opens the council by itself, so each revised plan waits for your shortcut; add `autoStart: true` for fully unattended runs. Auto mode stops and waits for you when every reviewer approves with no required revisions, or after `maxAutoRefines` refines of the same plan in a row (default 2). Refining or approving yourself, in the council or the native review, resets that count.
 - **Operator Steering**: Jump in at any time to steer the council via broadcast questions (`Ask council > ...`) or targeted mentions (`Ask council > @gpt ...`).
 - **Shared Codebase Reader**: Reviewers verify file paths, signatures, line anchors, and callers against the repository through an `ask_codebase` tool backed by one persistent read-only subagent (`read`, `grep`, `glob`, `find`, `ast_grep`, `lsp`). Queries run one at a time so files the reader already inspected stay warm across reviewers and rounds, and identical questions are answered once. Ask it yourself with `@reader <question>` (or `@scout`), or by typing on the `Reader` tab; your reader findings travel with the next debate round.
 - **Stall-Based Time Limits**: Reviewers, the synthesizer, and the reader can take as long as they need while they keep making progress. A model request is dropped only after 3 minutes with no output, and a reader question after 2 minutes with no activity (or 10 minutes in total). Time a reviewer spends waiting for the reader doesn't count. A dropped reviewer shows `Stalled: no response from <model>`, and if no reviewer finishes Round 1, auto mode stops and says so.
@@ -113,10 +113,10 @@ The overlay receives mouse input, so to select text inside it hold `Shift` while
 Configure options via `omp plugin config set`:
 
 ```bash
-# Hands-free mode: auto-proceed through critiques -> debate -> synthesis -> refine
+# Hands-free once opened: Ctrl+N runs critiques -> debate -> synthesis -> refine
 omp plugin config set plan-council autoProceed true
 
-# Automatically open council when a plan is drafted (no Ctrl+N needed)
+# Automatically open council when a plan is drafted (no Ctrl+N needed; with autoProceed, fully unattended)
 omp plugin config set plan-council autoStart true
 
 # Specify exact models (or role aliases) for reviewers

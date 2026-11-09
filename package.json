@@ -39,7 +39,7 @@
 			"autoProceed": {
 				"type": "boolean",
 				"default": false,
-				"description": "Automatically run critiques, debate disagreements, synthesize, and refine without manual steps"
+				"description": "Once the council opens (shortcut, /plan-council, or autoStart), run critiques, debate disagreements, synthesize, and refine without further keypresses"
 			},
 			"maxAutoRefines": {
 				"type": "number",

@@ -1882,6 +1882,110 @@ describe("planCouncilExtension lifecycle & shortcut wiring", () => {
 			isolation.restore();
 		}
 	});
+
+	it("autoProceed waits for the shortcut to open the council, then runs it through to refine", async () => {
+		const isolation = isolateOmpHome("pi-council-shortcut-home-");
+		const projectDir = TempDir.createSync("@pi-council-shortcut-proj-");
+		fs.mkdirSync(projectDir.join(".omp"));
+		fs.writeFileSync(
+			projectDir.join(".omp", "plugin-overrides.json"),
+			JSON.stringify({ settings: { "plan-council": { autoProceed: true, enableCodeReader: false } } }),
+		);
+		const synthesis = "## Required Plan Revisions\n1. Add a rollback step";
+		const streamSpy = spyOn(ai, "streamSimple").mockImplementation(((_model: Model, context: Context) => {
+			const isSynthesis = (context.systemPrompt?.[0] ?? "").includes("Synthesizer");
+			const content: AssistantMessage["content"] = isSynthesis
+				? [{ type: "text", text: synthesis }]
+				: [
+						{ type: "text", text: "### Verdict\nNEEDS REVISION" },
+						{
+							type: "toolCall",
+							id: "call-0",
+							name: "report_position",
+							arguments: { verdict: "NEEDS REVISION", revisions: [{ summary: "Add a rollback step" }], positions: [] },
+						},
+					];
+			const msg = { role: "assistant", content, stopReason: isSynthesis ? "stop" : "toolUse" } as unknown as AssistantMessage;
+			return {
+				async *[Symbol.asyncIterator](): AsyncGenerator<AssistantMessageEvent> {},
+				result: async () => msg,
+			} as unknown as ReturnType<typeof ai.streamSimple>;
+		}) as typeof ai.streamSimple);
+
+		try {
+			const handlers = new Map<string, ExtensionHandler<unknown, unknown>>();
+			planCouncilExtension({
+				registerCommand: () => {},
+				registerShortcut: () => {},
+				registerFlag: () => {},
+				on: (event: string, handler: unknown) => {
+					handlers.set(event, handler as ExtensionHandler<unknown, unknown>);
+				},
+				events: { emit: () => {}, on: () => () => {} },
+			} as unknown as ExtensionAPI);
+
+			const review: PlanReviewRequestedEvent = {
+				type: "plan_review_requested",
+				reviewId: "rev-shortcut",
+				sessionId: "sess-shortcut",
+				title: "Shortcut Plan",
+				planFilePath: "plan.md",
+				planContent: "# Shortcut Plan",
+				options: [{ id: "execute", label: "Execute", disabled: false }],
+			};
+			let terminalInput: ((data: string) => { consume?: boolean } | undefined) | undefined;
+			const notices: string[] = [];
+			let mounted = 0;
+			const resolved: Array<{ reviewId: string; choice: string; feedback?: string }> = [];
+			const ctx = {
+				cwd: projectDir.path(),
+				hasUI: true,
+				agent: { kind: "main", id: "main", name: "main", depth: 0 },
+				models: { list: () => [claude], current: () => claude, resolve: () => undefined, family: (m: Model) => m.provider },
+				modelRegistry: { resolver: () => undefined },
+				ui: {
+					// the status line is the only themed output here; the shared theme is uninitialized when this test runs alone
+					theme: { fg: (_color: string, text: string) => text },
+					onTerminalInput: (listener: (data: string) => { consume?: boolean } | undefined) => {
+						terminalInput = listener;
+						return () => {};
+					},
+					notify: (text: string) => notices.push(text),
+					setStatus: () => {},
+					custom: (factory: (tui: TUI, theme: Theme, keybindings: KeybindingsManager, done: (res: unknown) => void) => unknown) => {
+						mounted++;
+						const { promise, resolve } = Promise.withResolvers<unknown>();
+						const fakeTui = { terminal: { rows: 24, cols: 100 }, requestRender: () => {} } as unknown as TUI;
+						factory(fakeTui, theme as unknown as Theme, {} as unknown as KeybindingsManager, resolve);
+						return promise;
+					},
+				},
+				resolvePlanReview: (reviewId: string, choice: string, opts?: { feedback?: string }) => {
+					resolved.push({ reviewId, choice, feedback: opts?.feedback });
+					return true;
+				},
+				// a review already pending at session start must not open the council either
+				getPendingPlanReview: () => review,
+			} as unknown as ExtensionContext;
+
+			await handlers.get("session_start")!({} as unknown as SessionStartEvent, ctx);
+			handlers.get("plan_review_requested")!(review, ctx);
+			for (let i = 0; i < 100 && notices.length === 0; i++) await delay(5);
+			expect(notices).toEqual(["Plan Council ready — press ctrl+n to discuss with other models"]);
+			await delay(20);
+			expect(mounted).toBe(0);
+			expect(resolved).toEqual([]);
+
+			expect(terminalInput!("\x0e")).toEqual({ consume: true });
+			for (let i = 0; i < 300 && resolved.length === 0; i++) await delay(10);
+			expect(mounted).toBe(1);
+			expect(resolved).toEqual([{ reviewId: "rev-shortcut", choice: "refine", feedback: synthesis }]);
+		} finally {
+			streamSpy.mockRestore();
+			projectDir.removeSync();
+			isolation.restore();
+		}
+	});
 });
 
 describe("plugin package discovery", () => {

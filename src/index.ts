@@ -269,7 +269,8 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 		if (pending) {
 			activeReview = pending;
 			ctx.ui.setStatus("plan-council", ctx.ui.theme.fg("accent", `Council (${currentSettings.shortcut})`));
-			if (currentSettings.autoStart || currentSettings.autoProceed) {
+			// only autoStart opens the council unprompted; autoProceed drives it once open, so each refine needs a keypress
+			if (currentSettings.autoStart) {
 				void launchCouncilOverlay(ctx, pending, {
 					startCritiquesImmediately: true,
 					autoProceed: currentSettings.autoProceed,
@@ -290,7 +291,7 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 			ensureInputListener(ctx, currentSettings.shortcut);
 			ctx.ui.setStatus("plan-council", ctx.ui.theme.fg("accent", `Council (${currentSettings.shortcut})`));
 
-			if (currentSettings.autoStart || currentSettings.autoProceed) {
+			if (currentSettings.autoStart) {
 				void launchCouncilOverlay(ctx, event, {
 					startCritiquesImmediately: true,
 					autoProceed: currentSettings.autoProceed,
