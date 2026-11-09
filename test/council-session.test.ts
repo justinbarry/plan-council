@@ -16,6 +16,7 @@ import {
 	computePositionDelta,
 	isEmptyPositionDelta,
 	type ReviewerPosition,
+	formatReportedPositions,
 	stabilizeRevisionIds,
 	validateReportedPosition,
 } from "../src/position";
@@ -243,6 +244,54 @@ describe("position deltas and report_position extras", () => {
 			expect("nextSpeaker" in reported).toBe(false);
 			expect("operatorQuestion" in reported).toBe(false);
 		}
+	});
+
+	it("trims concern labels, caps them at 60 characters, and leaves blank ones out", () => {
+		const longLabel = "x".repeat(70);
+		const reported = validateReportedPosition(
+			reportCall({
+				revisions: [
+					{ summary: "Clamp budgets", concern: "  negative   budget handling  " },
+					{ summary: "Log errors", concern: "   " },
+					{ summary: "Add retry" },
+					{ summary: "Pin deps", concern: longLabel },
+				],
+			}),
+			"a",
+			[],
+		);
+		expect(reported.revisions).toEqual([
+			{ id: "a#1", summary: "Clamp budgets", concern: "negative budget handling" },
+			{ id: "a#2", summary: "Log errors" },
+			{ id: "a#3", summary: "Add retry" },
+			{ id: "a#4", summary: "Pin deps", concern: "x".repeat(60) },
+		]);
+	});
+
+	it("keeps a revision's ID when only its concern label changes", () => {
+		const held = [{ id: "a#2", summary: "Log errors", concern: "errors" }];
+		expect(stabilizeRevisionIds("a", [{ summary: "Log errors", concern: "logging" }], held, 3)).toEqual({
+			revisions: [{ id: "a#2", summary: "Log errors", concern: "logging" }],
+			nextNumber: 3,
+		});
+	});
+
+	it("shows concern labels to the synthesizer only for labeled revisions", () => {
+		const text = formatReportedPositions([
+			{
+				label: "A",
+				position: {
+					verdict: "NEEDS REVISION",
+					revisions: [
+						{ id: "a#1", summary: "Clamp budgets", concern: "negative budgets" },
+						{ id: "a#2", summary: "Log errors" },
+					],
+					positions: [],
+					promptedItemIds: [],
+				},
+			},
+		]);
+		expect(text).toBe("- A: NEEDS REVISION\n  - `a#1`: Clamp budgets [concern: negative budgets]\n  - `a#2`: Log errors");
 	});
 });
 
@@ -1595,6 +1644,436 @@ describe("roundtable debate rounds", () => {
 		expect(geminiPrompt).toContain(`**${gpt.label} · Round 1 reply**:\ngpt-4o answers\n`);
 		// the first to answer has no peer answers yet
 		expect(replies[0][1]).not.toContain("· Round 1 reply**");
+	});
+
+	describe("moderator", () => {
+		const moderatorModel = makeFakeReviewer("openai", "gpt-4o-mini", "gpt").model;
+		const label = "negative budget handling";
+		const claudeItem = "anthropic/claude-3-7-sonnet#1";
+		const gptItem = "openai/gpt-4o#1";
+
+		function isModeratorCall(context: Context): boolean {
+			return (context.systemPrompt?.[0] ?? "").includes("Plan Council Moderator");
+		}
+
+		const moderatorCalls = (calls: Calls) => calls.filter(c => isModeratorCall(c.context));
+
+		/** moderator requests go to `moderator` with the forced tool's name; everything else to `reviewers` */
+		function moderated(
+			moderator: (tool: string, prompt: string) => MockResponse | Promise<MockResponse>,
+			reviewers: (model: Model, context: Context) => MockResponse | Promise<MockResponse>,
+		): (model: Model, context: Context) => MockResponse | Promise<MockResponse> {
+			return (model, context) =>
+				isModeratorCall(context) ? moderator(context.tools?.[0]?.name ?? "", lastPrompt(context)) : reviewers(model, context);
+		}
+
+		const setAgenda = (args: Record<string, unknown>): MockResponse => ({ text: "", toolCalls: [{ name: "set_agenda", arguments: args }] });
+		const moderateTurn = (args: Record<string, unknown>): MockResponse => ({
+			text: "",
+			toolCalls: [{ name: "moderate_turn", arguments: args }],
+		});
+
+		function moderatedSession(
+			streamFn: ModelStreamFn,
+			reviewers: ReviewerMember[],
+			extra: Partial<ConstructorParameters<typeof CouncilSession>[0]> = {},
+		): CouncilSession {
+			return new CouncilSession({
+				planTitle: "Moderated Plan",
+				planFilePath: "plan.md",
+				planContent: "Plan content",
+				availableReviewers: reviewers,
+				initialReviewers: reviewers,
+				streamFn,
+				moderator: { model: moderatorModel },
+				...extra,
+			});
+		}
+
+		/** a report whose revisions carry concern labels */
+		const labeled = (verdict: string, revisions: { summary: string; concern?: string }[], positions: Stance[] = []) =>
+			withReportFields(reportPosition(verdict, [], positions), { revisions });
+		const agreeAll = (peerIds: string[]): Stance[] => peerIds.map(id => ({ id, stance: "agree" }));
+
+		/** Round 1: claude and gpt propose the same change under one label; gemini approves */
+		const sameConcernCouncil = (round2: (model: Model, t: ScriptedTurn) => MockToolCall[] | undefined = () => undefined) =>
+			scriptedCouncil((model, t) => {
+				const own =
+					model === claude.model
+						? [{ summary: "Reject negative budgets", concern: label }]
+						: model === gpt.model
+							? [{ summary: "Clamp budgets", concern: label }]
+							: [];
+				if (t.round > 1) {
+					const scripted = round2(model, t);
+					if (scripted) return scripted;
+				}
+				return [labeled(own.length > 0 ? "NEEDS REVISION" : "APPROVE", own, t.round > 1 ? agreeAll(t.peerIds) : [])];
+			});
+
+		const groupSameConcern = (tool: string): MockResponse =>
+			tool === "set_agenda"
+				? setAgenda({
+						topics: [{ id: "T1", title: "Negative budgets", itemIds: [gptItem, claudeItem], duplicates: true }],
+						nextSpeaker: "@gemini-2.5-pro",
+						topicId: "T1",
+						question: "Do the two budget revisions require the same change?",
+					})
+				: moderateTurn({ nextSpeaker: "@nobody", question: "Anything else?" });
+
+		it("builds the agenda from concern labels, lets the moderator regroup it, and groups peer items under topics", async () => {
+			const { streamFn, calls } = makeMockStreamFn(moderated(groupSameConcern, sameConcernCouncil()));
+			const session = moderatedSession(streamFn, [claude, gpt, gemini]);
+
+			await session.startInitialCritiques();
+			// no moderator call yet: the shared label alone puts both items in one topic
+			expect(moderatorCalls(calls)).toEqual([]);
+			const afterCritiques = session.getAgenda();
+			expect(afterCritiques.map(t => ({ ...t, itemIds: [...t.itemIds].sort() }))).toEqual([
+				{ id: "T1", title: label, itemIds: [claudeItem, gptItem], duplicates: false, status: "open" },
+			]);
+
+			await session.runDebateRound();
+			const agendaPrompt = lastPrompt(moderatorCalls(calls)[0].context);
+			expect(agendaPrompt).toContain(`- \`${claudeItem}\` [${label}]: Reject negative budgets`);
+			expect(agendaPrompt).toContain(`- \`${gptItem}\` [${label}]: Clamp budgets`);
+
+			expect(promptOf(calls, gemini, "Council Debate: Round 2")).toContain(
+				`### Peer required revisions\n**T1 · Negative budgets** (moderator: these may be the same change; if they are, keep one wording by agreeing with a peer's item and dropping yours; if they differ, say how)\n- \`${claudeItem}\`: Reject negative budgets\n- \`${gptItem}\`: Clamp budgets\n`,
+			);
+			expect(session.getAgenda()).toEqual([
+				{ id: "T1", title: "Negative budgets", itemIds: [gptItem, claudeItem], duplicates: true, status: "settled" },
+			]);
+
+			const synth = await session.synthesizeFeedback(claude.model);
+			expect(synth.status).toBe("done");
+			const synthPrompt = lastPrompt(calls.find(c => isSynthesis(c.context))!.context);
+			expect(synthPrompt).toContain(
+				`### Agenda\n- T1 · Negative budgets (settled): ${gptItem}, ${claudeItem} · moderator: possibly the same change\n`,
+			);
+			expect(synthPrompt).toContain(`\`${gptItem}\`: Clamp budgets [concern: ${label}]`);
+		});
+
+		it("keeps the agenda current with no moderator call after a final retraction, a reply, or a roster change", async () => {
+			// Round 3: claude and gpt retract; Round 3 runs every speaker because Round 2 ended converged
+			const council = sameConcernCouncil((model, t) =>
+				t.round === 3 && model !== gemini.model ? [labeled("APPROVE", [], agreeAll(t.peerIds))] : undefined,
+			);
+			const { streamFn, calls } = makeMockStreamFn(
+				moderated(groupSameConcern, (model, context) =>
+					turnPrompt(context).startsWith("# Operator Follow-up")
+						? { text: "Adding one", toolCalls: [labeled("NEEDS REVISION", [{ summary: "Bound retries", concern: "retry policy" }])] }
+						: council(model, context),
+				),
+			);
+			const session = moderatedSession(streamFn, [claude, gpt, gemini]);
+			await session.startInitialCritiques();
+			await session.runDebateRound();
+
+			await session.runDebateRound();
+			expect(debateTurns(session, 3).map(t => t.reviewerKey)).toEqual([gemini.key, claude.key, gpt.key]);
+			// gpt's retraction was the round's last turn: nothing called the moderator after it
+			expect(isModeratorCall(calls.at(-1)!.context)).toBe(false);
+			expect(session.getAgenda()).toEqual([]);
+
+			await session.askCouncil("@gemini Anything to add?");
+			expect(session.getAgenda()).toEqual([
+				{ id: "T2", title: "retry policy", itemIds: ["google/gemini-2.5-pro#1"], duplicates: false, status: "open" },
+			]);
+		});
+
+		it("drops a removed reviewer's items from their topic and clears the same-change mark", async () => {
+			const { streamFn } = makeMockStreamFn(moderated(groupSameConcern, sameConcernCouncil()));
+			const session = moderatedSession(streamFn, [claude, gpt, gemini]);
+			await session.startInitialCritiques();
+			await session.runDebateRound();
+			expect(session.getAgenda()[0].duplicates).toBe(true);
+
+			session.setReviewers([gpt.key, gemini.key]);
+			expect(session.getAgenda().map(({ id, itemIds, duplicates }) => ({ id, itemIds, duplicates }))).toEqual([
+				{ id: "T1", itemIds: [gptItem], duplicates: false },
+			]);
+		});
+
+		/** Round 1: only claude holds an item, so Round 2 opens with gpt, gemini, claude */
+		const claudeOnlyCouncil = (round2: (model: Model, t: ScriptedTurn) => MockToolCall[] | undefined = () => undefined) =>
+			scriptedCouncil((model, t) => {
+				const own = model === claude.model ? [{ summary: "Clamp budgets", concern: label }] : [];
+				if (t.round > 1) {
+					const scripted = round2(model, t);
+					if (scripted) return scripted;
+				}
+				return [labeled(own.length > 0 ? "NEEDS REVISION" : "APPROVE", own, t.round > 1 ? agreeAll(t.peerIds) : [])];
+			});
+		const framing = (nextSpeaker: string, question: string) =>
+			setAgenda({
+				topics: [{ id: "T1", title: "Budget clamps", itemIds: [claudeItem] }],
+				nextSpeaker,
+				topicId: "T1",
+				question,
+			});
+
+		it("lets the moderator pick a queued speaker and ask it one question", async () => {
+			const question = "Does `claude-3-7-sonnet#1` need to cover zero budgets, or only negative ones?";
+			const { streamFn, calls } = makeMockStreamFn(
+				moderated(
+					tool => (tool === "set_agenda" ? framing("@gemini-2.5-pro", question) : moderateTurn({ nextSpeaker: "@nobody", question: "?" })),
+					claudeOnlyCouncil(),
+				),
+			);
+			const session = moderatedSession(streamFn, [claude, gpt, gemini]);
+			await session.startInitialCritiques();
+			await session.runDebateRound();
+
+			const turns = debateTurns(session, 2);
+			expect(turns[0].reviewerKey).toBe(gemini.key);
+			expect(turns[0].moderation).toEqual({ topicId: "T1", question });
+			expect(promptOf(calls, gemini, "Council Debate: Round 2")).toContain(
+				`### Moderator\nTopic T1 · Budget clamps\n${question}\nAnswer this first, then anything else still open for you.\n`,
+			);
+			expect(turns.slice(1).every(t => t.moderation === undefined)).toBe(true);
+		});
+
+		it("ignores a pick outside the queue and lets a speaker's handoff outrank the moderator", async () => {
+			// gpt hands claude the floor; the moderator then names gemini
+			const { streamFn, calls } = makeMockStreamFn(
+				moderated(
+					tool =>
+						tool === "set_agenda"
+							? framing("@nobody", "Who is this for?")
+							: moderateTurn({ nextSpeaker: "@gemini-2.5-pro", topicId: "T1", question: "Gemini, agreed?" }),
+					claudeOnlyCouncil((model, t) =>
+						model === gpt.model ? [withReportFields(labeled("APPROVE", [], agreeAll(t.peerIds)), { nextSpeaker: "@claude-3-7-sonnet" })] : undefined,
+					),
+				),
+			);
+			const session = moderatedSession(streamFn, [claude, gpt, gemini]);
+			await session.startInitialCritiques();
+			await session.runDebateRound();
+
+			expect(debateTurns(session, 2).map(t => t.reviewerKey)).toEqual([gpt.key, claude.key, gemini.key]);
+			// claude's handoff outranks the moderator's pick of gemini; gemini still gets that question on its own turn
+			expect(debateTurns(session, 2).map(t => t.moderation)).toEqual([
+				undefined,
+				undefined,
+				{ topicId: "T1", question: "Gemini, agreed?" },
+			]);
+			for (const reviewer of [gpt, claude]) {
+				expect(promptOf(calls, reviewer, "Council Debate: Round 2")).not.toContain("### Moderator");
+			}
+		});
+
+		it("gives a queued @model message the next turn without moderator framing", async () => {
+			const gptGate = Promise.withResolvers<void>();
+			const gptStarted = Promise.withResolvers<void>();
+			const council = claudeOnlyCouncil();
+			const { streamFn, calls } = makeMockStreamFn(
+				moderated(
+					tool =>
+						tool === "set_agenda"
+							? framing("@gpt-4o", "gpt, is the clamp needed?")
+							: moderateTurn({ nextSpeaker: "@gemini-2.5-pro", topicId: "T1", question: "Gemini, agreed?" }),
+					async (model, context) => {
+						if (model === gpt.model && debateRound(context) === 2) {
+							gptStarted.resolve();
+							await gptGate.promise;
+						}
+						return council(model, context);
+					},
+				),
+			);
+			const session = moderatedSession(streamFn, [claude, gpt, gemini]);
+			await session.startInitialCritiques();
+			const round = session.runDebateRound();
+			await gptStarted.promise;
+			// queued while gpt speaks: the check that skips the moderator must not consume it
+			expect(await session.askCouncil("@claude Check the clamp")).toEqual({ status: "queued", target: claude });
+			gptGate.resolve();
+			await round;
+
+			expect(debateTurns(session, 2).map(t => t.reviewerKey)).toEqual([gpt.key, claude.key, gemini.key]);
+			const gptAt = calls.findIndex(c => c.model === gpt.model && debateRound(c.context) === 2);
+			const claudeAt = calls.findIndex(c => c.model === claude.model && debateRound(c.context) === 2);
+			expect(calls.slice(gptAt + 1, claudeAt).some(c => isModeratorCall(c.context))).toBe(false);
+			const claudePrompt = promptOf(calls, claude, "Council Debate: Round 2");
+			expect(claudePrompt).toContain(`[To ${claude.label}]: Check the clamp`);
+			expect(claudePrompt).not.toContain("### Moderator");
+		});
+
+		it("lets an @model message sent during a moderator call take the next turn", async () => {
+			const turnGate = Promise.withResolvers<void>();
+			const turnStarted = Promise.withResolvers<void>();
+			const { streamFn, calls } = makeMockStreamFn(
+				moderated(async tool => {
+					if (tool === "set_agenda") return framing("@gpt-4o", "gpt, is the clamp needed?");
+					turnStarted.resolve();
+					await turnGate.promise;
+					return moderateTurn({ nextSpeaker: "@gemini-2.5-pro", topicId: "T1", question: "Gemini, agreed?" });
+				}, claudeOnlyCouncil()),
+			);
+			const session = moderatedSession(streamFn, [claude, gpt, gemini]);
+			await session.startInitialCritiques();
+			const round = session.runDebateRound();
+			await turnStarted.promise;
+			expect(session.isModerating()).toBe(true);
+			await session.askCouncil("@claude Check the clamp");
+			turnGate.resolve();
+			await round;
+
+			const turns = debateTurns(session, 2);
+			expect(turns.map(t => t.reviewerKey)).toEqual([gpt.key, claude.key, gemini.key]);
+			expect(turns[1].moderation).toBeUndefined();
+			expect(promptOf(calls, claude, "Council Debate: Round 2")).not.toContain("### Moderator");
+		});
+
+		const failures: Array<{ name: string; reply: () => MockResponse | Promise<MockResponse>; error: string }> = [
+			{ name: "a failed request", reply: () => ({ text: "", stopReason: "error", error: "rate limited" }), error: "rate limited" },
+			{ name: "no tool call", reply: () => ({ text: "Here is my agenda." }), error: "no set_agenda call" },
+			// a stream that ignores cancellation: only the moderator's own deadline (real 20 ms timer) can end the wait
+			{ name: "a stream that never answers", reply: () => new Promise<MockResponse>(() => {}), error: "no answer within" },
+		];
+		for (const failure of failures) {
+			it(`debates in the usual order without the moderator after ${failure.name}, then recovers next round`, async () => {
+				let failing = true;
+				const { streamFn, calls } = makeMockStreamFn(
+					moderated(
+						tool =>
+							failing
+								? failure.reply()
+								: tool === "set_agenda"
+									? framing("@gpt-4o", "gpt, is the clamp needed?")
+									: moderateTurn({ nextSpeaker: "@claude", topicId: "T1", question: "Claude?" }),
+						claudeOnlyCouncil(),
+					),
+				);
+				const session = moderatedSession(streamFn, [claude, gpt, gemini], { moderatorTimeoutMs: 20 });
+				await session.startInitialCritiques();
+				await session.runDebateRound();
+
+				// the council converges once gemini has judged claude's item, so claude never speaks
+				expect(debateTurns(session, 2).map(t => t.reviewerKey)).toEqual([gpt.key, gemini.key]);
+				expect(debateTurns(session, 2).every(t => t.moderation === undefined)).toBe(true);
+				expect(session.moderatorError).toContain(failure.error);
+				// benched after its first failure: no between-turn calls this round
+				expect(moderatorCalls(calls).length).toBe(1);
+
+				failing = false;
+				await session.runDebateRound();
+				expect(session.moderatorError).toBeUndefined();
+				expect(debateTurns(session, 3)[0].moderation).toEqual({ topicId: "T1", question: "gpt, is the clamp needed?" });
+			});
+		}
+
+		it("starts no reviewer turn after an abort during a moderator call, and a stale call never touches a restarted round", async () => {
+			const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+			const started = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+			let agendaCalls = 0;
+			const { streamFn, calls } = makeMockStreamFn(
+				moderated(async tool => {
+					if (tool !== "set_agenda") return moderateTurn({ nextSpeaker: "@nobody", question: "?" });
+					const n = Math.min(agendaCalls, 1);
+					started[n].resolve();
+					// ignores the abort signal: the stopped request settles only when its gate opens
+					await gates[n].promise;
+					return setAgenda({
+						topics: [{ title: n === 0 ? "STALE" : "FRESH", itemIds: [claudeItem] }],
+						nextSpeaker: "@gpt-4o",
+						question: n === 0 ? "stale?" : "fresh?",
+					});
+				}, claudeOnlyCouncil()),
+			);
+			// the mock asks its responder twice per request; count requests, not responder runs
+			const counting: ModelStreamFn = (model, context, options) => {
+				if (isModeratorCall(context) && context.tools?.[0]?.name === "set_agenda") agendaCalls = moderatorCalls(calls).length;
+				return streamFn(model, context, options);
+			};
+			const session = moderatedSession(counting, [claude, gpt, gemini]);
+			await session.startInitialCritiques();
+
+			const stopped = session.runDebateRound();
+			await started[0].promise;
+			session.abortActiveRound();
+			// restart before the stopped round's moderator call has unwound
+			const restarted = session.runDebateRound();
+			await stopped;
+			expect(debateTurns(session, 2)).toEqual([]);
+
+			await started[1].promise;
+			gates[0].resolve();
+			for (let i = 0; i < 20; i++) await Promise.resolve();
+			expect(session.isModerating()).toBe(true);
+			expect(session.getAgenda().map(t => t.title)).toEqual([label]);
+			expect(session.moderatorError).toBeUndefined();
+
+			gates[1].resolve();
+			await restarted;
+			expect(session.getAgenda().map(t => t.title)).toEqual(["FRESH"]);
+			expect(debateTurns(session, 3)[0].moderation).toEqual({ question: "fresh?" });
+		});
+
+		it("skips the moderator when the round is about to end, and frames every speaker of a manual round on a converged council", async () => {
+			const { streamFn, calls } = makeMockStreamFn(
+				moderated(
+					tool =>
+						tool === "set_agenda"
+							? framing("@gpt-4o", "gpt, is the clamp needed?")
+							: moderateTurn({ nextSpeaker: "@claude-3-7-sonnet", topicId: "T1", question: "Claude, still needed?" }),
+					claudeOnlyCouncil(),
+				),
+			);
+			const session = moderatedSession(streamFn, [claude, gpt]);
+			await session.startInitialCritiques();
+
+			// gpt agrees, which converges the council: the round ends without a between-turn call
+			await session.runDebateRound();
+			expect(debateTurns(session, 2).map(t => t.reviewerKey)).toEqual([gpt.key]);
+			expect(moderatorCalls(calls).map(c => c.context.tools?.[0]?.name)).toEqual(["set_agenda"]);
+
+			await session.runDebateRound();
+			expect(debateTurns(session, 3).map(t => [t.reviewerKey, t.moderation?.question])).toEqual([
+				[gpt.key, "gpt, is the clamp needed?"],
+				[claude.key, "Claude, still needed?"],
+			]);
+
+			const plain = makeMockStreamFn(claudeOnlyCouncil());
+			const unmoderated = moderatedSession(plain.streamFn, [claude, gpt], { moderator: undefined });
+			await unmoderated.startInitialCritiques();
+			await unmoderated.runDebateRound();
+			expect(moderatorCalls(plain.calls)).toEqual([]);
+			expect(unmoderated.getAgenda()).toEqual([]);
+		});
+
+		it("gives each caller its own prompt-cache key, and none without a session ID", async () => {
+			const council = claudeOnlyCouncil();
+			const responder = moderated(
+				tool => (tool === "set_agenda" ? framing("@gpt-4o", "gpt?") : moderateTurn({ nextSpeaker: "@nobody", question: "?" })),
+				(model, context) =>
+					// claude's critique skips the report once, so a forced follow-up runs
+					model === claude.model && lastPrompt(context).startsWith("# Plan Review")
+						? { text: "Review without report" }
+						: council(model, context),
+			);
+			const keyed = makeMockStreamFn(responder);
+			const session = moderatedSession(keyed.streamFn, [claude, gpt], { sessionId: "s1" });
+			await session.startInitialCritiques();
+			await session.runDebateRound();
+			await session.synthesizeFeedback(claude.model);
+
+			const keysOf = (filter: (c: Calls[number]) => boolean) => [...new Set(keyed.calls.filter(filter).map(c => c.options.promptCacheKey))];
+			const claudeCalls = keyed.calls.filter(c => c.model === claude.model && !isSynthesis(c.context));
+			expect(claudeCalls.some(c => lastPrompt(c.context).startsWith(FORCED_REPORT_MARKER))).toBe(true);
+			expect(keysOf(c => c.model === claude.model && !isSynthesis(c.context))).toEqual(["s1:anthropic/claude-3-7-sonnet"]);
+			expect(keysOf(c => c.model === gpt.model)).toEqual(["s1:openai/gpt-4o"]);
+			expect(keysOf(c => isModeratorCall(c.context))).toEqual(["s1:moderator"]);
+			expect(keysOf(c => isSynthesis(c.context))).toEqual(["s1:synthesis"]);
+
+			const unkeyed = makeMockStreamFn(responder);
+			const anonymous = moderatedSession(unkeyed.streamFn, [claude, gpt]);
+			await anonymous.startInitialCritiques();
+			await anonymous.runDebateRound();
+			expect(unkeyed.calls.length).toBeGreaterThan(0);
+			expect(unkeyed.calls.some(c => "promptCacheKey" in c.options)).toBe(false);
+		});
 	});
 });
 

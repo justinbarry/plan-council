@@ -8,7 +8,7 @@ import { matchesKey, type KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import { CouncilCodeReader } from "./code-reader";
 import { CouncilSession, extractSessionGoalContext } from "./council-session";
-import { resolveCouncilRoster, resolveReaderModel, resolveSynthesizer } from "./models";
+import { resolveCouncilRoster, resolveModeratorModel, resolveReaderModel, resolveSynthesizer } from "./models";
 import { type CouncilOverlayOutcome, PlanCouncilOverlay } from "./overlay";
 import { collectPlanReferencedFiles } from "./plan-files";
 import { DEFAULT_PLAN_COUNCIL_SETTINGS, loadPlanCouncilSettings, type PlanCouncilSettings } from "./settings";
@@ -96,12 +96,22 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 			if (currentSettings.enableCodeReader && !readerSpec) {
 				warnings.push("Codebase reader enabled, but no authenticated model is available for it.");
 			}
+			const moderatorSpec = currentSettings.enableModerator ? resolveModeratorModel(ctx.models, currentSettings) : undefined;
+			if (currentSettings.enableModerator && !moderatorSpec) {
+				warnings.push(
+					"Moderator enabled, but no fast model is configured (set modelRoles.council_moderator or smol); debating without it.",
+				);
+			}
 
 			// toggling the reader, changing its model, or changing its per-turn cap rebuilds the cached council
 			const readerCacheKey = readerSpec
 				? `${readerSpec.model.provider}/${readerSpec.model.id}:${readerSpec.thinkingLevel ?? ""}:${currentSettings.maxReaderQueriesPerTurn}`
 				: "off";
-			const sessionCacheKey = `${review.sessionId}:${review.planFilePath}:${Bun.hash(review.planContent)}:${currentSettings.enableCodeReader}:${readerCacheKey}`;
+			// as does toggling the moderator or changing its model
+			const moderatorCacheKey = moderatorSpec
+				? `${moderatorSpec.model.provider}/${moderatorSpec.model.id}:${moderatorSpec.thinkingLevel ?? ""}`
+				: "off";
+			const sessionCacheKey = `${review.sessionId}:${review.planFilePath}:${Bun.hash(review.planContent)}:${currentSettings.enableCodeReader}:${readerCacheKey}:${moderatorCacheKey}`;
 			let session: CouncilSession;
 
 			if (cachedCouncil && cachedCouncil.key === sessionCacheKey) {
@@ -148,6 +158,7 @@ export default function planCouncilExtension(pi: ExtensionAPI, deps: PlanCouncil
 							})
 						: undefined,
 					maxReaderQueriesPerTurn: currentSettings.maxReaderQueriesPerTurn,
+					moderator: moderatorSpec,
 					referencedFiles,
 				});
 

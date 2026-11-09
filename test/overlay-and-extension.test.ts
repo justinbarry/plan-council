@@ -996,10 +996,18 @@ describe("PlanCouncilOverlay UI component", () => {
 
 	/** reviewers stream `text` and report `args`; a reply carrying `wait` settles only once that promise does */
 	function reportingStream(
-		respond: (modelId: string, prompt: string) => { text?: string; args: Record<string, unknown>; wait?: Promise<void> },
+		respond: (
+			modelId: string,
+			prompt: string,
+			toolName?: string,
+		) => { text?: string; args?: Record<string, unknown>; wait?: Promise<void>; error?: string },
 	): ModelStreamFn {
 		return (model, context) => {
-			const reply = respond(model.id, String(context.messages[context.messages.length - 1].content));
+			const toolName =
+				context.tools?.[0]?.name === "set_agenda" || context.tools?.[0]?.name === "moderate_turn"
+					? context.tools[0].name
+					: "report_position";
+			const reply = respond(model.id, String(context.messages[context.messages.length - 1].content), toolName);
 			const text = reply.text ?? "Review";
 			return {
 				async *[Symbol.asyncIterator]() {
@@ -1007,11 +1015,19 @@ describe("PlanCouncilOverlay UI component", () => {
 				},
 				result: async () => {
 					await reply.wait;
+					if (reply.error) {
+						return {
+							role: "assistant",
+							content: [{ type: "text", text: reply.error }],
+							stopReason: "error",
+							errorMessage: reply.error,
+						} as unknown as AssistantMessage;
+					}
 					return {
 						role: "assistant",
 						content: [
 							{ type: "text", text },
-							{ type: "toolCall", id: "call-0", name: "report_position", arguments: reply.args },
+							{ type: "toolCall", id: "call-0", name: toolName, arguments: reply.args ?? {} },
 						],
 						stopReason: "toolUse",
 					} as unknown as AssistantMessage;
@@ -1187,7 +1203,229 @@ describe("PlanCouncilOverlay UI component", () => {
 		expect(models).toContain("gpt-4o (openai) [family: openai]");
 		expect(models).toContain("Synthesizer: gpt-4o (openai) · thinking: low");
 		expect(models).toContain("Codebase reader: disabled");
+		expect(models).toContain("Moderator: disabled");
 		expect(models).toContain("⚠ Role @council3 did not resolve");
+	});
+
+	it("renders moderator framing above the turn header and the agenda in the scorecard", async () => {
+		const modQuestion = "Can we unify the retry and timeout logic?";
+		const moderatorModel = makeFakeModel("openai", "gpt-4o-mini");
+		const streamFn = reportingStream((modelId, prompt, toolName) => {
+			if (toolName === "set_agenda") {
+				return {
+					args: {
+						topics: [
+							{
+								id: "T1",
+								title: "Retry and timeout handling",
+								itemIds: [`${claude.key}#1`, `${gpt.key}#1`],
+								duplicates: true,
+							},
+						],
+						nextSpeaker: `@${gpt.model.id}`,
+						topicId: "T1",
+						question: modQuestion,
+					},
+				};
+			}
+			if (toolName === "moderate_turn") {
+				return {
+					args: {
+						nextSpeaker: `@${claude.model.id}`,
+						topicId: "T1",
+						question: "Do you accept the bounded timeouts?",
+						sameChangeTopicIds: ["T1"],
+					},
+				};
+			}
+			if (!prompt.includes("Council Debate")) {
+				return modelId === claude.model.id
+					? { args: { verdict: "NEEDS REVISION", revisions: [{ summary: "Limit retries" }], positions: [] } }
+					: { args: { verdict: "NEEDS REVISION", revisions: [{ summary: "Bound timeouts" }], positions: [] } };
+			}
+			return modelId === gpt.model.id
+				? {
+						args: {
+							verdict: "NEEDS REVISION",
+							revisions: [{ summary: "Bound timeouts" }],
+							positions: [{ id: `${claude.key}#1`, stance: "agree" }],
+						},
+					}
+				: {
+						args: {
+							verdict: "NEEDS REVISION",
+							revisions: [{ summary: "Limit retries" }],
+							positions: [{ id: `${gpt.key}#1`, stance: "agree" }],
+						},
+					};
+		});
+
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			moderator: { model: moderatorModel },
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		await session.startInitialCritiques();
+		await session.runDebateRound();
+
+		const rendered = plain(overlay.render(120));
+		expect(rendered).toContain(`Moderator → @${gpt.model.id} · T1: ${modQuestion}`);
+		expect(rendered).toContain("Agenda");
+		expect(rendered).toContain(" · possibly the same change");
+		expect(rendered).toMatch(/T1 · Retry and timeout handling · (✓ settled|○ open|⚡ contested) · .* · possibly the same change/);
+
+		const lines = rendered.split("\n");
+		const modIdx = lines.findIndex(l => l.includes(`Moderator → @${gpt.model.id} · T1: ${modQuestion}`));
+		expect(modIdx).toBeGreaterThanOrEqual(0);
+		expect(lines[modIdx + 1]).toContain("Round 2 turn 1");
+		expect(lines[modIdx + 1]).toContain(gpt.model.id);
+
+		overlay.dispose();
+	});
+
+	it("shows moderator busy indicator in title while a moderator call is pending and clears it after release", async () => {
+		const gate = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const streamFn = reportingStream((_modelId, _prompt, toolName) => {
+			if (toolName === "set_agenda") {
+				started.resolve();
+				return {
+					args: {
+						topics: [
+							{
+								id: "T1",
+								title: "Review topic",
+								itemIds: [`${claude.key}#1`],
+							},
+						],
+						nextSpeaker: `@${claude.model.id}`,
+						question: "What needs to change?",
+					},
+					wait: gate.promise,
+				};
+			}
+			if (toolName === "moderate_turn") {
+				return {
+					args: {
+						nextSpeaker: `@${gpt.model.id}`,
+						question: "Do you agree?",
+					},
+				};
+			}
+			return {
+				args: {
+					verdict: "NEEDS REVISION",
+					revisions: [{ summary: "Limit retries" }],
+					positions: [],
+				},
+			};
+		});
+
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			moderator: { model: makeFakeModel("openai", "gpt-4o-mini") },
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		await session.startInitialCritiques();
+
+		const debate = session.runDebateRound();
+		await started.promise;
+
+		const titleDuring = Bun.stripANSI(overlay.render(120)[0]);
+		expect(titleDuring).toContain(" · moderator ⏳");
+
+		gate.resolve();
+		await debate;
+
+		const titleAfter = Bun.stripANSI(overlay.render(120)[0]);
+		expect(titleAfter).not.toContain(" · moderator ⏳");
+		overlay.dispose();
+	});
+
+	it("displays moderator unavailable in the scorecard when the moderator stream errors", async () => {
+		const streamFn = reportingStream((_modelId, _prompt, toolName) => {
+			if (toolName === "set_agenda") {
+				return { error: "rate limit exceeded" };
+			}
+			return {
+				args: {
+					verdict: "NEEDS REVISION",
+					revisions: [{ summary: "Limit retries" }],
+					positions: [],
+				},
+			};
+		});
+
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			moderator: { model: makeFakeModel("openai", "gpt-4o-mini") },
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		await session.startInitialCritiques();
+		await session.runDebateRound();
+
+		const text = plain(overlay.render(120));
+		expect(text).toContain("⚠ Moderator unavailable (");
+		expect(text).toContain("default speaking order");
+		overlay.dispose();
+	});
+
+	it("shows moderator configuration in the models tab or disabled when omitted", () => {
+		const moderatorModel = makeFakeModel("openai", "gpt-4o-mini");
+		const sessionWithMod = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude],
+			moderator: { model: moderatorModel },
+		});
+		const overlayWithMod = new PlanCouncilOverlay(
+			tallTui(),
+			sessionWithMod,
+			{ reviewOptions: defaultReviewOptions, synthesizerModel: claude.model },
+			() => {},
+		);
+		overlayWithMod.handleInput("m");
+		const modelsWithMod = plain(overlayWithMod.render(100));
+		expect(modelsWithMod).toContain("Moderator: gpt-4o-mini (openai)");
+		overlayWithMod.dispose();
+
+		const sessionNoMod = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude],
+		});
+		const overlayNoMod = new PlanCouncilOverlay(
+			tallTui(),
+			sessionNoMod,
+			{ reviewOptions: defaultReviewOptions, synthesizerModel: claude.model },
+			() => {},
+		);
+		overlayNoMod.handleInput("m");
+		const modelsNoMod = plain(overlayNoMod.render(100));
+		expect(modelsNoMod).toContain("Moderator: disabled");
+		overlayNoMod.dispose();
 	});
 
 	it("restores each tab's scroll position when returning to it", () => {

@@ -18,6 +18,8 @@ export interface PlanCouncilSettings {
 	enableCodeReader: boolean;
 	readerModel: string | undefined;
 	maxReaderQueriesPerTurn: number;
+	enableModerator: boolean;
+	moderatorModel: string | undefined;
 }
 
 export const DEFAULT_PLAN_COUNCIL_SETTINGS: PlanCouncilSettings = {
@@ -34,6 +36,8 @@ export const DEFAULT_PLAN_COUNCIL_SETTINGS: PlanCouncilSettings = {
 	enableCodeReader: true,
 	readerModel: undefined,
 	maxReaderQueriesPerTurn: 3,
+	enableModerator: true,
+	moderatorModel: undefined,
 };
 
 export function parsePlanCouncilSettings(raw: Record<string, unknown>): PlanCouncilSettings {
@@ -113,6 +117,14 @@ export function parsePlanCouncilSettings(raw: Record<string, unknown>): PlanCoun
 		}
 	}
 
+	const enableModerator =
+		typeof raw.enableModerator === "boolean" ? raw.enableModerator : DEFAULT_PLAN_COUNCIL_SETTINGS.enableModerator;
+
+	const moderatorModel =
+		typeof raw.moderatorModel === "string" && raw.moderatorModel.trim()
+			? raw.moderatorModel.trim()
+			: DEFAULT_PLAN_COUNCIL_SETTINGS.moderatorModel;
+
 	return {
 		autoStart,
 		autoProceed,
@@ -127,6 +139,8 @@ export function parsePlanCouncilSettings(raw: Record<string, unknown>): PlanCoun
 		enableCodeReader,
 		readerModel,
 		maxReaderQueriesPerTurn,
+		enableModerator,
+		moderatorModel,
 	};
 }
 

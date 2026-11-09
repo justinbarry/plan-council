@@ -107,6 +107,16 @@
 				"max": 6,
 				"step": 1,
 				"description": "Maximum ask_codebase tool calls a reviewer may make per turn"
+			},
+			"enableModerator": {
+				"type": "boolean",
+				"default": true,
+				"description": "Let a fast moderator model group revisions into topics and frame each debate turn's question; it never takes positions"
+			},
+			"moderatorModel": {
+				"type": "string",
+				"default": "",
+				"description": "Model selector or role name (optional :effort suffix) for the moderator (empty uses @council_moderator, @smol, then @fast; with none of those the moderator stays off)"
 			}
 		}
 	}

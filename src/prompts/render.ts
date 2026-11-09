@@ -4,6 +4,9 @@ import type { RevisionItem } from "../position";
 import critiqueRoundTemplate from "./critique-round.md" with { type: "text" };
 import critiqueSystemTemplate from "./critique-system.md" with { type: "text" };
 import debateRebuttalTemplate from "./debate-rebuttal.md" with { type: "text" };
+import moderatorAgendaTemplate from "./moderator-agenda.md" with { type: "text" };
+import moderatorSystemTemplate from "./moderator-system.md" with { type: "text" };
+import moderatorTurnTemplate from "./moderator-turn.md" with { type: "text" };
 import positionFollowupTemplate from "./position-followup.md" with { type: "text" };
 import readerQueryTemplate from "./reader-query.md" with { type: "text" };
 import readerSystemTemplate from "./reader-system.md" with { type: "text" };
@@ -127,6 +130,14 @@ export interface RoundtableFloor {
 	peerHandles: readonly string[];
 }
 
+/** the agenda topic grouping peer items in a debate prompt */
+export interface PromptAgendaTopic {
+	id: string;
+	title: string;
+	duplicates: boolean;
+	itemIds: readonly string[];
+}
+
 export interface RenderDebateRebuttalOptions {
 	round: number;
 	peerCritiques: readonly PeerCritiqueItem[];
@@ -135,6 +146,10 @@ export interface RenderDebateRebuttalOptions {
 	roundtable?: RoundtableFloor;
 	operatorNotes?: string;
 	hasCodeReader?: boolean;
+	/** the moderator's question for this speaker */
+	moderator?: { topicId?: string; topicTitle?: string; question: string };
+	/** groups peer items under topic headings; items outside every topic follow untitled */
+	agenda?: readonly PromptAgendaTopic[];
 }
 
 /** summaries are model text: render placeholders, then restore the exact values */
@@ -164,6 +179,11 @@ export function renderDebateRebuttal(options: RenderDebateRebuttalOptions): stri
 	}
 	if (options.operatorNotes) exactValues.push(options.operatorNotes);
 	if (peerHandlesText) exactValues.push(peerHandlesText);
+	if (options.moderator) {
+		exactValues.push(options.moderator.question);
+		if (options.moderator.topicTitle) exactValues.push(options.moderator.topicTitle);
+	}
+	for (const topic of options.agenda ?? []) exactValues.push(topic.title);
 	for (const d of ownDisputes) {
 		exactValues.push(d.summary, d.by);
 		if (d.reason.trim()) exactValues.push(d.reason);
@@ -212,18 +232,84 @@ export function renderDebateRebuttal(options: RenderDebateRebuttalOptions): stri
 			disputes: disputes.length > 0 ? disputes : undefined,
 		};
 	});
+	const moderator = options.moderator && {
+		topicId: options.moderator.topicId,
+		topicTitle: options.moderator.topicTitle ? exact("TOPIC", options.moderator.topicTitle) : undefined,
+		question: exact("QUESTION", options.moderator.question),
+	};
+
+	// without an agenda every item sits in one group with no heading, rendering exactly as an ungrouped list
+	const peerItemGroups: Array<{ heading?: string; sameChange?: boolean; items: typeof mappedItems }> = [];
+	const grouped = new Set<string>();
+	for (const topic of options.agenda ?? []) {
+		const members = new Set(topic.itemIds);
+		const items = mappedItems.filter(item => members.has(item.id) && !grouped.has(item.id));
+		if (items.length === 0) continue;
+		for (const item of items) grouped.add(item.id);
+		peerItemGroups.push({ heading: `${topic.id} · ${exact("TOPIC", topic.title)}`, sameChange: topic.duplicates, items });
+	}
+	const ungrouped = mappedItems.filter(item => !grouped.has(item.id));
+	if (ungrouped.length > 0) {
+		peerItemGroups.push({ heading: peerItemGroups.length > 0 ? "Not on the agenda yet" : undefined, items: ungrouped });
+	}
 
 	const rendered = prompt.render(debateRebuttalTemplate, {
 		round: options.round,
 		roundtable,
 		peerCritiques: mappedPeers.length > 0 ? mappedPeers : undefined,
 		ownDisputes: mappedOwnDisputes.length > 0 ? mappedOwnDisputes : undefined,
-		peerItems: mappedItems.length > 0 ? mappedItems : undefined,
+		peerItemGroups: peerItemGroups.length > 0 ? peerItemGroups : undefined,
+		moderator,
 		operatorNotes,
 		hasCodeReader: options.hasCodeReader === true,
 	});
 
 	return restoreExactValues(rendered, replacements);
+}
+
+/** placeholder-protect every model-written value, render, then restore the exact text */
+function renderWithExactValues(
+	template: string,
+	data: Record<string, unknown>,
+	exactFields: Record<string, string | undefined>,
+): string {
+	const entries = Object.entries(exactFields).filter((e): e is [string, string] => e[1] !== undefined);
+	const values = entries.map(([, value]) => value);
+	const replacements: Array<readonly [string, string]> = [];
+	const placeholders: Record<string, string> = {};
+	entries.forEach(([key, value], idx) => {
+		const placeholder = exactPlaceholder(key.toUpperCase(), idx, values);
+		replacements.push([placeholder, value]);
+		placeholders[key] = placeholder;
+	});
+	return restoreExactValues(prompt.render(template, { ...data, ...placeholders }), replacements);
+}
+
+export function renderModeratorSystem(): string {
+	return prompt.render(moderatorSystemTemplate, {});
+}
+
+export interface RenderModeratorAgendaOptions {
+	planTitle: string;
+	planFilePath: string;
+	/** the full current state from `formatModeratorSnapshot` */
+	snapshot: string;
+}
+
+export function renderModeratorAgenda(options: RenderModeratorAgendaOptions): string {
+	return renderWithExactValues(moderatorAgendaTemplate, {}, { ...options });
+}
+
+export interface RenderModeratorTurnOptions extends RenderModeratorAgendaOptions {
+	/** provisionally placed items, one `- id → topic` line each */
+	provisional?: string;
+	turnLabel: string;
+	turnText: string;
+	turnDelta?: string;
+}
+
+export function renderModeratorTurn(options: RenderModeratorTurnOptions): string {
+	return renderWithExactValues(moderatorTurnTemplate, {}, { ...options });
 }
 
 export interface PeerUpdateItem {

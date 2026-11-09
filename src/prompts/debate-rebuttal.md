@@ -3,6 +3,15 @@
 {{#if roundtable}}
 You have the floor (turn {{roundtable.speaker}}{{#if roundtable.peerHandlesText}}; peers: {{roundtable.peerHandlesText}}{{/if}}). Reply directly to your peers rather than rewriting a standalone review.
 
+{{#if moderator}}
+### Moderator
+{{#if moderator.topicId}}
+Topic {{moderator.topicId}} · {{{moderator.topicTitle}}}
+{{/if}}
+{{{moderator.question}}}
+Answer this first, then anything else still open for you.
+
+{{/if}}
 {{else if peerCritiques}}
 Peer reviewers have reviewed the plan. Examine their assessments below:
 
@@ -31,13 +40,18 @@ Peer reviewers have reviewed the plan. Examine their assessments below:
 {{/each}}
 
 {{/if}}
-{{#if peerItems}}
+{{#if peerItemGroups}}
 ---
 ### Peer required revisions
-{{#each peerItems}}
+{{#each peerItemGroups}}
+{{#if heading}}
+**{{{heading}}}**{{#if sameChange}} (moderator: these may be the same change; if they are, keep one wording by agreeing with a peer's item and dropping yours; if they differ, say how){{/if}}
+{{/if}}
+{{#each items}}
 - `{{id}}`: {{{summary}}}
 {{#each disputes}}
   - Disputed by **{{by}}**{{#if reason}}: {{{reason}}}{{/if}}
+{{/each}}
 {{/each}}
 {{/each}}
 

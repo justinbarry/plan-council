@@ -9,10 +9,16 @@ import {
 import { describe, expect, it } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionModelQuery } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
-import { modelKey, resolveCouncilRoster, resolveReaderModel, resolveSynthesizer } from "../src/models";
+import { parseEffort } from "@oh-my-pi/pi-tui/thinking";
+import { modelKey, resolveCouncilRoster, resolveModeratorModel, resolveReaderModel, resolveSynthesizer } from "../src/models";
 import { parsePlanCouncilSettings } from "../src/settings";
 
-function makeFakeModel(provider: string, id: string, family: string): Model {
+function makeFakeModel(
+	provider: string,
+	id: string,
+	family: string,
+	opts?: { thinking?: Model["thinking"]; reasoning?: boolean },
+): Model {
 	return {
 		id,
 		provider,
@@ -20,7 +26,8 @@ function makeFakeModel(provider: string, id: string, family: string): Model {
 		description: "fake model for test",
 		contextWindow: 128000,
 		maxTokens: 4096,
-		thinking: false,
+		thinking: opts?.thinking ?? false,
+		reasoning: opts?.reasoning,
 		identity: {
 			family,
 			class: family,
@@ -113,6 +120,16 @@ describe("settings parser", () => {
 			raw => parsePlanCouncilSettings({ maxReaderQueriesPerTurn: raw }).maxReaderQueriesPerTurn,
 		);
 		expect(budgets).toEqual([1, 6, 4, 3, 3, 3]);
+	});
+
+	it("parses moderator settings", () => {
+		const defaults = parsePlanCouncilSettings({});
+		expect(defaults.enableModerator).toBe(true);
+		expect(defaults.moderatorModel).toBeUndefined();
+		expect(parsePlanCouncilSettings({ enableModerator: false }).enableModerator).toBe(false);
+		expect(parsePlanCouncilSettings({ enableModerator: true }).enableModerator).toBe(true);
+		expect(parsePlanCouncilSettings({ moderatorModel: "  @smol:low " }).moderatorModel).toBe("@smol:low");
+		expect(parsePlanCouncilSettings({ moderatorModel: "   " }).moderatorModel).toBeUndefined();
 	});
 });
 
@@ -218,6 +235,33 @@ describe("model roster resolution", () => {
 		const query = makeFakeModelQuery({ available: [claude, gpt4o, smol], roles: { smol }, current: claude });
 		expect(resolveReaderModel(query, parsePlanCouncilSettings({ readerModel: "gpt-4o" }), [])?.model).toBe(gpt4o);
 		expect(resolveReaderModel(query, parsePlanCouncilSettings({ readerModel: "missing-model" }), [])?.model).toBe(smol);
+	});
+
+	it("resolves the moderator through @council_moderator, @council-moderator, @smol, then @fast", () => {
+		const roleNames = ["council_moderator", "council-moderator", "smol", "fast"];
+		const models = roleNames.map(role => makeFakeModel("test", `${role}-model`, role));
+		const settings = parsePlanCouncilSettings({});
+		for (let i = 0; i < roleNames.length; i++) {
+			const roles = Object.fromEntries(roleNames.slice(i).map((role, j) => [role, models[i + j]]));
+			const query = makeFakeModelQuery({ available: [claude, ...models], roles, current: claude });
+			expect(resolveModeratorModel(query, settings)?.model).toBe(models[i]);
+		}
+	});
+
+	it("honors an explicit moderatorModel with a :low suffix and returns undefined when none of the chain resolves", () => {
+		const efforts = ["low", "medium", "high", "xhigh"].map(parseEffort).filter((e): e is NonNullable<typeof e> => e !== undefined);
+		const fast = makeFakeModel("openai", "gpt-4o-mini", "gpt", { reasoning: true, thinking: { mode: "effort", efforts } });
+		const query = makeFakeModelQuery({ available: [claude, fast], roles: { fast }, current: claude });
+
+		const resolvedWithEffort = resolveModeratorModel(
+			query,
+			parsePlanCouncilSettings({ moderatorModel: "gpt-4o-mini:low" }),
+		);
+		expect(resolvedWithEffort?.model).toBe(fast);
+		expect(resolvedWithEffort?.thinkingLevel?.toString()).toBe("low");
+
+		const emptyQuery = makeFakeModelQuery({ available: [claude], current: claude });
+		expect(resolveModeratorModel(emptyQuery, parsePlanCouncilSettings({}))).toBeUndefined();
 	});
 
 	it("prioritizes custom council roles and automatically adds @ prefix when resolving", () => {

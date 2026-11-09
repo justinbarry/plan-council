@@ -6,6 +6,7 @@ import type {
 	Message,
 	Model,
 	SimpleStreamOptions,
+	Tool,
 	ToolCall,
 	ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
@@ -21,7 +22,24 @@ import {
 	type CodeReaderQueryInput,
 } from "./code-reader";
 import { StallTimer } from "./stall-timer";
-import type { ReviewerMember } from "./models";
+import { matchReviewerHandle, type ReviewerMember } from "./models";
+import {
+	type AgendaTopic,
+	type AgendaTopicStatus,
+	agendaStatuses,
+	applyAgenda,
+	applyAssignments,
+	formatAgenda,
+	formatEndedTurn,
+	formatModeratorSnapshot,
+	MODERATE_TURN_TOOL,
+	type moderateTurnSchema,
+	pickFraming,
+	reconcileAgenda,
+	SET_AGENDA_TOOL,
+	type setAgendaSchema,
+	type TurnFraming,
+} from "./moderator";
 import type { PlanFileExcerpt } from "./plan-files";
 import {
 	computeConvergence,
@@ -45,6 +63,9 @@ import {
 	renderCritiqueRound,
 	renderCritiqueSystem,
 	renderDebateRebuttal,
+	renderModeratorAgenda,
+	renderModeratorSystem,
+	renderModeratorTurn,
 	renderPositionFollowup,
 	renderSynthesizeSystem,
 	renderSynthesizeUser,
@@ -75,6 +96,8 @@ export type CouncilTurnEntry =
 			roundtableTurn?: { step: number };
 			/** how the turn's report moved the reviewer's previous reported position */
 			positionDelta?: PositionDelta;
+			/** the moderator's question this debate turn answered */
+			moderation?: { topicId?: string; question: string };
 	  }
 	| {
 			id: string;
@@ -150,6 +173,9 @@ export const READER_TARGET_KEY = "@reader";
 /** a model request is abandoned after this long without any stream event (text, reasoning, or tool call) */
 const DEFAULT_MODEL_STALL_MS = 180_000;
 
+/** a moderator call is abandoned after this long, even when its stream ignores cancellation */
+const DEFAULT_MODERATOR_TIMEOUT_MS = 20_000;
+
 /** turns one reviewer may start in one debate round; an operator's queued `@model` message may exceed it */
 const MAX_ROUNDTABLE_TURNS_PER_REVIEWER = 2;
 
@@ -203,7 +229,9 @@ function createToolResult(block: ToolCall, text: string, isError: boolean): Tool
 export type ModelStreamFn = (
 	model: Model,
 	context: Context,
-	options: Pick<SimpleStreamOptions, "apiKey" | "reasoning" | "disableReasoning" | "toolChoice"> & { signal: AbortSignal },
+	options: Pick<SimpleStreamOptions, "apiKey" | "reasoning" | "disableReasoning" | "toolChoice" | "promptCacheKey"> & {
+		signal: AbortSignal;
+	},
 ) => AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> };
 
 export interface CouncilSessionOptions {
@@ -223,6 +251,10 @@ export interface CouncilSessionOptions {
 	referencedFiles?: readonly PlanFileExcerpt[];
 	/** how long a model stream may go without any event before its request is abandoned; default 180s */
 	modelStallMs?: number;
+	/** a fast model that groups revisions into an agenda and frames each debate turn; omit for no moderator */
+	moderator?: { model: Model; thinkingLevel?: ConfiguredThinkingLevel };
+	/** a moderator call that has not answered after this long is abandoned; default 20s */
+	moderatorTimeoutMs?: number;
 }
 
 export function extractSessionGoalContext(entries: readonly SessionEntry[], maxChars = 2000): string | undefined {
@@ -301,6 +333,17 @@ export class CouncilSession {
 	 * operator messages from this index on were sent after the operator could see the question
 	 */
 	#questionReportedAt = new Map<string, number>();
+	#moderator?: { model: Model; thinkingLevel?: ConfiguredThinkingLevel };
+	#moderatorTimeoutMs: number;
+	/** topics over the held revision items; maintained only when a moderator is configured */
+	#agenda: AgendaTopic[] = [];
+	/** next never-used topic number, so a dropped `T<n>` is never reissued */
+	#nextTopicNumber = 1;
+	/** items placed on the agenda mechanically since the moderator last saw it; the only ones it may move */
+	#provisionalItemIds = new Set<string>();
+	/** the round whose moderator call is in flight */
+	#moderatingController?: AbortController;
+	#moderatorError?: string;
 
 	/** preserve reviewer request options when forwarding to the native model stream */
 	constructor(options: CouncilSessionOptions) {
@@ -316,6 +359,8 @@ export class CouncilSession {
 		this.#maxReaderQueriesPerTurn = Math.min(6, Math.max(1, Math.round(options.maxReaderQueriesPerTurn ?? 3)));
 		this.#referencedFiles = [...(options.referencedFiles ?? [])];
 		this.#modelStallMs = options.modelStallMs ?? DEFAULT_MODEL_STALL_MS;
+		this.#moderator = options.moderator;
+		this.#moderatorTimeoutMs = options.moderatorTimeoutMs ?? DEFAULT_MODERATOR_TIMEOUT_MS;
 
 		this.#streamFn =
 			options.streamFn ??
@@ -393,6 +438,29 @@ export class CouncilSession {
 		return this.#pendingAsks.length;
 	}
 
+	/** the moderator model, e.g. `gpt-4o-mini (openai) · thinking: low`; undefined without a moderator */
+	get moderatorLabel(): string | undefined {
+		const moderator = this.#moderator;
+		if (!moderator) return undefined;
+		const level = moderator.thinkingLevel ? ` · thinking: ${moderator.thinkingLevel}` : "";
+		return `${moderator.model.id} (${moderator.model.provider})${level}`;
+	}
+
+	/** a moderator request of the running round is in flight */
+	isModerating(): boolean {
+		return this.#busy && this.#moderatingController !== undefined && this.#moderatingController === this.#roundAbortController;
+	}
+
+	/** why the latest moderator call failed; cleared by the next successful one */
+	get moderatorError(): string | undefined {
+		return this.#moderatorError;
+	}
+
+	/** the agenda with each topic's status; empty without a moderator */
+	getAgenda(): AgendaTopicStatus[] {
+		return agendaStatuses(this.#agenda, this.getConvergence());
+	}
+
 	/** a round is running, or an auto run that has not been stopped is between stages */
 	isActive(): boolean {
 		return this.#busy || (this.#autoRun !== undefined && !this.#autoRun.stopped);
@@ -417,6 +485,7 @@ export class CouncilSession {
 		}
 		const keySet = new Set(keys);
 		this.#activeReviewers = this.#availableReviewers.filter(r => keySet.has(r.key));
+		this.#reconcileAgenda();
 		this.#emitChange();
 	}
 
@@ -493,7 +562,9 @@ export class CouncilSession {
 	 * Round 2+ is a sequential roundtable: each speaker sees earlier speakers' replies and position updates from
 	 * the same round. The floor is reactive: a reviewer named by `nextSpeaker` and the authors of items a speaker
 	 * disputes speak next, peers who already spoke confirm new wording, and a queued `@model` operator message gives
-	 * that reviewer the next turn. The round ends when no one is queued or every held revision is agreed.
+	 * that reviewer the next turn. A configured moderator sets the agenda when the round opens and, before each turn,
+	 * may pick which queued reviewer speaks and pose them one question; it never adds turns or ends the round. The
+	 * round ends when no one is queued or every held revision is agreed.
 	 */
 	async runDebateRound(): Promise<void> {
 		if (this.#busy) {
@@ -524,28 +595,52 @@ export class CouncilSession {
 		const queue = this.#orderDebateSpeakers();
 		const turnsStarted = new Map<string, number>();
 		let step = 0;
+		// one failed moderator call benches the moderator for the rest of the round
+		let moderatorOn = this.#moderator !== undefined;
+		let framing: TurnFraming | undefined;
+		let handedOff = false;
 		try {
+			if (moderatorOn) {
+				this.#reconcileAgenda();
+				if (this.#heldItems().length > 0) {
+					const opening = await this.#callModerator<typeof setAgendaSchema.infer>(
+						controller,
+						SET_AGENDA_TOOL,
+						renderModeratorAgenda({
+							planTitle: this.#planTitle,
+							planFilePath: this.#planFilePath,
+							snapshot: this.#moderatorSnapshot(queue),
+						}),
+					);
+					if (opening) {
+						const update = applyAgenda(opening, this.#agenda, this.#heldItems(), this.#nextTopicNumber);
+						this.#agenda = update.topics;
+						this.#nextTopicNumber = update.nextTopicNumber;
+						this.#provisionalItemIds.clear();
+						framing = pickFraming(opening, queue, this.#agenda);
+						this.#emitChange();
+					} else {
+						moderatorOn = false;
+					}
+				}
+			}
+
 			while (!controller.signal.aborted) {
 				let reviewer: ReviewerMember;
+				let turnFraming: TurnFraming | undefined;
 				const preempt = this.#operatorPreemptedSpeaker();
 				if (preempt) {
 					const at = queue.findIndex(r => r.key === preempt.key);
 					if (at !== -1) queue.splice(at, 1);
 					reviewer = preempt;
 				} else {
-					const next = queue[0];
-					if (!next) break;
-					if (
-						step > 0 &&
-						!startedConverged &&
-						this.getConvergence().converged &&
-						queue.every(s => !this.#hasUnseenOperatorInput(s.key))
-					) {
-						break;
-					}
-					queue.shift();
-					reviewer = next;
+					if (!this.#roundContinues(queue, step, startedConverged)) break;
+					// a speaker's explicit handoff outranks the moderator's pick; its question still applies to that speaker
+					const framed = framing && !handedOff ? queue.findIndex(r => r.key === framing?.speakerKey) : -1;
+					[reviewer] = queue.splice(framed === -1 ? 0 : framed, 1);
+					if (framing?.speakerKey === reviewer.key) turnFraming = framing;
 				}
+				framing = undefined;
 				step++;
 				turnsStarted.set(reviewer.key, (turnsStarted.get(reviewer.key) ?? 0) + 1);
 				const before = this.#latestDefinedPosition(reviewer.key);
@@ -558,6 +653,7 @@ export class CouncilSession {
 					...unseen.userEntries.map(u => (u.targetLabel ? `[To ${u.targetLabel}]: ${u.text}` : u.text)),
 					...unseen.operatorReaderEntries.map(r => `[Operator → Reader]: ${r.question}\n[Reader]: ${r.answer}`),
 				];
+				const framedTopic = this.#agenda.find(t => t.id === turnFraming?.topicId);
 				const promptText = renderDebateRebuttal({
 					round: roundNum,
 					peerCritiques: unseen.peerTurns.map(e => ({
@@ -574,6 +670,12 @@ export class CouncilSession {
 					},
 					operatorNotes: notes.length > 0 ? notes.join("\n\n") : undefined,
 					hasCodeReader: Boolean(this.#codeReader),
+					moderator: turnFraming && {
+						topicId: framedTopic?.id,
+						topicTitle: framedTopic?.title,
+						question: turnFraming.question,
+					},
+					agenda: this.#agenda.length > 0 ? this.#agenda : undefined,
 				});
 
 				let history = this.#histories.get(reviewer.key);
@@ -603,6 +705,9 @@ export class CouncilSession {
 					text: "",
 					startedAt: Date.now(),
 					roundtableTurn: { step },
+					...(turnFraming
+						? { moderation: { ...(framedTopic ? { topicId: framedTopic.id } : {}), question: turnFraming.question } }
+						: {}),
 				};
 				this.#entries.push(entry);
 				this.#emitChange();
@@ -615,14 +720,53 @@ export class CouncilSession {
 					promptedItemIds,
 					forcePosition: true,
 				});
+				handedOff = false;
 				// a failed or aborted turn leaves everything unseen so the retry delivers it again
-				if (entry.status === "done") {
-					this.#markSeen(reviewer.key, [...unseen.consumedPeerIds, ...unseen.consumedOperatorIds]);
-					// a queued message every addressee has now read in a debate turn needs no reply pass
-					this.#pendingAsks = this.#pendingAsks.filter(
-						p => p.kind === "reader" || p.reviewers.some(r => !this.#seenSet(r.key).has(p.userEntry.id)),
+				if (entry.status !== "done") continue;
+				this.#markSeen(reviewer.key, [...unseen.consumedPeerIds, ...unseen.consumedOperatorIds]);
+				// a queued message every addressee has now read in a debate turn needs no reply pass
+				this.#pendingAsks = this.#pendingAsks.filter(
+					p => p.kind === "reader" || p.reviewers.some(r => !this.#seenSet(r.key).has(p.userEntry.id)),
+				);
+				handedOff = this.#enqueueReactions(queue, reviewer, before, entry, turnsStarted);
+
+				if (
+					moderatorOn &&
+					this.#heldItems().length > 0 &&
+					this.#roundContinues(queue, step, startedConverged) &&
+					this.#preemptableAsk() === undefined
+				) {
+					const shown = [...this.#provisionalItemIds];
+					const ended = formatEndedTurn(entry.text, entry.positionDelta, entry.position?.verdict);
+					const turn = await this.#callModerator<typeof moderateTurnSchema.infer>(
+						controller,
+						MODERATE_TURN_TOOL,
+						renderModeratorTurn({
+							planTitle: this.#planTitle,
+							planFilePath: this.#planFilePath,
+							snapshot: this.#moderatorSnapshot(queue),
+							provisional: shown.length > 0 ? this.#formatProvisional(shown) : undefined,
+							turnLabel: `${reviewer.label} · Round ${roundNum} turn ${step}`,
+							turnText: ended.text,
+							turnDelta: ended.delta,
+						}),
 					);
-					this.#enqueueReactions(queue, reviewer, before, entry, turnsStarted);
+					if (turn) {
+						const update = applyAssignments(
+							turn,
+							this.#agenda,
+							this.#heldItems(),
+							new Set(shown),
+							this.#nextTopicNumber,
+						);
+						this.#agenda = update.topics;
+						this.#nextTopicNumber = update.nextTopicNumber;
+						for (const id of shown) this.#provisionalItemIds.delete(id);
+						framing = pickFraming(turn, queue, this.#agenda);
+						this.#emitChange();
+					} else {
+						moderatorOn = false;
+					}
 				}
 			}
 		} finally {
@@ -959,6 +1103,7 @@ export class CouncilSession {
 					apiKey,
 					reasoning: toReasoningEffort(level),
 					disableReasoning: shouldDisableReasoning(level),
+					...this.#cacheKeyOption(reviewer.key),
 				});
 				// prose from a continuation step starts its own paragraph
 				const separator = stepMessages.length > 0 && entry.text.trim() && !entry.text.endsWith("\n\n") ? "\n\n" : "";
@@ -1148,6 +1293,7 @@ export class CouncilSession {
 			}
 			entry.readerStatus = undefined;
 			entry.finishedAt = Date.now();
+			if (entry.status === "done") this.#reconcileAgenda();
 			this.#emitChange();
 		}
 	}
@@ -1171,6 +1317,7 @@ export class CouncilSession {
 			throw new Error("Run at least one critique or message before synthesizing.");
 		}
 
+		this.#reconcileAgenda();
 		const controller = this.#beginRound();
 
 		const historyLines: string[] = [];
@@ -1186,6 +1333,8 @@ export class CouncilSession {
 		}
 		const reviewerPositions = this.#reviewerPositions();
 		const convergence = computeConvergence(reviewerPositions);
+		const agenda = this.getAgenda();
+		if (agenda.length > 0) historyLines.push(`### Agenda\n${formatAgenda(agenda)}\n`);
 		historyLines.push(`### Reported Positions\n${formatReportedPositions(reviewerPositions)}\n`);
 		historyLines.push(`### Convergence\n${formatConvergence(convergence, convergence.items)}\n`);
 
@@ -1226,6 +1375,7 @@ export class CouncilSession {
 				apiKey,
 				reasoning: toReasoningEffort(level),
 				disableReasoning: shouldDisableReasoning(level),
+				...this.#cacheKeyOption("synthesis"),
 			});
 			for await (const event of stream) {
 				stall.touch();
@@ -1304,6 +1454,7 @@ export class CouncilSession {
 					reasoning: toReasoningEffort(level),
 					disableReasoning: shouldDisableReasoning(level),
 					toolChoice: { type: "function", name: REPORT_POSITION_TOOL_NAME },
+					...this.#cacheKeyOption(reviewer.key),
 				},
 			);
 			// the forced report is bookkeeping, not part of the visible review text
@@ -1475,22 +1626,41 @@ export class CouncilSession {
 		return [...this.#activeReviewers].sort((a, b) => (scores.get(a.key) ?? 0) - (scores.get(b.key) ?? 0));
 	}
 
-	/** the reviewer a queued `@model` message names, once per message, while that reviewer has not read it */
-	#operatorPreemptedSpeaker(): ReviewerMember | undefined {
+	/** the queued `@model` message whose single addressee is active and has not read it, without claiming it */
+	#preemptableAsk(): { ask: PendingAsk & { kind: "ask" }; reviewer: ReviewerMember } | undefined {
 		for (const ask of this.#pendingAsks) {
 			if (ask.kind !== "ask" || ask.preempted || ask.reviewers.length !== 1) continue;
-			const target = this.#activeReviewers.find(r => r.key === ask.reviewers[0].key);
-			if (!target || this.#seenSet(target.key).has(ask.userEntry.id)) continue;
-			ask.preempted = true;
-			return target;
+			const reviewer = this.#activeReviewers.find(r => r.key === ask.reviewers[0].key);
+			if (reviewer && !this.#seenSet(reviewer.key).has(ask.userEntry.id)) return { ask, reviewer };
 		}
 		return undefined;
+	}
+
+	/** the reviewer a queued `@model` message names, claiming the message so it preempts only once */
+	#operatorPreemptedSpeaker(): ReviewerMember | undefined {
+		const found = this.#preemptableAsk();
+		if (!found) return undefined;
+		found.ask.preempted = true;
+		return found.reviewer;
+	}
+
+	/** the debate loop's continuation check, shared with the decision to call the moderator */
+	#roundContinues(queue: readonly ReviewerMember[], step: number, startedConverged: boolean): boolean {
+		if (queue.length === 0) return false;
+		// an operator-requested round on an already converged council runs every speaker
+		return (
+			step === 0 ||
+			startedConverged ||
+			!this.getConvergence().converged ||
+			queue.some(s => this.#hasUnseenOperatorInput(s.key))
+		);
 	}
 
 	/**
 	 * route the floor after a completed debate turn: the peer the speaker named in `nextSpeaker`, then the authors of
 	 * items it disputes, speak next; when it reported new wording, peers who already spoke are re-queued last to
-	 * confirm it. Only reviewers under MAX_ROUNDTABLE_TURNS_PER_REVIEWER this round are added.
+	 * confirm it. Only reviewers under MAX_ROUNDTABLE_TURNS_PER_REVIEWER this round are added. Returns whether the
+	 * speaker's handoff put a peer at the head of the queue.
 	 */
 	#enqueueReactions(
 		queue: ReviewerMember[],
@@ -1498,15 +1668,17 @@ export class CouncilSession {
 		before: ReviewerPosition | undefined,
 		entry: ReviewerTurnEntry,
 		turnsStarted: ReadonlyMap<string, number>,
-	): void {
+	): boolean {
 		const position = entry.position;
-		if (!position) return;
+		if (!position) return false;
 		const canSpeak = (r: ReviewerMember) =>
 			r.key !== speaker.key && (turnsStarted.get(r.key) ?? 0) < MAX_ROUNDTABLE_TURNS_PER_REVIEWER;
 		const front: ReviewerMember[] = [];
 
-		const handoff = position.nextSpeaker ? this.#matchPeerHandle(position.nextSpeaker, speaker.key) : undefined;
-		if (handoff && canSpeak(handoff)) front.push(handoff);
+		const peers = this.#activeReviewers.filter(r => r.key !== speaker.key);
+		const handoff = position.nextSpeaker ? matchReviewerHandle(position.nextSpeaker, peers) : undefined;
+		const handedOff = handoff !== undefined && canSpeak(handoff);
+		if (handoff && handedOff) front.push(handoff);
 
 		const disputedIds = position.positions.filter(p => p.stance === "dispute").map(p => p.id);
 		for (const owner of this.#activeReviewers) {
@@ -1537,16 +1709,119 @@ export class CouncilSession {
 			if (at !== -1) queue.splice(at, 1);
 		}
 		queue.unshift(...front);
+		return handedOff;
 	}
 
-	/** the active peer a `nextSpeaker` handle names: exact model id or key, else a unique substring match */
-	#matchPeerHandle(handle: string, speakerKey: string): ReviewerMember | undefined {
-		const token = handle.toLowerCase();
-		const peers = this.#activeReviewers.filter(r => r.key !== speakerKey);
-		const exact = peers.find(r => r.model.id.toLowerCase() === token || r.key.toLowerCase() === token);
-		if (exact) return exact;
-		const candidates = peers.filter(r => r.model.id.toLowerCase().includes(token) || r.key.toLowerCase().includes(token));
-		return candidates.length === 1 ? candidates[0] : undefined;
+	/** every revision the active reviewers currently hold, in roster order */
+	#heldItems(): RevisionItem[] {
+		return this.#activeReviewers.flatMap(r => this.#latestPosition(r.key)?.revisions ?? []);
+	}
+
+	/** model-free agenda upkeep after any position or roster change; a no-op without a moderator */
+	#reconcileAgenda(): void {
+		if (!this.#moderator) return;
+		const held = this.#heldItems();
+		const update = reconcileAgenda(this.#agenda, held, this.#nextTopicNumber);
+		this.#agenda = update.topics;
+		this.#nextTopicNumber = update.nextTopicNumber;
+		const heldIds = new Set(held.map(item => item.id));
+		for (const id of this.#provisionalItemIds) {
+			if (!heldIds.has(id)) this.#provisionalItemIds.delete(id);
+		}
+		for (const id of update.placedIds) this.#provisionalItemIds.add(id);
+	}
+
+	#moderatorSnapshot(queue: readonly ReviewerMember[]): string {
+		return formatModeratorSnapshot({
+			agenda: this.getAgenda(),
+			reviewers: this.getReviewerPositions(),
+			convergence: this.getConvergence(),
+			queue,
+		});
+	}
+
+	/** `- id → T3` per provisionally placed item */
+	#formatProvisional(itemIds: readonly string[]): string {
+		const topicOf = new Map(this.#agenda.flatMap(topic => topic.itemIds.map(id => [id, topic.id] as const)));
+		return itemIds.map(id => `- \`${id}\` → ${topicOf.get(id) ?? "(none)"}`).join("\n");
+	}
+
+	/** a stable prompt-cache key per caller, so each caller's requests share one cache affinity */
+	#cacheKeyOption(caller: string): { promptCacheKey?: string } {
+		return this.#sessionId ? { promptCacheKey: `${this.#sessionId}:${caller}` } : {};
+	}
+
+	/**
+	 * one forced-tool moderator request for the round `controller` owns. It never throws and never outlives its
+	 * deadline: on timeout or abort it returns undefined at once and leaves the stream to settle unobserved. Every
+	 * effect is skipped when the round is no longer current, since an abort frees the session for a new round.
+	 */
+	async #callModerator<T>(controller: AbortController, tool: Tool, promptText: string): Promise<T | undefined> {
+		const moderator = this.#moderator;
+		if (!moderator) return undefined;
+		const own = new AbortController();
+		this.#moderatingController = controller;
+		this.#emitChange();
+
+		const { promise: cutoff, resolve: cut } = Promise.withResolvers<{ error?: string }>();
+		const timer = setTimeout(
+			() => cut({ error: `no answer within ${Math.round(this.#moderatorTimeoutMs / 1000)}s` }),
+			this.#moderatorTimeoutMs,
+		);
+		const onAbort = () => cut({});
+		controller.signal.addEventListener("abort", onAbort, { once: true });
+		let outcome: { args?: T; error?: string };
+		try {
+			outcome = await Promise.race([
+				this.#requestModerator<T>(moderator, tool, promptText, AbortSignal.any([controller.signal, own.signal])),
+				cutoff,
+			]);
+		} finally {
+			clearTimeout(timer);
+			controller.signal.removeEventListener("abort", onAbort);
+			own.abort();
+		}
+
+		if (this.#roundAbortController !== controller || controller.signal.aborted) return undefined;
+		this.#moderatingController = undefined;
+		this.#moderatorError = outcome.args === undefined ? (outcome.error ?? "no result") : undefined;
+		this.#emitChange();
+		return outcome.args;
+	}
+
+	async #requestModerator<T>(
+		moderator: { model: Model; thinkingLevel?: ConfiguredThinkingLevel },
+		tool: Tool,
+		promptText: string,
+		signal: AbortSignal,
+	): Promise<{ args?: T; error?: string }> {
+		try {
+			const apiKey = this.#getApiKey ? await this.#getApiKey(moderator.model) : undefined;
+			const level = concreteThinkingLevel(moderator.thinkingLevel);
+			const stream = this.#streamFn(
+				moderator.model,
+				{ systemPrompt: [renderModeratorSystem()], messages: [createUserMessage(promptText)], tools: [tool] },
+				{
+					signal,
+					apiKey,
+					reasoning: toReasoningEffort(level),
+					disableReasoning: shouldDisableReasoning(level),
+					toolChoice: { type: "function", name: tool.name },
+					...this.#cacheKeyOption("moderator"),
+				},
+			);
+			for await (const _event of stream) {
+				// only the final tool call matters
+			}
+			const msg = await stream.result();
+			if (msg.stopReason === "error") return { error: msg.errorMessage || "request failed" };
+			if (msg.stopReason === "aborted") return { error: "request aborted" };
+			const call = msg.content.find((block): block is ToolCall => block.type === "toolCall" && block.name === tool.name);
+			if (!call) return { error: `no ${tool.name} call` };
+			return { args: validateToolArguments(tool, call) as T };
+		} catch (err) {
+			return { error: err instanceof Error ? err.message : String(err) };
+		}
 	}
 
 	#completedReviewerCount(): number {
@@ -1690,6 +1965,7 @@ export class CouncilSession {
 		this.#busy = false;
 		this.#roundAbortController = null;
 		this.#activeSpeaker = undefined;
+		if (this.#moderatingController === controller) this.#moderatingController = undefined;
 	}
 
 	abortActiveRound(): void {
@@ -1719,6 +1995,7 @@ export class CouncilSession {
 		this.#pendingAsks = [];
 		this.#busy = false;
 		this.#activeSpeaker = undefined;
+		this.#moderatingController = undefined;
 		this.#emitChange();
 	}
 

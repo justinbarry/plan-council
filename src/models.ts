@@ -61,6 +61,7 @@ export const COUNCIL_ROLE_CHAINS = {
 	council3: ["@council3", "@slow", "@advisor", "@reasoning"],
 	synthesizer: ["@council_synthesizer", "@council-synth", "@plan", "@slow", "@default"],
 	reader: ["@council_reader", "@council-reader", "@smol", "@fast", "@default"],
+	moderator: ["@council_moderator", "@council-moderator", "@smol", "@fast"],
 };
 
 /** resolve a council role through its existing model fallback chain */
@@ -258,9 +259,45 @@ export function resolveCouncilRoster(models: ExtensionModelQuery, settings: Plan
 	};
 }
 
-export interface ResolvedSynthesizer {
+export interface ResolvedRoleModel {
 	model: Model;
 	thinkingLevel?: ConfiguredThinkingLevel;
+}
+
+/** resolve a role model: an explicit selector with optional thinking suffix, else the role chain, else a last-resort model */
+export function resolveRoleModel(
+	models: ExtensionModelQuery,
+	spec: string | undefined,
+	chain: readonly string[],
+	lastResort: Model | undefined,
+): ResolvedRoleModel | undefined {
+	const trimmed = spec?.trim();
+	if (trimmed) {
+		const { base, level } = splitThinkingSuffix(trimmed, -1, MAX_THINKING_SUFFIX_OPTIONS);
+		// resolve the full selector first to preserve model ids with a literal thinking suffix
+		const selection = resolveRoleWithBackup(models, trimmed) ?? (level ? resolveRoleWithBackup(models, base) : undefined);
+		if (selection) {
+			const resolved = selection.model;
+			const literalId =
+				trimmed.toLowerCase() === resolved.id.toLowerCase() ||
+				trimmed.toLowerCase() === modelKey(resolved).toLowerCase();
+			return {
+				model: resolved,
+				thinkingLevel: supportedThinkingLevel(resolved, (literalId ? undefined : level) ?? selection.thinkingLevel),
+			};
+		}
+	}
+
+	// a fallback role uses its own level; an unresolved selector's suffix is not carried over
+	for (const candidate of chain) {
+		const selection = resolveModelSpec(models, candidate);
+		if (selection) {
+			return { model: selection.model, thinkingLevel: supportedThinkingLevel(selection.model, selection.thinkingLevel) };
+		}
+	}
+
+	// the session model and reviewers carry no level
+	return lastResort ? { model: lastResort } : undefined;
 }
 
 /** the synthesizer model and its level: an explicit suffix, else the level its role configures */
@@ -268,38 +305,13 @@ export function resolveSynthesizer(
 	models: ExtensionModelQuery,
 	settings: PlanCouncilSettings,
 	activeReviewers: readonly ReviewerMember[],
-): ResolvedSynthesizer | undefined {
-	if (settings.synthesizerModel) {
-		const spec = settings.synthesizerModel.trim();
-		const { base, level } = splitThinkingSuffix(spec, -1, MAX_THINKING_SUFFIX_OPTIONS);
-		// resolve the full selector first to preserve model ids with a literal thinking suffix
-		const selection = resolveRoleWithBackup(models, spec) ?? (level ? resolveRoleWithBackup(models, base) : undefined);
-		if (selection) {
-			const resolved = selection.model;
-			const literalId = spec.toLowerCase() === resolved.id.toLowerCase() || spec.toLowerCase() === modelKey(resolved).toLowerCase();
-			return {
-				model: resolved,
-				thinkingLevel: supportedThinkingLevel(resolved, (literalId ? undefined : level) ?? selection.thinkingLevel),
-			};
-		}
-	}
-
-	// a fallback role uses its own level; an unresolved selector's suffix is not carried over
-	for (const candidate of COUNCIL_ROLE_CHAINS.synthesizer) {
-		const selection = resolveModelSpec(models, candidate);
-		if (selection) {
-			return { model: selection.model, thinkingLevel: supportedThinkingLevel(selection.model, selection.thinkingLevel) };
-		}
-	}
-
-	// the session model and reviewers carry no level for synthesis
-	const model = models.current() ?? activeReviewers[0]?.model;
-	return model ? { model } : undefined;
-}
-
-export interface ResolvedReaderModel {
-	model: Model;
-	thinkingLevel?: ConfiguredThinkingLevel;
+): ResolvedRoleModel | undefined {
+	return resolveRoleModel(
+		models,
+		settings.synthesizerModel,
+		COUNCIL_ROLE_CHAINS.synthesizer,
+		models.current() ?? activeReviewers[0]?.model,
+	);
 }
 
 /** the shared codebase reader and its level: an explicit suffix, else the level its role configures */
@@ -307,31 +319,34 @@ export function resolveReaderModel(
 	models: ExtensionModelQuery,
 	settings: PlanCouncilSettings,
 	activeReviewers: readonly ReviewerMember[],
-): ResolvedReaderModel | undefined {
-	const spec = settings.readerModel?.trim();
-	if (spec) {
-		const { base, level } = splitThinkingSuffix(spec, -1, MAX_THINKING_SUFFIX_OPTIONS);
-		// resolve the full selector first to preserve model ids with a literal thinking suffix
-		const selection = resolveRoleWithBackup(models, spec) ?? (level ? resolveRoleWithBackup(models, base) : undefined);
-		if (selection) {
-			const resolved = selection.model;
-			const literalId = spec.toLowerCase() === resolved.id.toLowerCase() || spec.toLowerCase() === modelKey(resolved).toLowerCase();
-			return {
-				model: resolved,
-				thinkingLevel: supportedThinkingLevel(resolved, (literalId ? undefined : level) ?? selection.thinkingLevel),
-			};
-		}
-	}
-
-	// a fallback role uses its own level; an unresolved selector's suffix is not carried over
-	for (const candidate of COUNCIL_ROLE_CHAINS.reader) {
-		const selection = resolveModelSpec(models, candidate);
-		if (selection) {
-			return { model: selection.model, thinkingLevel: supportedThinkingLevel(selection.model, selection.thinkingLevel) };
-		}
-	}
-
-	// the session model and reviewers carry no level for the reader
-	const model = models.current() ?? activeReviewers[0]?.model;
-	return model ? { model } : undefined;
+): ResolvedRoleModel | undefined {
+	return resolveRoleModel(
+		models,
+		settings.readerModel,
+		COUNCIL_ROLE_CHAINS.reader,
+		models.current() ?? activeReviewers[0]?.model,
+	);
 }
+
+export function resolveModeratorModel(
+	models: ExtensionModelQuery,
+	settings: PlanCouncilSettings,
+): ResolvedRoleModel | undefined {
+	return resolveRoleModel(
+		models,
+		settings.moderatorModel,
+		COUNCIL_ROLE_CHAINS.moderator,
+		undefined,
+	);
+}
+
+/** the reviewer a `@model` handle names: exact model id or key first, else a unique substring match */
+export function matchReviewerHandle(handle: string, reviewers: readonly ReviewerMember[]): ReviewerMember | undefined {
+	const token = handle.trim().replace(/^@+/, "").toLowerCase();
+	if (!token) return undefined;
+	const exact = reviewers.find(r => r.model.id.toLowerCase() === token || r.key.toLowerCase() === token);
+	if (exact) return exact;
+	const candidates = reviewers.filter(r => r.model.id.toLowerCase().includes(token) || r.key.toLowerCase().includes(token));
+	return candidates.length === 1 ? candidates[0] : undefined;
+}
+

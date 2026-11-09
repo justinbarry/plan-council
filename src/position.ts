@@ -11,7 +11,12 @@ export const REPORT_POSITION_TOOL_NAME = "report_position";
 
 export const positionSchema = type({
 	verdict: type("'APPROVE' | 'NEEDS REVISION' | 'BLOCK'").describe("Your current bottom-line verdict on the plan."),
-	revisions: type({ summary: type("string > 0").describe("One required plan change, one sentence.") })
+	revisions: type({
+		summary: type("string > 0").describe("One required plan change, one sentence."),
+		"concern?": type("string").describe(
+			'A few words naming the problem this change addresses, e.g. "negative budget handling". Reuse a peer\'s label when it is the same problem.',
+		),
+	})
 		.array()
 		.describe(
 			"Your complete standing set of still-required plan changes, including settled ones your prose no longer repeats. Reuse an unchanged prior summary verbatim, update a narrowed summary, and omit retracted ones. Empty only when you require no changes.",
@@ -43,7 +48,12 @@ export const REPORT_POSITION_TOOL: Tool = {
 export interface RevisionItem {
 	id: string;
 	summary: string;
+	/** a few words naming the problem the revision fixes; peers reuse labels for the same problem */
+	concern?: string;
 }
+
+/** labels longer than this are cut; a label is a topic name, not a sentence */
+const MAX_CONCERN_LENGTH = 60;
 
 export interface ItemPosition {
 	id: string;
@@ -105,7 +115,10 @@ export function validateReportedPosition(
 	const question = args.questionForOperator?.trim();
 	return {
 		verdict: args.verdict,
-		revisions: args.revisions.map((r, index) => ({ id: `${reviewerKey}#${index + 1}`, summary: r.summary })),
+		revisions: args.revisions.map((r, index) => {
+			const concern = r.concern?.trim().replace(/\s+/g, " ").slice(0, MAX_CONCERN_LENGTH).trim();
+			return { id: `${reviewerKey}#${index + 1}`, summary: r.summary, ...(concern ? { concern } : {}) };
+		}),
 		positions: args.positions.map(p => ({ id: p.id, stance: p.stance, reason: p.reason ?? "" })),
 		promptedItemIds: [...promptedItemIds],
 		...(next ? { nextSpeaker: next } : {}),
@@ -119,11 +132,12 @@ function normalizeSummary(summary: string): string {
 
 /**
  * keep a revision's ID while its summary is unchanged (ignoring case and whitespace) so peer stances stay attached
- * to the same item; a new or reworded summary gets a never-used `#N`, so peers must judge the new wording
+ * to the same item; a new or reworded summary gets a never-used `#N`, so peers must judge the new wording. The
+ * concern label follows the new report, so relabeling never changes an ID.
  */
 export function stabilizeRevisionIds(
 	reviewerKey: string,
-	summaries: readonly { summary: string }[],
+	reported: readonly { summary: string; concern?: string }[],
 	previous: readonly RevisionItem[],
 	nextNumber: number,
 ): { revisions: RevisionItem[]; nextNumber: number } {
@@ -134,12 +148,13 @@ export function stabilizeRevisionIds(
 		if (Number.isInteger(n) && n >= seq) seq = n + 1;
 	}
 
-	const revisions = summaries.map(({ summary }) => {
+	const revisions = reported.map(({ summary, concern }) => {
+		const label = concern ? { concern } : {};
 		const normalized = normalizeSummary(summary);
 		const index = available.findIndex(item => normalizeSummary(item.summary) === normalized);
-		if (index === -1) return { id: `${reviewerKey}#${seq++}`, summary };
+		if (index === -1) return { id: `${reviewerKey}#${seq++}`, summary, ...label };
 		const [matched] = available.splice(index, 1);
-		return { id: matched.id, summary };
+		return { id: matched.id, summary, ...label };
 	});
 	return { revisions, nextNumber: seq };
 }
@@ -182,6 +197,21 @@ export function isEmptyPositionDelta(delta: PositionDelta): boolean {
 		delta.agreed.length === 0 &&
 		delta.disputed.length === 0
 	);
+}
+
+/** `provider/model#N` without the provider, which is enough to tell reviewers apart in summaries */
+export function shortRevisionId(id: string): string {
+	return id.replace(/^[^/]+\//, "");
+}
+
+/** the non-verdict parts of a delta in reading order: dropped, added (with wording), newly agreed, newly disputed */
+export function positionDeltaSegments(delta: PositionDelta): string[] {
+	const segments: string[] = [];
+	if (delta.dropped.length > 0) segments.push(`dropped ${delta.dropped.map(r => shortRevisionId(r.id)).join(", ")}`);
+	for (const item of delta.added) segments.push(`added ${shortRevisionId(item.id)} "${item.summary}"`);
+	if (delta.agreed.length > 0) segments.push(`agrees ${delta.agreed.map(shortRevisionId).join(", ")}`);
+	if (delta.disputed.length > 0) segments.push(`disputes ${delta.disputed.map(shortRevisionId).join(", ")}`);
+	return segments;
 }
 
 /** answer every tool call in the message (providers reject unanswered calls) and extract the last valid report */
@@ -294,9 +324,10 @@ export function formatReportedPositions(reviewers: { label: string; position?: R
 		.map(({ label, position }) => {
 			if (!position) return `- ${label}: no position reported`;
 			if (position.revisions.length === 0) return `- ${label}: ${position.verdict}, no required revisions`;
-			return [`- ${label}: ${position.verdict}`, ...position.revisions.map(r => `  - \`${r.id}\`: ${r.summary}`)].join(
-				"\n",
-			);
+			return [
+				`- ${label}: ${position.verdict}`,
+				...position.revisions.map(r => `  - \`${r.id}\`: ${r.summary}${r.concern ? ` [concern: ${r.concern}]` : ""}`),
+			].join("\n");
 		})
 		.join("\n");
 }

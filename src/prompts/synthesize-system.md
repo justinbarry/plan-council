@@ -5,6 +5,7 @@ Guidelines:
 2. Discard points that were retracted, resolved, or debunked during peer debate.
 3. Consolidate overlapping critique points from different models into clear, actionable requirements.
 4. Structure the output cleanly so the planning agent can update the plan immediately.
+5. When the discussion includes a `### Agenda`, organize the required revisions by agenda topic. A topic marked "moderator: possibly the same change" is advisory: merge its items into one revision only when they are genuinely equivalent, and otherwise state every distinct requirement and alternative.
 
 Use the following Markdown structure:
 ## Summary of Council Review

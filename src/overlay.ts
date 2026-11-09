@@ -22,7 +22,14 @@ import {
 	READER_TARGET_KEY,
 	type ReviewerTurnEntry,
 } from "./council-session";
-import { isEmptyPositionDelta, openDisagreementCount, type PositionDelta, type ReviewerPosition } from "./position";
+import {
+	isEmptyPositionDelta,
+	openDisagreementCount,
+	type PositionDelta,
+	positionDeltaSegments,
+	type ReviewerPosition,
+	shortRevisionId,
+} from "./position";
 
 export type ApprovalChoice = "execute" | "compact" | "keep";
 
@@ -98,21 +105,12 @@ function formatElapsed(startedAt: number, finishedAt: number | undefined): strin
 /** one-line summary of how a turn moved its reviewer's position, e.g. `dropped gpt-4o#1 · added gpt-4o#2 "…"` */
 function formatPositionDelta(delta: PositionDelta, verdict: ReviewerPosition["verdict"]): string {
 	if (isEmptyPositionDelta(delta)) return theme.fg("muted", "position unchanged");
-	const shortId = (id: string) => id.replace(/^[^/]+\//, "");
-	const segments: string[] = [];
+	const segments = positionDeltaSegments(delta).map(segment => theme.fg("muted", replaceTabs(segment)));
 	if (delta.verdictFrom) {
-		segments.push(
+		segments.unshift(
 			`${theme.fg("muted", "verdict ")}${formatVerdictGlyph(delta.verdictFrom)}${theme.fg("muted", " → ")}${formatVerdictGlyph(verdict)}`,
 		);
 	}
-	if (delta.dropped.length > 0) {
-		segments.push(theme.fg("muted", `dropped ${delta.dropped.map(r => shortId(r.id)).join(", ")}`));
-	}
-	for (const item of delta.added) {
-		segments.push(theme.fg("muted", `added ${shortId(item.id)} "${replaceTabs(item.summary)}"`));
-	}
-	if (delta.agreed.length > 0) segments.push(theme.fg("muted", `agrees ${delta.agreed.map(shortId).join(", ")}`));
-	if (delta.disputed.length > 0) segments.push(theme.fg("muted", `disputes ${delta.disputed.map(shortId).join(", ")}`));
 	return segments.join(theme.fg("muted", " · "));
 }
 
@@ -380,7 +378,19 @@ export class PlanCouncilOverlay implements Component, Focusable {
 
 	/** a reviewer turn: header, error, body, then once done its position delta and any question for the operator */
 	#renderReviewerEntry(entry: ReviewerTurnEntry, contentWidth: number): string[] {
-		const lines = [this.#formatReviewerHeader(entry)];
+		const lines: string[] = [];
+		if (entry.moderation) {
+			const modelId =
+				this.#session.availableReviewers.find(r => r.key === entry.reviewerKey)?.model.id ?? entry.reviewerLabel;
+			const topic = entry.moderation.topicId ? ` · ${entry.moderation.topicId}` : "";
+			lines.push(
+				truncateToWidth(
+					theme.fg("muted", `Moderator → @${shortModelId(modelId)}${topic}: ${replaceTabs(entry.moderation.question)}`),
+					contentWidth,
+				),
+			);
+		}
+		lines.push(this.#formatReviewerHeader(entry));
 		if (entry.status === "error" && entry.errorMessage) {
 			lines.push(theme.fg("error", `  Error: ${replaceTabs(entry.errorMessage)}`));
 		}
@@ -465,8 +475,36 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			}
 		}
 
+		const agenda = this.#session.getAgenda();
+		if (agenda.length > 0) {
+			lines.push(`    ${theme.fg("accent", "Agenda")}`);
+			for (const topic of agenda) {
+				let status: string;
+				if (topic.status === "contested") status = theme.fg("error", "⚡ contested");
+				else if (topic.status === "open") status = theme.fg("warning", "○ open");
+				else status = theme.fg("success", "✓ settled");
+				const ids = topic.itemIds.map(id => shortIdByFullId.get(id) ?? shortRevisionId(id)).join(", ");
+				const same = topic.duplicates ? " · possibly the same change" : "";
+				lines.push(
+					truncateToWidth(
+						`      ${theme.fg("accent", topic.id)} · ${replaceTabs(topic.title)} · ${status}${theme.fg("muted", ` · ${ids}${same}`)}`,
+						contentWidth,
+					),
+				);
+			}
+		}
+		const moderatorError = this.#session.moderatorError;
+		if (moderatorError) {
+			lines.push(
+				truncateToWidth(
+					theme.fg("muted", `    ⚠ Moderator unavailable (${replaceTabs(moderatorError)}); default speaking order`),
+					contentWidth,
+				),
+			);
+		}
+
 		for (const d of convergence.disputes) {
-			const id = shortIdByFullId.get(d.id) ?? d.id.replace(/^[^/]+\//, "");
+			const id = shortIdByFullId.get(d.id) ?? shortRevisionId(d.id);
 			const reason = d.reason ? `: ${replaceTabs(d.reason)}` : "";
 			lines.push(
 				truncateToWidth(
@@ -538,7 +576,8 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			// a sequential debate round or Q&A pass names who holds the floor
 			const speaker = this.#session.activeSpeaker;
 			let busy = "";
-			if (speaker?.kind === "rebuttal") busy = ` · turn ${speaker.step} @${shortModelId(speaker.modelId)} ⏳`;
+			if (this.#session.isModerating()) busy = " · moderator ⏳";
+			else if (speaker?.kind === "rebuttal") busy = ` · turn ${speaker.step} @${shortModelId(speaker.modelId)} ⏳`;
 			else if (speaker) busy = ` · @${shortModelId(speaker.modelId)} replying ⏳`;
 			else if (this.#session.isBusy()) busy = " ⏳";
 			roundBadge = theme.fg("accent", ` [Round ${this.#session.round}${busy}]`);
@@ -739,6 +778,10 @@ export class PlanCouncilOverlay implements Component, Focusable {
 				"",
 				truncateToWidth(theme.fg("muted", `  Synthesizer: ${replaceTabs(synthLabel)}`), contentWidth),
 				truncateToWidth(theme.fg("muted", `  Codebase reader: ${replaceTabs(readerLabel)}`), contentWidth),
+				truncateToWidth(
+					theme.fg("muted", `  Moderator: ${replaceTabs(this.#session.moderatorLabel ?? "disabled")}`),
+					contentWidth,
+				),
 				...this.#renderWarnings(contentWidth),
 			);
 		}
