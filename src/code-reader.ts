@@ -1,15 +1,18 @@
 import { type, type Model, type Tool } from "@oh-my-pi/pi-ai";
-import { AgentRegistry, createAgentSession, SessionManager } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry, createAgentSession, SessionManager, Settings } from "@oh-my-pi/pi-coding-agent";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
+import { cfgToolsApproval } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { renderReaderQuery, renderReaderSystem } from "./prompts/render";
+import { createGitGhTool, createMcpReadTool } from "./reader-tools";
 import { StallTimer } from "./stall-timer";
 
 export const ASK_CODEBASE_TOOL_NAME = "ask_codebase";
 
 export const askCodebaseSchema = type({
 	question: type("string > 0").describe(
-		"Focused codebase verification question (symbols, signatures, file paths, line anchors, callers, or edge-case behavior). Batch related checks into one question.",
+		"Focused verification question: code (symbols, signatures, file paths, line anchors, callers, edge-case behavior), history and GitHub (commits, blame, PR/issue state, CI runs), external docs, or a connected service's read-only data. Batch related checks into one question.",
 	),
 	"paths?": type("string > 0")
 		.array()
@@ -19,7 +22,7 @@ export const askCodebaseSchema = type({
 export const ASK_CODEBASE_TOOL: Tool = {
 	name: ASK_CODEBASE_TOOL_NAME,
 	description:
-		"Message the council's shared read-only codebase subagent to verify files, symbols, signatures, callers, and tests against the repository before finalizing your review.",
+		"Message the council's shared read-only reader subagent to verify facts before finalizing your review: repository files, symbols, callers, and tests; git history and blame; GitHub PRs, issues, and CI runs; web docs; and read-only data from connected services.",
 	parameters: askCodebaseSchema,
 };
 
@@ -82,7 +85,12 @@ export interface CouncilCodeReaderOptions {
 const DEFAULT_QUERY_STALL_MS = 120_000;
 const DEFAULT_QUERY_MAX_MS = 600_000;
 const NO_FINDINGS_ANSWER = "(No relevant codebase findings returned.)";
-const READER_TOOL_NAMES = ["read", "grep", "glob", "find", "ast_grep", "lsp"];
+/**
+ * built-in tools whose every operation here is read-only, so no inherited `tools.approval.<tool>: allow` policy can
+ * unlock a write; GitHub goes through `git_gh` (`gh`) and `read pr://N` instead of the `github` tool, whose
+ * `pr_push`/`pr_create` an inherited allow would let run
+ */
+const READER_TOOL_NAMES = ["read", "grep", "glob", "find", "ast_grep", "lsp", "web_search"];
 
 /** trimmed, non-empty, first-occurrence order */
 function cleanPaths(paths: readonly string[] | undefined): string[] {
@@ -421,8 +429,23 @@ export class CouncilCodeReader implements CodebaseReader {
 		const options = this.#options;
 		const registry = options.modelRegistry;
 		const hasFullRegistry = Boolean(registry && "authStorage" in registry && registry.authStorage);
+		// over the host's settings, only read-tier tool calls run: anything else needs an approval this headless
+		// session cannot get, so edits and shell commands fail instead of running unattended
+		const settings = (await Settings.init({ cwd: options.cwd })).overlay(
+			{ "tools.approvalMode": "always-ask" },
+			{ derived: true },
+		);
+		// the host's connected MCP servers, reached through one proxy that exposes only read-only tools
+		const mcpManager = MCPManager.instance();
+		const customTools = [
+			createGitGhTool(options.cwd),
+			...(mcpManager
+				? [createMcpReadTool(() => mcpManager.getTools(), () => cfgToolsApproval.get(settings) as Record<string, unknown>)]
+				: []),
+		];
 		const { session } = await createAgentSession({
 			cwd: options.cwd,
+			settings,
 			modelRegistry: hasFullRegistry ? registry : undefined,
 			credentialSourceSessionId: options.sessionId,
 			model: options.model,
@@ -438,7 +461,7 @@ export class CouncilCodeReader implements CodebaseReader {
 			taskDepth: 1,
 			bindProcessState: false,
 			hasUI: false,
-			autoApprove: true,
+			autoApprove: false,
 			cacheWarming: false,
 			disableExtensionDiscovery: true,
 			enableMCP: false,
@@ -450,8 +473,9 @@ export class CouncilCodeReader implements CodebaseReader {
 			skills: [],
 			promptTemplates: [],
 			slashCommands: [],
-			customTools: [],
-			toolNames: [...READER_TOOL_NAMES],
+			customTools,
+			allowRestrictedCustomTools: true,
+			toolNames: [...READER_TOOL_NAMES, ...customTools.map(tool => tool.name)],
 			restrictToolNames: true,
 			// append, not replace: the built-in prompt carries the tool and selector instructions
 			appendSystemPrompt: renderReaderSystem({
