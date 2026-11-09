@@ -931,6 +931,233 @@ describe("PlanCouncilOverlay UI component", () => {
 		expect(plain(overlay.render(120))).toContain("△ NEEDS REVISION · gpt-4o");
 	});
 
+	it("names the speaker holding the floor and numbers roundtable turns while a debate round runs", async () => {
+		const { tui } = createFakeTui();
+		const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		const started = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		const streamFn: ModelStreamFn = (model, context) => {
+			const debate = String(context.messages[context.messages.length - 1].content).includes("Council Debate");
+			const speaker = model.id === claude.model.id ? 0 : 1;
+			const text = debate ? `${model.id} has the floor` : "Review";
+			return {
+				async *[Symbol.asyncIterator]() {
+					yield { type: "text_delta", delta: text } as unknown as AssistantMessageEvent;
+				},
+				result: async () => {
+					if (debate) {
+						started[speaker].resolve();
+						await gates[speaker].promise;
+					}
+					return {
+						role: "assistant",
+						content: [
+							{ type: "text", text },
+							{ type: "toolCall", id: "call-0", name: "report_position", arguments: { verdict: "APPROVE", revisions: [], positions: [] } },
+						],
+						stopReason: "toolUse",
+					} as unknown as AssistantMessage;
+				},
+			};
+		};
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tui, session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		await session.startInitialCritiques();
+		const debate = session.runDebateRound();
+		await started[0].promise;
+		let rows = overlay.render(120);
+		expect(Bun.stripANSI(rows[0])).toContain("[Round 2 · turn 1 @claude-3-7-so… ⏳]");
+		let body = bodyRows(rows).join("\n");
+		expect(body).toContain("[claude-3-7-sonnet (anthropic) · Round 1 critique] ✓ APPROVE");
+		expect(body).toContain("[claude-3-7-sonnet (anthropic) · Round 2 turn 1] ⏳ streaming...");
+		expect(body).not.toContain("Round 2 turn 2");
+
+		gates[0].resolve();
+		await started[1].promise;
+		rows = overlay.render(120);
+		expect(Bun.stripANSI(rows[0])).toContain("[Round 2 · turn 2 @gpt-4o ⏳]");
+		body = bodyRows(rows).join("\n");
+		const firstAt = body.indexOf("[claude-3-7-sonnet (anthropic) · Round 2 turn 1] ✓ APPROVE");
+		expect(firstAt).toBeGreaterThan(-1);
+		expect(body.indexOf("[gpt-4o (openai) · Round 2 turn 2] ⏳ streaming...")).toBeGreaterThan(firstAt);
+
+		gates[1].resolve();
+		await debate;
+		expect(Bun.stripANSI(overlay.render(120)[0])).toContain("[Round 2] · converged");
+		overlay.dispose();
+	});
+
+	/** reviewers stream `text` and report `args`; a reply carrying `wait` settles only once that promise does */
+	function reportingStream(
+		respond: (modelId: string, prompt: string) => { text?: string; args: Record<string, unknown>; wait?: Promise<void> },
+	): ModelStreamFn {
+		return (model, context) => {
+			const reply = respond(model.id, String(context.messages[context.messages.length - 1].content));
+			const text = reply.text ?? "Review";
+			return {
+				async *[Symbol.asyncIterator]() {
+					yield { type: "text_delta", delta: text } as unknown as AssistantMessageEvent;
+				},
+				result: async () => {
+					await reply.wait;
+					return {
+						role: "assistant",
+						content: [
+							{ type: "text", text },
+							{ type: "toolCall", id: "call-0", name: "report_position", arguments: reply.args },
+						],
+						stopReason: "toolUse",
+					} as unknown as AssistantMessage;
+				},
+			};
+		};
+	}
+	const approve = { verdict: "APPROVE", revisions: [], positions: [] };
+	const tallTui = () => ({ terminal: { rows: 200, cols: 120 }, requestRender: () => {} }) as unknown as TUI;
+
+	it("shows how each turn moved its reviewer's position and a reviewer's question for the operator", async () => {
+		const question = "Should retries be bounded?";
+		const streamFn = reportingStream((modelId, prompt) => {
+			// claude challenges gpt's first item, which hands gpt the floor to narrow it
+			const positions = [...prompt.matchAll(/^- `([^`]+)`: /gm)].map(m =>
+				m[1] === `${gpt.key}#1` ? { id: m[1], stance: "dispute", reason: "too broad" } : { id: m[1], stance: "agree" },
+			);
+			if (modelId !== gpt.model.id) return { args: { ...approve, positions } };
+			return prompt.includes("Council Debate")
+				? { args: { verdict: "NEEDS REVISION", revisions: [{ summary: "Clamp negative budgets" }], positions, questionForOperator: question } }
+				: { args: { verdict: "NEEDS REVISION", revisions: [{ summary: "Clamp budgets" }], positions } };
+		});
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+
+		await session.startInitialCritiques();
+		await session.runDebateRound();
+		// claude's answer repeats its position
+		await session.askCouncil("@claude Anything else?");
+		const text = plain(overlay.render(120));
+
+		expect(text).toContain(`↳ dropped gpt-4o#1 · added gpt-4o#2 "Clamp negative budgets"`);
+		expect(text).toContain("↳ disputes gpt-4o#1");
+		expect(text).toContain("↳ agrees gpt-4o#2");
+		expect(text).toContain("↳ position unchanged");
+		expect(text).toContain(`❓ asks you: ${question}`);
+		expect(text).toContain(`❓ gpt-4o (openai) asks: ${question} (press i to answer)`);
+		overlay.dispose();
+	});
+
+	it("sends a message at once while a turn streams, queues it, and shows the queue", async () => {
+		const gate = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const streamFn = reportingStream((modelId, prompt) => {
+			if (modelId !== claude.model.id || !prompt.includes("Council Debate")) return { args: approve };
+			started.resolve();
+			return { args: approve, wait: gate.promise };
+		});
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+		await session.startInitialCritiques();
+		const debate = session.runDebateRound();
+		await started.promise;
+
+		overlay.handleInput("i");
+		for (const ch of "@gpt hold on") overlay.handleInput(ch);
+		overlay.handleInput("\r");
+		// the composer is cleared and back in browse mode before the session answers
+		const sent = overlay.render(120).map(r => Bun.stripANSI(r));
+		expect(sent.at(-2)?.trim()).toBe("Ask council >");
+		expect(sent.at(-1)).toContain("i ask");
+
+		await flushMicrotasks();
+		const rows = overlay.render(120);
+		expect(Bun.stripANSI(rows.at(-3) ?? "")).toContain("Queued: @gpt-4o takes the floor next.");
+		expect(Bun.stripANSI(rows[0])).toContain("[Round 2 · turn 1 @claude-3-7-so… ⏳] · 1 queued");
+
+		gate.resolve();
+		await debate;
+		expect(session.pendingAskCount).toBe(0);
+		overlay.dispose();
+	});
+
+	it("completes an @mention with Tab and cycles through the candidates", () => {
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+		});
+		const open = () => {
+			const overlay = new PlanCouncilOverlay(createFakeTui().tui, session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+			overlay.handleInput("i");
+			return overlay;
+		};
+		const inputRow = (overlay: PlanCouncilOverlay) => Bun.stripANSI(overlay.render(120).at(-2) ?? "");
+		const statusRow = (overlay: PlanCouncilOverlay) => Bun.stripANSI(overlay.render(120).at(-3) ?? "");
+
+		const partial = open();
+		for (const ch of "@gp") partial.handleInput(ch);
+		partial.handleInput("\t");
+		partial.handleInput("x");
+		expect(inputRow(partial)).toContain("Ask council > @gpt-4o x");
+
+		const bare = open();
+		bare.handleInput("@");
+		bare.handleInput("\t");
+		bare.handleInput("\t");
+		expect(statusRow(bare)).toContain("@claude-3-7-sonnet  [@gpt-4o]  (Tab cycles)");
+		bare.handleInput("x");
+		expect(inputRow(bare)).toContain("Ask council > @gpt-4o x");
+		expect(statusRow(bare)).not.toContain("Tab cycles");
+	});
+
+	it("names the reviewer answering an operator question in the title", async () => {
+		const gate = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const streamFn = reportingStream((_modelId, prompt) => {
+			if (!prompt.startsWith("# Operator Follow-up")) return { args: approve };
+			started.resolve();
+			return { args: approve, wait: gate.promise };
+		});
+		const session = new CouncilSession({
+			planTitle: "Test Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: [claude, gpt],
+			initialReviewers: [claude, gpt],
+			streamFn,
+		});
+		const overlay = new PlanCouncilOverlay(tallTui(), session, { reviewOptions: defaultReviewOptions, synthesizerModel: claude.model }, () => {});
+		await session.startInitialCritiques();
+
+		const ask = session.askCouncil("@gpt Why approve?");
+		await started.promise;
+		expect(Bun.stripANSI(overlay.render(120)[0])).toContain("[Round 1 · @gpt-4o replying ⏳]");
+		gate.resolve();
+		await ask;
+		overlay.dispose();
+	});
+
 	it("shows configuration warnings and the reviewer, synthesizer, and reader settings", () => {
 		const { tui } = createFakeTui();
 		const thinkingClaude: ReviewerMember = { ...claude, thinkingLevel: parseThinkingLevel("high") };
@@ -1049,13 +1276,16 @@ describe("PlanCouncilOverlay UI component", () => {
 			const pausedTop = visible()[0];
 			expect(visible().join("\n")).not.toContain("t2 point 29");
 
-			// Round 1 → Round 2 debate (t3, t4) → synthesis (t5) without snapping back to the tail
+			// Round 1 → sequential Round 2 debate (t3 claude, then t4 gpt) → synthesis (t5) without snapping back to the tail
 			gates[1]();
 			await delay(5);
 			expect(session.round).toBe(2);
 			expect(visible()[0]).toBe(pausedTop);
-			expect(visible().join("\n")).not.toContain("t4 point 29");
+			expect(visible().join("\n")).not.toContain("t3 point 29");
 			gates[2]();
+			await delay(5);
+			expect(visible()[0]).toBe(pausedTop);
+			expect(visible().join("\n")).not.toContain("t4 point 29");
 			gates[3]();
 			await delay(5);
 			expect(session.latestSynthesis?.status).toBe("streaming");
@@ -1068,16 +1298,16 @@ describe("PlanCouncilOverlay UI component", () => {
 			await delay(5);
 			expect(session.isActive()).toBe(false);
 
-			// a paused view resumes following when the next run starts
+			// a paused view resumes following when the next run starts (Round 3 opens with claude's t6)
 			for (let i = 0; i < 3; i++) overlay.handleInput("[");
 			for (let i = 0; i < 5; i++) overlay.handleInput("k");
 			overlay.handleInput(" ");
 			await delay(5);
-			expect(visible().join("\n")).toContain("t7 point 29");
+			expect(visible().join("\n")).toContain("t6 point 29");
 			for (let i = 0; i < 5; i++) overlay.handleInput("k");
-			expect(visible().join("\n")).not.toContain("t7 point 29");
+			expect(visible().join("\n")).not.toContain("t6 point 29");
 			overlay.handleInput("G");
-			expect(visible().join("\n")).toContain("t7 point 29");
+			expect(visible().join("\n")).toContain("t6 point 29");
 		} finally {
 			for (let i = 0; i < 10 && session.isActive(); i++) {
 				for (const open of gates) open();

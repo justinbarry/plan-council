@@ -388,7 +388,69 @@ describe("prompt renderers", () => {
 		expect(rebuttal).toContain(`### Peer required revisions\n${expected}`);
 		expect(renderUserFollowup({ userMessage: "Why?", peerItems })).toContain(`### Peer required revisions\n${expected}`);
 
-		expect(renderDebateRebuttal({ round: 2, peerCritiques: [], peerItems: [] })).not.toContain("Peer required revisions");
+		// the instructions name the section; only the section heading itself must be absent
+		expect(renderDebateRebuttal({ round: 2, peerCritiques: [], peerItems: [] })).not.toContain("---\n### Peer required revisions\n");
+	});
+
+	it("renders a roundtable turn with the floor, turn headings, challenges to own revisions, and annotated peer items verbatim", () => {
+		const rendered = renderDebateRebuttal({
+			round: 2,
+			roundtable: { speaker: 2, peerHandles: ["@claude-3-7-sonnet", "@gemini-2.5-pro"] },
+			peerCritiques: [
+				{ reviewerLabel: "claude-3-7-sonnet (anthropic)", critiqueText: "R1: a -> b", round: 1, kind: "critique" },
+				{ reviewerLabel: "gemini-2.5-pro (google)", critiqueText: "R2: keep {{raw}}", round: 2, kind: "rebuttal" },
+			],
+			ownDisputes: [
+				{ id: "openai/gpt-4o#1", summary: "Retry -> twice", by: "claude-3-7-sonnet (anthropic)", reason: "already {{raw}} != needed" },
+			],
+			peerItems: [
+				{
+					id: "anthropic/claude-3-7-sonnet#1",
+					summary: "Guard a -> b",
+					disputes: [{ by: "gemini-2.5-pro (google)", reason: "covered by {{x}}" }],
+				},
+				{
+					id: "google/gemini-2.5-pro#1",
+					summary: "Pin deps",
+					disputes: [
+						{ by: "claude-3-7-sonnet (anthropic)", reason: "pinned != locked" },
+						{ by: "grok-3 (xai)", reason: "" },
+					],
+				},
+			],
+		});
+
+		expect(rendered).toContain("You have the floor (turn 2; peers: @claude-3-7-sonnet, @gemini-2.5-pro).");
+		expect(rendered).toContain("### Critique from claude-3-7-sonnet (anthropic)\nR1: a -> b\n");
+		expect(rendered).toContain("### Round 2 rebuttal from gemini-2.5-pro (google)\nR2: keep {{raw}}\n");
+		expect(rendered).toContain(
+			"### Peer challenges to your revisions\n- **claude-3-7-sonnet (anthropic)** challenged your `openai/gpt-4o#1` (Retry -> twice): already {{raw}} != needed\n",
+		);
+		expect(rendered).toContain(
+			[
+				"### Peer required revisions",
+				"- `anthropic/claude-3-7-sonnet#1`: Guard a -> b",
+				"  - Disputed by **gemini-2.5-pro (google)**: covered by {{x}}",
+				"- `google/gemini-2.5-pro#1`: Pin deps",
+				"  - Disputed by **claude-3-7-sonnet (anthropic)**: pinned != locked",
+				"  - Disputed by **grok-3 (xai)**",
+				"",
+			].join("\n"),
+		);
+		// stance targets are read from `- \`id\`: ` lines, which only peer items use
+		expect([...rendered.matchAll(/^- `([^`]+)`: /gm)].map(m => m[1])).toEqual([
+			"anthropic/claude-3-7-sonnet#1",
+			"google/gemini-2.5-pro#1",
+		]);
+		expect(rendered).toContain("### Roundtable Instructions");
+		expect(rendered).not.toContain("### Instructions for Rebuttal");
+	});
+
+	it("renders a bare rebuttal without a lead-in or floor", () => {
+		const rendered = renderDebateRebuttal({ round: 2, peerCritiques: [] });
+		expect(rendered).not.toContain("Examine their assessments below");
+		expect(rendered).not.toContain("You have the floor");
+		expect(rendered).toContain("### Instructions for Rebuttal");
 	});
 
 	it("renders synthesize system and user prompt with verbatim history", () => {

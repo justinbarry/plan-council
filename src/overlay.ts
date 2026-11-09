@@ -15,8 +15,14 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { getMarkdownTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
-import { CouncilSession, isReviewerTurnEntry, READER_TARGET_KEY, type ReviewerTurnEntry } from "./council-session";
-import { openDisagreementCount, type ReviewerPosition } from "./position";
+import {
+	CouncilSession,
+	isReviewerTurnEntry,
+	OperatorQuestionPending,
+	READER_TARGET_KEY,
+	type ReviewerTurnEntry,
+} from "./council-session";
+import { isEmptyPositionDelta, openDisagreementCount, type PositionDelta, type ReviewerPosition } from "./position";
 
 export type ApprovalChoice = "execute" | "compact" | "keep";
 
@@ -51,6 +57,8 @@ const SYNTHESIS_READY_BANNER = "Synthesis ready — press f to refine plan, or a
 interface StatusBanner {
 	text: string;
 	isError: boolean;
+	/** `mention`: @-completion candidates, cleared by the next composer key */
+	kind?: "mention";
 }
 
 /** compact model id for narrow tab bars: drops a dated snapshot suffix and caps the length */
@@ -85,6 +93,27 @@ function formatVerdictBadge(verdict: ReviewerPosition["verdict"]): string {
 function formatElapsed(startedAt: number, finishedAt: number | undefined): string | undefined {
 	if (finishedAt === undefined || finishedAt < startedAt) return undefined;
 	return `${((finishedAt - startedAt) / 1000).toFixed(1)}s`;
+}
+
+/** one-line summary of how a turn moved its reviewer's position, e.g. `dropped gpt-4o#1 · added gpt-4o#2 "…"` */
+function formatPositionDelta(delta: PositionDelta, verdict: ReviewerPosition["verdict"]): string {
+	if (isEmptyPositionDelta(delta)) return theme.fg("muted", "position unchanged");
+	const shortId = (id: string) => id.replace(/^[^/]+\//, "");
+	const segments: string[] = [];
+	if (delta.verdictFrom) {
+		segments.push(
+			`${theme.fg("muted", "verdict ")}${formatVerdictGlyph(delta.verdictFrom)}${theme.fg("muted", " → ")}${formatVerdictGlyph(verdict)}`,
+		);
+	}
+	if (delta.dropped.length > 0) {
+		segments.push(theme.fg("muted", `dropped ${delta.dropped.map(r => shortId(r.id)).join(", ")}`));
+	}
+	for (const item of delta.added) {
+		segments.push(theme.fg("muted", `added ${shortId(item.id)} "${replaceTabs(item.summary)}"`));
+	}
+	if (delta.agreed.length > 0) segments.push(theme.fg("muted", `agrees ${delta.agreed.map(shortId).join(", ")}`));
+	if (delta.disputed.length > 0) segments.push(theme.fg("muted", `disputes ${delta.disputed.map(shortId).join(", ")}`));
+	return segments.join(theme.fg("muted", " · "));
 }
 
 export class PlanCouncilOverlay implements Component, Focusable {
@@ -127,6 +156,8 @@ export class PlanCouncilOverlay implements Component, Focusable {
 	#input: Input;
 	#modelCursor = 0;
 	#statusBanner?: StatusBanner;
+	/** Tab completion state while the operator cycles through `@` mention candidates */
+	#mentionCycle?: { prefixValue: string; candidates: string[]; index: number };
 	#scorecardExpanded = true;
 
 	#planMarkdown: Markdown;
@@ -341,7 +372,36 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		}
 		const elapsed = entry.readerStatus ? undefined : formatElapsed(entry.startedAt, entry.finishedAt);
 		if (elapsed) badge += theme.fg("muted", ` · ${elapsed}`);
-		return theme.bold(theme.fg("accent", `[${entry.reviewerLabel} · Round ${entry.round} ${entry.kind}]`)) + badge;
+		const turn = entry.roundtableTurn
+			? `Round ${entry.round} turn ${entry.roundtableTurn.step}`
+			: `Round ${entry.round} ${entry.kind}`;
+		return theme.bold(theme.fg("accent", `[${entry.reviewerLabel} · ${turn}]`)) + badge;
+	}
+
+	/** a reviewer turn: header, error, body, then once done its position delta and any question for the operator */
+	#renderReviewerEntry(entry: ReviewerTurnEntry, contentWidth: number): string[] {
+		const lines = [this.#formatReviewerHeader(entry)];
+		if (entry.status === "error" && entry.errorMessage) {
+			lines.push(theme.fg("error", `  Error: ${replaceTabs(entry.errorMessage)}`));
+		}
+		if (entry.text) {
+			lines.push(...this.#getEntryMarkdown(entry.id, entry.text).render(contentWidth));
+		}
+		if (entry.status === "done" && entry.position) {
+			if (entry.positionDelta) {
+				lines.push(
+					truncateToWidth(
+						`${theme.fg("muted", "  ↳ ")}${formatPositionDelta(entry.positionDelta, entry.position.verdict)}`,
+						contentWidth,
+					),
+				);
+			}
+			if (entry.position.operatorQuestion) {
+				lines.push(theme.fg("warning", `  ❓ asks you: ${replaceTabs(entry.position.operatorQuestion)}`));
+			}
+		}
+		lines.push("");
+		return lines;
 	}
 
 	/** verdicts, required revisions, disputes, and pending cross-examination at a glance */
@@ -416,6 +476,15 @@ export class PlanCouncilOverlay implements Component, Focusable {
 			);
 		}
 
+		for (const q of this.#session.getOpenOperatorQuestions()) {
+			lines.push(
+				truncateToWidth(
+					`${theme.fg("warning", `    ❓ ${replaceTabs(q.reviewerLabel)} asks: ${replaceTabs(q.question)}`)}${theme.fg("muted", " (press i to answer)")}`,
+					contentWidth,
+				),
+			);
+		}
+
 		if (convergence.uncovered.length > 0) {
 			// one aggregate row: after Round 1 every reviewer lacks a stance on every peer item
 			const pendingCount = new Set(convergence.uncovered.map(u => u.id)).size;
@@ -466,7 +535,13 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		const hasDoneReviewer = this.#session.entries.some(e => isReviewerTurnEntry(e) && e.status === "done");
 		let roundBadge = "";
 		if (this.#session.round > 0) {
-			roundBadge = theme.fg("accent", ` [Round ${this.#session.round}${this.#session.isBusy() ? " ⏳" : ""}]`);
+			// a sequential debate round or Q&A pass names who holds the floor
+			const speaker = this.#session.activeSpeaker;
+			let busy = "";
+			if (speaker?.kind === "rebuttal") busy = ` · turn ${speaker.step} @${shortModelId(speaker.modelId)} ⏳`;
+			else if (speaker) busy = ` · @${shortModelId(speaker.modelId)} replying ⏳`;
+			else if (this.#session.isBusy()) busy = " ⏳";
+			roundBadge = theme.fg("accent", ` [Round ${this.#session.round}${busy}]`);
 			if (!this.#session.isBusy() && hasDoneReviewer) {
 				const convergence = this.#session.getConvergence();
 				roundBadge += convergence.converged
@@ -474,6 +549,8 @@ export class PlanCouncilOverlay implements Component, Focusable {
 					: theme.fg("warning", ` · ${openDisagreementCount(convergence)} open`);
 			}
 		}
+		const queuedAsks = this.#session.pendingAskCount;
+		if (queuedAsks > 0) roundBadge += theme.fg("warning", ` · ${queuedAsks} queued`);
 		const warnBadge =
 			this.#warnings.length > 0
 				? theme.fg("warning", ` (${this.#warnings.length} warning${this.#warnings.length === 1 ? "" : "s"})`)
@@ -530,15 +607,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 						}
 						lines.push("");
 					} else {
-						lines.push(this.#formatReviewerHeader(entry));
-						if (entry.status === "error" && entry.errorMessage) {
-							lines.push(theme.fg("error", `  Error: ${replaceTabs(entry.errorMessage)}`));
-						}
-						if (entry.text) {
-							const md = this.#getEntryMarkdown(entry.id, entry.text);
-							lines.push(...md.render(contentWidth));
-						}
-						lines.push("");
+						lines.push(...this.#renderReviewerEntry(entry, contentWidth));
 					}
 				}
 			}
@@ -563,15 +632,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 						}
 						lines.push("");
 					} else if (isReviewerTurnEntry(entry)) {
-						lines.push(this.#formatReviewerHeader(entry));
-						if (entry.status === "error" && entry.errorMessage) {
-							lines.push(theme.fg("error", `  Error: ${replaceTabs(entry.errorMessage)}`));
-						}
-						if (entry.text) {
-							const md = this.#getEntryMarkdown(entry.id, entry.text);
-							lines.push(...md.render(contentWidth));
-						}
-						lines.push("");
+						lines.push(...this.#renderReviewerEntry(entry, contentWidth));
 					}
 				}
 			}
@@ -773,7 +834,7 @@ export class PlanCouncilOverlay implements Component, Focusable {
 					? "←/→ select approval · Tab/t execution tier · Enter confirm · Esc cancel"
 					: "←/→ select approval · Enter confirm · Esc cancel";
 		} else if (this.#mode === "compose") {
-			hints = "Enter submit question · Esc back to browse mode";
+			hints = "Enter send · Tab complete @model · Esc back to browse mode";
 		} else if (activeTab === "models") {
 			hints = "Tab tabs · ↑↓/jk select model · Space toggle · Enter start critiques · Esc close";
 		} else {
@@ -875,6 +936,14 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		}
 
 		if (this.#mode === "compose") {
+			if (matchesKey(data, "tab")) {
+				this.#completeMention();
+				this.#tui.requestRender();
+				return;
+			}
+			this.#mentionCycle = undefined;
+			if (this.#statusBanner?.kind === "mention") this.#statusBanner = undefined;
+
 			if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
 				this.#mode = "browse";
 				this.#input.focused = false;
@@ -898,18 +967,32 @@ export class PlanCouncilOverlay implements Component, Focusable {
 				} else if (activeTab === "reader" && this.#session.hasCodeReader) {
 					defaultTargetKey = READER_TARGET_KEY;
 				}
-				// watch the reader stream its answer live
-				if (this.#session.hasCodeReader && /^@(reader|scout)\b/i.test(text)) {
-					this.#tabBar.selectTab("reader");
+
+				// an unparseable message keeps the composer open with the text, for correction
+				let toReader: boolean;
+				try {
+					toReader = this.#session.resolveAskTarget(text, defaultTargetKey).reader;
+				} catch (err) {
+					this.#statusBanner = { text: err instanceof Error ? err.message : String(err), isError: true };
+					this.#tui.requestRender();
+					return;
 				}
+				// watch the reader stream its answer live
+				if (toReader) this.#tabBar.selectTab("reader");
+				this.#input.setValue("");
+				this.#mode = "browse";
+				this.#input.focused = false;
+				this.#statusBanner = undefined;
+				this.#tui.requestRender();
 
 				void this.#session
 					.askCouncil(text, defaultTargetKey)
-					.then(() => {
-						this.#input.setValue("");
-						this.#mode = "browse";
-						this.#input.focused = false;
-						this.#statusBanner = undefined;
+					.then(result => {
+						if (result.status !== "queued") return;
+						let banner = "Queued: delivered with the next turn.";
+						if (result.target) banner = `Queued: @${result.target.model.id} takes the floor next.`;
+						else if (toReader) banner = "Queued: the reader answers once the council is idle.";
+						this.#statusBanner = { text: banner, isError: false };
 						this.#tui.requestRender();
 					})
 					.catch(err => {
@@ -1127,6 +1210,47 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		}
 	}
 
+	/**
+	 * Tab with the caret after a trailing `@partial` completes it to an active reviewer's model id (or `reader`):
+	 * prefix matches first, then substring matches; repeated Tabs cycle through the candidates
+	 */
+	#completeMention(): void {
+		const value = this.#input.getValue();
+		if (this.#input.getCursor() !== value.length) return;
+		let cycle = this.#mentionCycle;
+		if (cycle && value === `${cycle.prefixValue}@${cycle.candidates[cycle.index]} `) {
+			cycle.index = (cycle.index + 1) % cycle.candidates.length;
+		} else {
+			const m = value.match(/(^|\s)@([a-zA-Z0-9_\-./]*)$/);
+			if (!m || m.index === undefined) return;
+			const lower = m[2].toLowerCase();
+			const prefixValue = value.slice(0, m.index + m[1].length);
+			const handles = this.#session.activeReviewers.map(r => r.model.id);
+			if (this.#session.hasCodeReader) handles.push("reader");
+			const candidates = [
+				...new Set([
+					...handles.filter(h => h.toLowerCase().startsWith(lower)),
+					...handles.filter(h => h.toLowerCase().includes(lower)),
+				]),
+			];
+			if (candidates.length === 0) return;
+			cycle = { prefixValue, candidates, index: 0 };
+			this.#mentionCycle = cycle;
+		}
+
+		const { candidates, index } = cycle;
+		this.#input.setValue(`${cycle.prefixValue}@${candidates[index]} `);
+		if (candidates.length > 1) {
+			this.#statusBanner = {
+				kind: "mention",
+				isError: false,
+				text: `${candidates.map((c, i) => (i === index ? `[@${c}]` : `@${c}`)).join("  ")}  (Tab cycles)`,
+			};
+		} else if (this.#statusBanner?.kind === "mention") {
+			this.#statusBanner = undefined;
+		}
+	}
+
 	/** approval picker: choose an approval and tier, confirm, or cancel back to browsing; other keys are ignored */
 	#handleApproveInput(data: string): void {
 		const choices = this.#enabledApprovalOptions();
@@ -1255,10 +1379,16 @@ export class PlanCouncilOverlay implements Component, Focusable {
 		} catch (err) {
 			if (this.#resolved) return;
 			this.#autoStage = undefined;
-			this.#statusBanner = {
-				text: err instanceof Error ? err.message : String(err),
-				isError: true,
-			};
+			if (err instanceof OperatorQuestionPending) {
+				// a pause, not a failure: the operator answers with i, or resumes with Space
+				this.#statusBanner = { text: err.message, isError: false };
+				if (this.#mode !== "approve") this.#tabBar.selectTab("council");
+			} else {
+				this.#statusBanner = {
+					text: err instanceof Error ? err.message : String(err),
+					isError: true,
+				};
+			}
 			this.#tui.requestRender();
 		}
 	}

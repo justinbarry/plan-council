@@ -14,21 +14,29 @@ export const positionSchema = type({
 	revisions: type({ summary: type("string > 0").describe("One required plan change, one sentence.") })
 		.array()
 		.describe(
-			"Every change you require in the plan, in the order they appear in your review. Empty when you require none.",
+			"Your complete standing set of still-required plan changes, including settled ones your prose no longer repeats. Reuse an unchanged prior summary verbatim, update a narrowed summary, and omit retracted ones. Empty only when you require no changes.",
 		),
 	positions: type({
-		id: type("string > 0").describe("A peer revision ID exactly as listed in the prompt."),
+		id: type("string > 0").describe("A revision ID exactly as listed under ### Peer required revisions."),
 		stance: type("'agree' | 'dispute'"),
 		"reason?": type("string").describe("Required for dispute: why the peer item is wrong, unnecessary, or must change."),
 	})
 		.array()
-		.describe("One entry for every peer revision ID listed in the prompt. Empty when none are listed."),
+		.describe(
+			"One entry for each revision ID listed under ### Peer required revisions and no others: never your own IDs from ### Peer challenges to your revisions or IDs quoted in peer replies. Empty when none are listed there.",
+		),
+	"nextSpeaker?": type("string").describe(
+		"Optional @model handle (or provider/model key) of one peer you are asking to respond next. Set only when handing them the floor; omit for passing mentions.",
+	),
+	"questionForOperator?": type("string").describe(
+		"One concise question only the human operator can answer (intent, scope, priorities) that your stance depends on. Omit when none.",
+	),
 });
 
 export const REPORT_POSITION_TOOL: Tool = {
 	name: REPORT_POSITION_TOOL_NAME,
 	description:
-		"Record your verdict, your required plan revisions, and your stance on each peer revision ID listed in the prompt. Call it once, after your written review.",
+		"Record your verdict, your complete standing set of required plan revisions, and your stance on each revision ID listed under ### Peer required revisions. Call it once, after your written reply.",
 	parameters: positionSchema,
 };
 
@@ -49,6 +57,24 @@ export interface ReviewerPosition {
 	positions: ItemPosition[];
 	/** peer item IDs the reviewer was shown in the prompt that produced this report */
 	promptedItemIds: string[];
+	/** model id or key of the peer the reviewer handed the floor to, without a leading `@` */
+	nextSpeaker?: string;
+	/** a question only the operator can answer that the reviewer's stance depends on */
+	operatorQuestion?: string;
+}
+
+/** how a reviewer's position moved between two consecutive reports */
+export interface PositionDelta {
+	/** previous verdict, present only when the verdict changed */
+	verdictFrom?: ReviewerPosition["verdict"];
+	/** own revisions whose IDs did not exist in the previous position */
+	added: RevisionItem[];
+	/** previous own revisions whose IDs are gone */
+	dropped: RevisionItem[];
+	/** peer IDs with an `agree` stance now that were not agreed in the previous position */
+	agreed: string[];
+	/** peer IDs with a `dispute` stance now that were not disputed in the previous position */
+	disputed: string[];
 }
 
 export interface ParsedPosition {
@@ -75,12 +101,87 @@ export function validateReportedPosition(
 ): ReviewerPosition {
 	// the shared validator repairs common model quirks (e.g. arrays sent as JSON strings) before rejecting
 	const args = validateToolArguments(REPORT_POSITION_TOOL, block) as typeof positionSchema.infer;
+	const next = args.nextSpeaker?.trim().replace(/^@+/, "");
+	const question = args.questionForOperator?.trim();
 	return {
 		verdict: args.verdict,
 		revisions: args.revisions.map((r, index) => ({ id: `${reviewerKey}#${index + 1}`, summary: r.summary })),
 		positions: args.positions.map(p => ({ id: p.id, stance: p.stance, reason: p.reason ?? "" })),
 		promptedItemIds: [...promptedItemIds],
+		...(next ? { nextSpeaker: next } : {}),
+		...(question ? { operatorQuestion: question } : {}),
 	};
+}
+
+function normalizeSummary(summary: string): string {
+	return summary.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+/**
+ * keep a revision's ID while its summary is unchanged (ignoring case and whitespace) so peer stances stay attached
+ * to the same item; a new or reworded summary gets a never-used `#N`, so peers must judge the new wording
+ */
+export function stabilizeRevisionIds(
+	reviewerKey: string,
+	summaries: readonly { summary: string }[],
+	previous: readonly RevisionItem[],
+	nextNumber: number,
+): { revisions: RevisionItem[]; nextNumber: number } {
+	const available = [...previous];
+	let seq = Math.max(1, nextNumber);
+	for (const item of previous) {
+		const n = Number(item.id.slice(item.id.lastIndexOf("#") + 1));
+		if (Number.isInteger(n) && n >= seq) seq = n + 1;
+	}
+
+	const revisions = summaries.map(({ summary }) => {
+		const normalized = normalizeSummary(summary);
+		const index = available.findIndex(item => normalizeSummary(item.summary) === normalized);
+		if (index === -1) return { id: `${reviewerKey}#${seq++}`, summary };
+		const [matched] = available.splice(index, 1);
+		return { id: matched.id, summary };
+	});
+	return { revisions, nextNumber: seq };
+}
+
+/** first stance per peer ID, the one computeConvergence counts */
+function firstStances(position: ReviewerPosition): Map<string, ItemPosition["stance"]> {
+	const stances = new Map<string, ItemPosition["stance"]>();
+	for (const p of position.positions) {
+		if (!stances.has(p.id)) stances.set(p.id, p.stance);
+	}
+	return stances;
+}
+
+/** what changed between two reports; revisions compare by stable ID, so a reworded item is one drop plus one add */
+export function computePositionDelta(previous: ReviewerPosition, next: ReviewerPosition): PositionDelta {
+	const previousIds = new Set(previous.revisions.map(r => r.id));
+	const nextIds = new Set(next.revisions.map(r => r.id));
+	const before = firstStances(previous);
+	const agreed: string[] = [];
+	const disputed: string[] = [];
+	for (const [id, stance] of firstStances(next)) {
+		if (stance === before.get(id)) continue;
+		if (stance === "agree") agreed.push(id);
+		else disputed.push(id);
+	}
+	return {
+		...(previous.verdict !== next.verdict ? { verdictFrom: previous.verdict } : {}),
+		added: next.revisions.filter(r => !previousIds.has(r.id)),
+		dropped: previous.revisions.filter(r => !nextIds.has(r.id)),
+		agreed,
+		disputed,
+	};
+}
+
+export function isEmptyPositionDelta(delta: PositionDelta): boolean {
+	return (
+		delta.verdictFrom === undefined &&
+		delta.added.length === 0 &&
+		delta.dropped.length === 0 &&
+		delta.agreed.length === 0 &&
+		delta.disputed.length === 0
+	);
 }
 
 /** answer every tool call in the message (providers reject unanswered calls) and extract the last valid report */

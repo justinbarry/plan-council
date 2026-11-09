@@ -1,16 +1,24 @@
-import { describe, expect, it, setSystemTime } from "bun:test";
-import type { AssistantMessage, AssistantMessageEvent, Context, Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { describe, expect, it } from "bun:test";
+import type { AssistantMessage, AssistantMessageEvent, Context, Model, ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent";
 import type { CodebaseReader, CodeReaderQueryInput } from "../src/code-reader";
 import {
 	CouncilSession,
 	extractSessionGoalContext,
 	isReviewerTurnEntry,
+	OperatorQuestionPending,
 	type ModelStreamFn,
 	READER_TARGET_KEY,
 	type ReviewerTurnEntry,
 } from "../src/council-session";
-import { computeConvergence } from "../src/position";
+import {
+	computeConvergence,
+	computePositionDelta,
+	isEmptyPositionDelta,
+	type ReviewerPosition,
+	stabilizeRevisionIds,
+	validateReportedPosition,
+} from "../src/position";
 import type { ReviewerMember } from "../src/models";
 
 function makeFakeReviewer(provider: string, id: string, family: string): ReviewerMember {
@@ -123,6 +131,42 @@ function lastPrompt(context: Context): string {
 	return last.role === "user" && typeof last.content === "string" ? last.content : "";
 }
 
+/** a report_position call with extra arguments, e.g. `nextSpeaker` or `questionForOperator` */
+function withReportFields(call: MockToolCall, fields: Record<string, unknown>): MockToolCall {
+	return { ...call, arguments: { ...call.arguments, ...fields } };
+}
+
+/** resolve once the session goes idle, e.g. after the reply pass it runs for a queued operator message */
+function settle(session: CouncilSession): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const unsubscribe = session.subscribe(() => {
+		if (session.isBusy()) return;
+		unsubscribe();
+		resolve();
+	});
+	if (!session.isBusy()) {
+		unsubscribe();
+		resolve();
+	}
+	return promise;
+}
+
+const FORCED_REPORT_MARKER = "Call the `report_position` tool now";
+
+/** the turn's own prompt: skips tool results of earlier steps and a forced report_position follow-up */
+function turnPrompt(context: Context): string {
+	for (let i = context.messages.length - 1; i >= 0; i--) {
+		const m = context.messages[i];
+		if (m.role === "user" && typeof m.content === "string" && !m.content.startsWith(FORCED_REPORT_MARKER)) return m.content;
+	}
+	return "";
+}
+
+function debateRound(context: Context): number | undefined {
+	const match = turnPrompt(context).match(/# Council Debate: Round (\d+)/);
+	return match ? Number(match[1]) : undefined;
+}
+
 function isSynthesis(context: Context): boolean {
 	return (context.systemPrompt?.[0] ?? "").includes("Synthesizer");
 }
@@ -140,8 +184,8 @@ function scriptedCouncil(turn: (model: Model, t: ScriptedTurn) => MockToolCall[]
 		if (isSynthesis(context)) {
 			return { text: "## Required Plan Revisions\n1. Synthesized result" };
 		}
-		const prompt = lastPrompt(context);
-		const round = Number(prompt.match(/# Council Debate: Round (\d+)/)?.[1] ?? 1);
+		const prompt = turnPrompt(context);
+		const round = debateRound(context) ?? 1;
 		const peerIds = [...prompt.matchAll(/^- `([^`]+)`: /gm)].map(m => m[1]);
 		return { text: `Review from ${model.id} for round ${round}`, toolCalls: turn(model, { round, peerIds, prompt }) };
 	};
@@ -150,6 +194,57 @@ function scriptedCouncil(turn: (model: Model, t: ScriptedTurn) => MockToolCall[]
 function toolResultsIn(context: Context): ToolResultMessage[] {
 	return context.messages.filter((m): m is ToolResultMessage => m.role === "toolResult");
 }
+
+describe("position deltas and report_position extras", () => {
+	const position = (verdict: ReviewerPosition["verdict"], revisionIds: string[], stances: Stance[]): ReviewerPosition => ({
+		verdict,
+		revisions: revisionIds.map(id => ({ id, summary: `Summary of ${id}` })),
+		positions: stances.map(p => ({ reason: "", ...p })),
+		promptedItemIds: stances.map(p => p.id),
+	});
+
+	it("reports a verdict change, revisions by ID, and peer items newly agreed or disputed", () => {
+		const previous = position("NEEDS REVISION", ["a#1", "a#2"], [{ id: "b#1", stance: "agree" }]);
+		const next = position("APPROVE", ["a#2", "a#3"], [
+			{ id: "b#1", stance: "dispute" },
+			{ id: "c#1", stance: "agree" },
+		]);
+		expect(computePositionDelta(previous, next)).toEqual({
+			verdictFrom: "NEEDS REVISION",
+			added: [{ id: "a#3", summary: "Summary of a#3" }],
+			dropped: [{ id: "a#1", summary: "Summary of a#1" }],
+			agreed: ["c#1"],
+			disputed: ["b#1"],
+		});
+		expect(isEmptyPositionDelta(computePositionDelta(previous, previous))).toBe(true);
+	});
+
+	const reportCall = (extra: Record<string, unknown>) =>
+		({
+			type: "toolCall",
+			id: "call-0",
+			name: "report_position",
+			arguments: { verdict: "APPROVE", revisions: [], positions: [], ...extra },
+		}) as ToolCall;
+
+	it("trims the handoff and the operator question and strips the handle's @", () => {
+		const reported = validateReportedPosition(
+			reportCall({ nextSpeaker: "  @gemini-2.5-pro  ", questionForOperator: "  Bound retries?  " }),
+			"a",
+			[],
+		);
+		expect(reported.nextSpeaker).toBe("gemini-2.5-pro");
+		expect(reported.operatorQuestion).toBe("Bound retries?");
+	});
+
+	it("leaves the handoff and question keys out when omitted or blank", () => {
+		for (const extra of [{}, { nextSpeaker: "  @ ", questionForOperator: "   " }]) {
+			const reported = validateReportedPosition(reportCall(extra), "a", []);
+			expect("nextSpeaker" in reported).toBe(false);
+			expect("operatorQuestion" in reported).toBe(false);
+		}
+	});
+});
 
 describe("extractSessionGoalContext", () => {
 	it("extracts and formats user messages from session branch entries", () => {
@@ -497,7 +592,8 @@ describe("report_position convergence", () => {
 		await session.synthesizeFeedback(claude.model);
 
 		const reviewerCalls = calls.filter(c => !isSynthesis(c.context));
-		expect(reviewerCalls).toHaveLength(6);
+		// claude's Round 2 agreement settles every held revision, so gpt's Round 2 turn is skipped
+		expect(reviewerCalls).toHaveLength(5);
 		for (const call of reviewerCalls) {
 			expect(call.context.tools?.map(t => t.name)).toEqual(["report_position"]);
 		}
@@ -569,6 +665,29 @@ describe("report_position convergence", () => {
 		expect(toolResultsIn(claudeDebate!.context).map(r => r.isError)).toEqual([true, true]);
 	});
 
+	it("keeps a revision's ID through a round that failed to report", async () => {
+		const { streamFn } = makeMockStreamFn(
+			scriptedCouncil((model, { round, peerIds }) => {
+				// claude keeps disputing so gpt speaks every round
+				if (model === claude.model) return [reportPosition("APPROVE", [], peerIds.map(id => ({ id, stance: "dispute", reason: "no" })))];
+				if (round === 2) return [{ name: "report_position", arguments: { verdict: "MAYBE", revisions: [], positions: [] } }];
+				return [reportPosition("NEEDS REVISION", ["Clamp negative budgets"])];
+			}),
+		);
+		const session = newSession(streamFn);
+		const clamp = [{ id: "openai/gpt-4o#1", summary: "Clamp negative budgets" }];
+
+		await session.startInitialCritiques();
+		expect(reviewerEntry(session, gpt.key, "critique").position?.revisions).toEqual(clamp);
+
+		await session.runDebateRound();
+		expect(reviewerEntry(session, gpt.key, "rebuttal").position).toBeUndefined();
+		expect(session.getConvergence().unreported).toEqual([gpt.label]);
+
+		await session.runDebateRound();
+		expect(reviewerEntry(session, gpt.key, "rebuttal").position?.revisions).toEqual(clamp);
+	});
+
 	const stanceCases: Array<{
 		name: string;
 		stances: (peerIds: string[]) => Stance[];
@@ -604,7 +723,8 @@ describe("report_position convergence", () => {
 
 			const gptDebatePrompt = lastPrompt(calls.find(x => x.model === gpt.model && lastPrompt(x.context).includes("Council Debate"))!.context);
 			expect(gptDebatePrompt).toContain("- `anthropic/claude-3-7-sonnet#1`: Fix raised by claude-3-7-sonnet");
-			expect(gptDebatePrompt).not.toContain("openai/gpt-4o#1");
+			// own IDs may appear under "Peer challenges to your revisions", never as listed peer items
+			expect(gptDebatePrompt).not.toContain("- `openai/gpt-4o#1`:");
 
 			const report = session.getConvergence();
 			expect(report.converged).toBe(c.converged);
@@ -639,13 +759,23 @@ describe("report_position convergence", () => {
 			{ id: "anthropic/claude-3-7-sonnet#1", by: gpt.label },
 		]);
 
+		// gpt adds an item in its Round 2 turn: claude has not been shown it, so it is open until claude, who already
+		// spoke, is re-queued in the same round to confirm it
+		let uncoveredAfterGptTurn: unknown;
+		const unsubscribe = session.subscribe(() => {
+			const gptTurn = session.entries.find(
+				(e): e is ReviewerTurnEntry => isReviewerTurnEntry(e) && e.kind === "rebuttal" && e.reviewerKey === gpt.key,
+			);
+			if (uncoveredAfterGptTurn === undefined && gptTurn?.status === "done") {
+				uncoveredAfterGptTurn = session.getConvergence().uncovered;
+			}
+		});
 		await session.runDebateRound();
+		unsubscribe();
+		expect(uncoveredAfterGptTurn).toEqual([{ id: "openai/gpt-4o#2", by: claude.label }]);
 		const afterFirstDebate = session.getConvergence();
 		expect(afterFirstDebate.disputes).toEqual([]);
-		expect(afterFirstDebate.uncovered).toEqual([{ id: "openai/gpt-4o#2", by: claude.label }]);
-
-		await session.runDebateRound();
-		expect(session.getConvergence().converged).toBe(true);
+		expect(afterFirstDebate.converged).toBe(true);
 	});
 
 	it("ignores stances on peer items their owner dropped in the same round", () => {
@@ -879,6 +1009,593 @@ describe("report_position convergence", () => {
 		expect(session.latestSynthesis).toBeUndefined();
 		expect(session.isActive()).toBe(false);
 	});
+
+	describe("operator questions", () => {
+		const question = "Should retries be bounded?";
+		const autoStages = (session: CouncilSession, options: { maxDebateRounds?: number } = {}) => {
+			const stages: string[] = [];
+			const run = session.runAutoPipeline(claude.model, { ...options, onStageChange: s => stages.push(s) });
+			return { stages, run };
+		};
+		/** claude asks the operator in its Round 1 critique and needs one revision gpt agrees to */
+		const askingCritique = scriptedCouncil((model, { round, peerIds, prompt }) => {
+			if (prompt.startsWith("# Operator Follow-up")) return [];
+			const positions = peerIds.map(id => ({ id, stance: "agree" as const }));
+			if (model === gpt.model) return [reportPosition("APPROVE", [], positions)];
+			const report = reportPosition("NEEDS REVISION", ["Bound retries"], positions);
+			return [round === 1 ? withReportFields(report, { questionForOperator: question }) : report];
+		});
+
+		it("pauses an auto run on a reviewer's question until the operator answers it", async () => {
+			const { streamFn } = makeMockStreamFn(askingCritique);
+			const session = newSession(streamFn);
+
+			const first = autoStages(session);
+			const err = await first.run.catch((e: unknown) => e);
+			expect(err).toBeInstanceOf(OperatorQuestionPending);
+			expect((err as Error).message).toContain(`${claude.label} asks: "${question}"`);
+			expect(first.stages).toEqual(["Round 1 Critiques"]);
+			expect(session.getOpenOperatorQuestions()).toEqual([
+				{ reviewerKey: claude.key, reviewerLabel: claude.label, question, entryId: expect.any(String) },
+			]);
+
+			expect(await session.askCouncil("@claude Yes, three attempts")).toEqual({ status: "answered" });
+			expect(session.getOpenOperatorQuestions()).toEqual([]);
+			const resumed = autoStages(session);
+			expect((await resumed.run).status).toBe("done");
+			expect(resumed.stages.at(-1)).toBe("Synthesizing Consensus");
+		});
+
+		it("does not count a message sent before the question was reported as its answer", async () => {
+			const gate = Promise.withResolvers<void>();
+			const started = Promise.withResolvers<void>();
+			const { streamFn } = makeMockStreamFn(async (model, context) => {
+				if (!isSynthesis(context) && debateRound(context) === undefined && !turnPrompt(context).startsWith("# Operator Follow-up")) {
+					started.resolve();
+					await gate.promise;
+				}
+				return askingCritique(model, context);
+			});
+			const session = newSession(streamFn);
+
+			const first = autoStages(session);
+			await started.promise;
+			// queued while claude's critique streams, before its question exists
+			expect(await session.askCouncil("Keep it small")).toEqual({ status: "queued" });
+			gate.resolve();
+
+			expect(await first.run.catch((e: unknown) => e)).toBeInstanceOf(OperatorQuestionPending);
+			expect(session.getOpenOperatorQuestions().map(q => q.question)).toEqual([question]);
+			await settle(session);
+		});
+
+		it("pauses once per question, so a resumed run continues without an answer", async () => {
+			const { streamFn } = makeMockStreamFn(askingCritique);
+			const session = newSession(streamFn);
+
+			expect(await autoStages(session).run.catch((e: unknown) => e)).toBeInstanceOf(OperatorQuestionPending);
+			const resumed = autoStages(session);
+			expect((await resumed.run).status).toBe("done");
+			expect(resumed.stages).toEqual(["Round 1 Critiques", "Round 2 Debate", "Synthesizing Consensus"]);
+			// still open for the operator, but it no longer stops the run
+			expect(session.getOpenOperatorQuestions().map(q => q.question)).toEqual([question]);
+		});
+
+		it("counts debate rounds already held when a paused run resumes", async () => {
+			const { streamFn } = makeMockStreamFn(
+				scriptedCouncil((model, { round, peerIds }) => {
+					const report = reportPosition("BLOCK", [`Fix raised by ${model.id}`], peerIds.map(id => ({ id, stance: "dispute", reason: "no" })));
+					return [model === claude.model && round === 2 ? withReportFields(report, { questionForOperator: question }) : report];
+				}),
+			);
+			const session = newSession(streamFn);
+
+			const first = autoStages(session, { maxDebateRounds: 2 });
+			expect(await first.run.catch((e: unknown) => e)).toBeInstanceOf(OperatorQuestionPending);
+			expect(first.stages).toEqual(["Round 1 Critiques", "Round 2 Debate"]);
+
+			const resumed = autoStages(session, { maxDebateRounds: 2 });
+			await resumed.run;
+			expect(resumed.stages).toEqual(["Round 1 Critiques", "Round 3 Debate", "Synthesizing Consensus"]);
+		});
+	});
+});
+
+describe("stabilizeRevisionIds", () => {
+	const held = [
+		{ id: "a#1", summary: "Add retry" },
+		{ id: "a#2", summary: "Log errors" },
+	];
+	const summaries = (...s: string[]) => s.map(summary => ({ summary }));
+
+	it("keeps an unchanged summary's ID and never reissues a dropped one", () => {
+		const round2 = stabilizeRevisionIds("a", summaries("Log errors", "Clamp timeout"), held, 3);
+		expect(round2).toEqual({
+			revisions: [
+				{ id: "a#2", summary: "Log errors" },
+				{ id: "a#3", summary: "Clamp timeout" },
+			],
+			nextNumber: 4,
+		});
+		expect(stabilizeRevisionIds("a", summaries("Add retry"), round2.revisions, round2.nextNumber)).toEqual({
+			revisions: [{ id: "a#4", summary: "Add retry" }],
+			nextNumber: 5,
+		});
+	});
+
+	it("matches ignoring case and whitespace, and reuses each held ID at most once", () => {
+		expect(stabilizeRevisionIds("a", summaries("  log   ERRORS ", "Log errors"), held, 3)).toEqual({
+			revisions: [
+				{ id: "a#2", summary: "  log   ERRORS " },
+				{ id: "a#3", summary: "Log errors" },
+			],
+			nextNumber: 4,
+		});
+	});
+
+	it("keeps the sequence on an empty report and numbers past a larger held ID", () => {
+		expect(stabilizeRevisionIds("a", [], held, 3)).toEqual({ revisions: [], nextNumber: 3 });
+		expect(stabilizeRevisionIds("a", summaries("Pin deps"), [{ id: "a#5", summary: "Old" }], 2)).toEqual({
+			revisions: [{ id: "a#6", summary: "Pin deps" }],
+			nextNumber: 7,
+		});
+	});
+});
+
+describe("roundtable debate rounds", () => {
+	const claude = makeFakeReviewer("anthropic", "claude-3-7-sonnet", "claude");
+	const gpt = makeFakeReviewer("openai", "gpt-4o", "gpt");
+	const gemini = makeFakeReviewer("google", "gemini-2.5-pro", "gemini");
+
+	function newSession(streamFn: ModelStreamFn, reviewers: ReviewerMember[], codeReader?: CodebaseReader): CouncilSession {
+		return new CouncilSession({
+			planTitle: "Roundtable Plan",
+			planFilePath: "plan.md",
+			planContent: "Plan content",
+			availableReviewers: reviewers,
+			initialReviewers: reviewers,
+			streamFn,
+			codeReader,
+		});
+	}
+
+	function debateTurns(session: CouncilSession, round: number): ReviewerTurnEntry[] {
+		return session.entries.filter((e): e is ReviewerTurnEntry => isReviewerTurnEntry(e) && e.kind === "rebuttal" && e.round === round);
+	}
+
+	type Calls = ReturnType<typeof makeMockStreamFn>["calls"];
+
+	/** the turn prompt of the reviewer's first request whose prompt includes `marker` */
+	function promptOf(calls: Calls, reviewer: ReviewerMember, marker: string): string {
+		const call = calls.find(c => c.model === reviewer.model && turnPrompt(c.context).includes(marker));
+		if (!call) throw new Error(`no ${reviewer.model.id} prompt with ${marker}`);
+		return turnPrompt(call.context);
+	}
+
+	it("lets a challenged author answer in the same round, so a single round converges", async () => {
+		const { streamFn, calls } = makeMockStreamFn(
+			scriptedCouncil((model, { round, peerIds }) => {
+				if (model === gpt.model) {
+					return round === 1
+						? [reportPosition("NEEDS REVISION", ["Add retry", "Log errors"])]
+						: [reportPosition("NEEDS REVISION", ["Log errors"], peerIds.map(id => ({ id, stance: "agree" })))];
+				}
+				if (round === 1) return [reportPosition("APPROVE")];
+				return [
+					reportPosition("APPROVE", [], [
+						{ id: "openai/gpt-4o#1", stance: "dispute", reason: "already retried" },
+						{ id: "openai/gpt-4o#2", stance: "agree" },
+					]),
+				];
+			}),
+		);
+		const session = newSession(streamFn, [gpt, claude]);
+
+		await session.startInitialCritiques();
+		await session.runDebateRound();
+
+		// claude holds no revisions, so it examines gpt's proposals before gpt speaks
+		const turns = debateTurns(session, 2);
+		expect(turns.map(t => [t.reviewerKey, t.roundtableTurn])).toEqual([
+			[claude.key, { step: 1 }],
+			[gpt.key, { step: 2 }],
+		]);
+		expect(turns.map(t => t.position?.promptedItemIds)).toEqual([["openai/gpt-4o#1", "openai/gpt-4o#2"], []]);
+
+		const gptPrompt = promptOf(calls, gpt, "Council Debate: Round 2");
+		expect(gptPrompt).toContain("You have the floor (turn 2; peers: @claude-3-7-sonnet).");
+		const critiqueAt = gptPrompt.indexOf(`### Critique from ${claude.label}\nReview from claude-3-7-sonnet for round 1\n`);
+		const replyAt = gptPrompt.indexOf(`### Round 2 rebuttal from ${claude.label}\nReview from claude-3-7-sonnet for round 2\n`);
+		expect(critiqueAt).toBeGreaterThan(-1);
+		expect(replyAt).toBeGreaterThan(critiqueAt);
+		expect(gptPrompt).toContain(
+			`### Peer challenges to your revisions\n- **${claude.label}** challenged your \`openai/gpt-4o#1\` (Add retry): already retried\n`,
+		);
+
+		expect(session.getConvergence()).toEqual({
+			converged: true,
+			items: [{ id: "openai/gpt-4o#2", summary: "Log errors" }],
+			disputes: [],
+			uncovered: [],
+			unreported: [],
+		});
+	});
+
+	describe("disputed author speaks first and a settled round ends early", () => {
+		// Round 2 ends with only gpt#1 disputed (by claude); gpt retracts it in Round 3
+		const turn = (model: Model, { round, peerIds }: ScriptedTurn): MockToolCall[] => {
+			if (model === gpt.model) {
+				return [reportPosition(round < 3 ? "NEEDS REVISION" : "APPROVE", round < 3 ? ["Clamp budgets"] : [], peerIds.map(id => ({ id, stance: "agree" })))];
+			}
+			if (round === 1) return [reportPosition("APPROVE")];
+			const stance = model === claude.model ? "dispute" : "agree";
+			return [reportPosition("APPROVE", [], peerIds.map(id => ({ id, stance, reason: "already clamped" })))];
+		};
+
+		const cases: Array<{ name: string; before: (session: CouncilSession) => Promise<unknown>; speakers: ReviewerMember[]; note?: string }> = [
+			{ name: "without operator input", before: async () => {}, speakers: [gpt] },
+			{
+				name: "unless a later speaker has an unseen operator message",
+				before: session => session.askCouncil("@gpt Is the clamp needed?"),
+				speakers: [gpt, claude, gemini],
+				note: `[To ${gpt.label}]: Is the clamp needed?`,
+			},
+			{
+				name: "unless a later speaker has an unseen operator reader answer",
+				before: session => session.askCouncil("@reader Where is the clamp?"),
+				speakers: [gpt, claude, gemini],
+				note: "[Operator → Reader]: Where is the clamp?\n[Reader]: Reader: Where is the clamp?",
+			},
+		];
+
+		for (const c of cases) {
+			it(c.name, async () => {
+				const { streamFn, calls } = makeMockStreamFn(scriptedCouncil(turn));
+				const session = newSession(streamFn, [claude, gpt, gemini], makeFakeReader().reader);
+
+				await session.startInitialCritiques();
+				await session.runDebateRound();
+				// claude's dispute hands gpt the floor at once
+				expect(debateTurns(session, 2).map(t => t.reviewerKey)).toEqual([claude.key, gpt.key, gemini.key]);
+				expect(promptOf(calls, gemini, "Council Debate: Round 2")).toContain(
+					`- \`openai/gpt-4o#1\`: Clamp budgets\n  - Disputed by **${claude.label}**: already clamped\n`,
+				);
+				expect(session.getConvergence().disputes).toEqual([{ id: "openai/gpt-4o#1", by: claude.label, reason: "already clamped" }]);
+
+				await c.before(session);
+				await session.runDebateRound();
+				expect(debateTurns(session, 3).map(t => t.reviewerKey)).toEqual(c.speakers.map(s => s.key));
+				expect(session.getConvergence().converged).toBe(true);
+				if (c.note) expect(promptOf(calls, claude, "Council Debate: Round 3")).toContain(c.note);
+			});
+		}
+	});
+
+	it("delivers unseen peer turns once, keeps operator input for the next debate turn, and redelivers after a failed turn", async () => {
+		const { reader } = makeFakeReader();
+		const { streamFn, calls } = makeMockStreamFn((model, context) => {
+			const round = debateRound(context);
+			const prompt = turnPrompt(context);
+			if (round !== undefined) {
+				if (model === gpt.model && round === 2) return { text: "", stopReason: "error", error: "Rate limit" };
+				return { text: `${model.id} round ${round}`, toolCalls: [reportPosition("APPROVE")] };
+			}
+			if (!prompt.startsWith("# Operator Follow-up")) return { text: `${model.id} critique`, toolCalls: [reportPosition("APPROVE")] };
+			if (model === gpt.model) return { text: "gpt reply" };
+			// claude's second reply is tool-only: it must not displace the first
+			return prompt.includes("Why approve?") ? { text: "Claude reply one" } : { text: "", toolCalls: [reportPosition("APPROVE")] };
+		});
+		const session = newSession(streamFn, [claude, gpt], reader);
+
+		await session.startInitialCritiques();
+		await session.askCouncil("@claude Why approve?");
+		await session.askCouncil("@claude Report only");
+		await session.askCouncil("@reader Where is X?");
+		await session.askCouncil("@gpt What do you think?");
+
+		const gptReplyPrompt = promptOf(calls, gpt, "What do you think?");
+		const peerResponses = [...gptReplyPrompt.matchAll(/^\*\*(.+)\*\*:$/gm)].map(m => m[1]);
+		expect(peerResponses).toEqual([`${claude.label} · Round 1 critique`, `${claude.label} · Round 1 reply`]);
+		expect(gptReplyPrompt).toContain(`**${claude.label} · Round 1 reply**:\nClaude reply one\n`);
+
+		const operatorNotes = [
+			`[To ${claude.label}]: Why approve?`,
+			`[To ${claude.label}]: Report only`,
+			"[Operator → Reader]: Where is X?\n[Reader]: Reader: Where is X?",
+		];
+		await session.runDebateRound();
+		expect(debateTurns(session, 2).map(t => [t.reviewerKey, t.status])).toEqual([
+			[claude.key, "done"],
+			[gpt.key, "error"],
+		]);
+		const failedPrompt = promptOf(calls, gpt, "Council Debate: Round 2");
+		for (const note of operatorNotes) expect(failedPrompt).toContain(note);
+		// gpt's own question and the peer turns its reply already received are not repeated
+		expect(failedPrompt).not.toContain("What do you think?");
+		expect(failedPrompt).not.toContain("Claude reply one");
+		expect(failedPrompt).not.toContain("claude-3-7-sonnet critique");
+		expect(failedPrompt).toContain(`### Round 2 rebuttal from ${claude.label}\nclaude-3-7-sonnet round 2\n`);
+
+		// the failed turn consumed nothing, so the retry round delivers the same input again
+		await session.runDebateRound();
+		const retryPrompt = promptOf(calls, gpt, "Council Debate: Round 3");
+		for (const note of operatorNotes) expect(retryPrompt).toContain(note);
+		const priorAt = retryPrompt.indexOf(`### Round 2 rebuttal from ${claude.label}\nclaude-3-7-sonnet round 2\n`);
+		expect(priorAt).toBeGreaterThan(-1);
+		expect(retryPrompt.indexOf(`### Round 3 rebuttal from ${claude.label}\nclaude-3-7-sonnet round 3\n`)).toBeGreaterThan(priorAt);
+		expect(debateTurns(session, 3).map(t => t.status)).toEqual(["done", "done"]);
+	});
+
+	it("delivers a peer's unseen prior-round rebuttal and its later targeted reply in order", async () => {
+		const { streamFn, calls } = makeMockStreamFn((model, context) => {
+			const round = debateRound(context);
+			if (round !== undefined) return { text: `${model.id} round ${round}`, toolCalls: [reportPosition("APPROVE")] };
+			if (turnPrompt(context).startsWith("# Operator Follow-up")) return { text: `${model.id} explains` };
+			return { text: `${model.id} critique`, toolCalls: [reportPosition("APPROVE")] };
+		});
+		const session = newSession(streamFn, [claude, gpt]);
+
+		await session.startInitialCritiques();
+		await session.runDebateRound();
+		await session.askCouncil("@gpt Explain more");
+		await session.runDebateRound();
+
+		const claudePrompt = promptOf(calls, claude, "Council Debate: Round 3");
+		const rebuttalAt = claudePrompt.indexOf(`### Round 2 rebuttal from ${gpt.label}\ngpt-4o round 2\n`);
+		const replyAt = claudePrompt.indexOf(`### Round 2 reply from ${gpt.label}\ngpt-4o explains\n`);
+		expect(rebuttalAt).toBeGreaterThan(-1);
+		expect(replyAt).toBeGreaterThan(rebuttalAt);
+		expect(claudePrompt).toContain(`[To ${gpt.label}]: Explain more`);
+	});
+
+	it("starts no later speaker after an abort and keeps a restarted round's floor when the stopped speaker settles late", async () => {
+		const gates = new Map([2, 3].map(round => [round, Promise.withResolvers<void>()]));
+		const started = new Map([2, 3].map(round => [round, Promise.withResolvers<void>()]));
+		const { streamFn, calls } = makeMockStreamFn(async (model, context) => {
+			const round = debateRound(context);
+			const gate = round === undefined ? undefined : gates.get(round);
+			if (round !== undefined && gate) {
+				started.get(round)?.resolve();
+				// ignores the abort signal: the stopped request settles only when its gate opens
+				await gate.promise;
+			}
+			return { text: `${model.id} round ${round ?? 1}`, toolCalls: [reportPosition("APPROVE")] };
+		});
+		const session = newSession(streamFn, [claude, gpt]);
+		await session.startInitialCritiques();
+
+		const stopped = session.runDebateRound();
+		await started.get(2)?.promise;
+		expect(session.activeSpeaker).toEqual({ reviewerKey: claude.key, modelId: claude.model.id, label: claude.label, kind: "rebuttal", step: 1 });
+		session.abortActiveRound();
+		expect(session.activeSpeaker).toBeUndefined();
+
+		const restarted = session.runDebateRound();
+		await started.get(3)?.promise;
+		gates.get(2)?.resolve();
+		await stopped;
+		// the stopped round's cleanup must not release the restarted one
+		expect(session.isBusy()).toBe(true);
+		expect(session.activeSpeaker).toMatchObject({ reviewerKey: claude.key, kind: "rebuttal", step: 1 });
+		expect(calls.filter(c => debateRound(c.context) === 2).map(c => c.model.id)).toEqual([claude.model.id]);
+		expect(debateTurns(session, 2).map(t => [t.reviewerKey, t.status])).toEqual([[claude.key, "aborted"]]);
+
+		gates.get(3)?.resolve();
+		await restarted;
+		expect(session.activeSpeaker).toBeUndefined();
+		expect(session.isBusy()).toBe(false);
+		expect(debateTurns(session, 3).map(t => [t.reviewerKey, t.status])).toEqual([
+			[claude.key, "done"],
+			[gpt.key, "done"],
+		]);
+	});
+
+	describe("reactive floor", () => {
+		it("lets a challenged author answer at once and the challenger confirm the narrowed item in the same round", async () => {
+			const { streamFn, calls } = makeMockStreamFn(
+				scriptedCouncil((model, { round, peerIds, prompt }) => {
+					if (model === gpt.model) {
+						const challenged = prompt.includes("### Peer challenges to your revisions");
+						return [reportPosition("NEEDS REVISION", [challenged ? "Clamp negative budgets" : "Clamp budgets"])];
+					}
+					if (round === 1) return [reportPosition("APPROVE")];
+					const disputer = model === claude.model;
+					return [
+						reportPosition(
+							"APPROVE",
+							[],
+							peerIds.map(id =>
+								disputer && id === "openai/gpt-4o#1"
+									? { id, stance: "dispute" as const, reason: "too broad" }
+									: { id, stance: "agree" as const },
+							),
+						),
+					];
+				}),
+			);
+			const session = newSession(streamFn, [claude, gpt, gemini]);
+
+			await session.startInitialCritiques();
+			await session.runDebateRound();
+
+			const turns = debateTurns(session, 2);
+			expect(turns.map(t => t.reviewerKey)).toEqual([claude.key, gpt.key, gemini.key, claude.key]);
+			expect(turns.map(t => t.roundtableTurn?.step)).toEqual([1, 2, 3, 4]);
+			const claudePrompts = calls
+				.filter(c => c.model === claude.model && debateRound(c.context) === 2)
+				.map(c => turnPrompt(c.context));
+			expect(claudePrompts).toHaveLength(2);
+			expect(claudePrompts[1]).toContain(`### Round 2 rebuttal from ${gpt.label}`);
+			expect(claudePrompts[1]).toContain("- `openai/gpt-4o#2`: Clamp negative budgets");
+			expect(session.getConvergence()).toEqual({
+				converged: true,
+				items: [{ id: "openai/gpt-4o#2", summary: "Clamp negative budgets" }],
+				disputes: [],
+				uncovered: [],
+				unreported: [],
+			});
+			expect(turns[1].positionDelta).toEqual({
+				added: [{ id: "openai/gpt-4o#2", summary: "Clamp negative budgets" }],
+				dropped: [{ id: "openai/gpt-4o#1", summary: "Clamp budgets" }],
+				agreed: [],
+				disputed: [],
+			});
+		});
+
+		it("caps each reviewer at two turns a round while a dispute keeps bouncing", async () => {
+			const { streamFn } = makeMockStreamFn(
+				scriptedCouncil((model, { peerIds }) => [
+					reportPosition("NEEDS REVISION", [`Fix raised by ${model.id}`], peerIds.map(id => ({ id, stance: "dispute", reason: "no" }))),
+				]),
+			);
+			const session = newSession(streamFn, [claude, gpt]);
+
+			await session.startInitialCritiques();
+			await session.runDebateRound();
+
+			expect(debateTurns(session, 2).map(t => t.reviewerKey)).toEqual([claude.key, gpt.key, claude.key, gpt.key]);
+			expect(session.getConvergence().disputes.map(d => d.id)).toEqual(["openai/gpt-4o#1", "anthropic/claude-3-7-sonnet#1"]);
+		});
+
+		const handoffCases = [
+			{ name: "hands the floor to the peer named in nextSpeaker", handoff: true, order: [gpt, gemini, claude] },
+			{ name: "keeps the order for a passing @mention in prose", handoff: false, order: [gpt, claude, gemini] },
+		];
+		for (const c of handoffCases) {
+			it(c.name, async () => {
+				const { streamFn } = makeMockStreamFn((model, context) => {
+					const report = reportPosition("APPROVE");
+					if (model !== gpt.model || debateRound(context) !== 2) return { text: `${model.id} review`, toolCalls: [report] };
+					return {
+						text: "I agree with @gemini-2.5-pro",
+						toolCalls: [c.handoff ? withReportFields(report, { nextSpeaker: "@gemini-2.5-pro" }) : report],
+					};
+				});
+				const session = newSession(streamFn, [gpt, claude, gemini]);
+
+				await session.startInitialCritiques();
+				await session.runDebateRound();
+
+				expect(debateTurns(session, 2).map(t => t.reviewerKey)).toEqual(c.order.map(r => r.key));
+			});
+		}
+	});
+
+	describe("operator messages sent while the council is busy", () => {
+		/** reviewers approve and answer follow-ups at once; turns matching `gated` signal `started` and wait for `release` */
+		function gatedCouncil(gated: (model: Model, context: Context) => boolean) {
+			const gate = Promise.withResolvers<void>();
+			const started = Promise.withResolvers<void>();
+			const mock = makeMockStreamFn(async (model, context) => {
+				if (turnPrompt(context).startsWith("# Operator Follow-up")) return { text: `${model.id} answers` };
+				if (gated(model, context)) {
+					started.resolve();
+					await gate.promise;
+				}
+				return { text: `${model.id} turn`, toolCalls: [reportPosition("APPROVE")] };
+			});
+			return { ...mock, started: started.promise, release: () => gate.resolve() };
+		}
+		const followUps = (calls: Calls) => calls.filter(c => turnPrompt(c.context).startsWith("# Operator Follow-up"));
+		const isCritique = (_model: Model, context: Context) => debateRound(context) === undefined;
+		const isClaudeRound2 = (model: Model, context: Context) => model === claude.model && debateRound(context) === 2;
+
+		it("queues an @model message during Round 1 and answers it once the round ends", async () => {
+			const { streamFn, calls, started, release } = gatedCouncil(isCritique);
+			const session = newSession(streamFn, [claude, gpt]);
+			const round1 = session.startInitialCritiques();
+			await started;
+			const callsBefore = calls.length;
+
+			expect(await session.askCouncil("@gpt Is step 2 safe?")).toEqual({ status: "queued", target: gpt });
+			expect(calls.length).toBe(callsBefore);
+			expect(session.entries.filter(e => e.kind === "user").map(e => e.text)).toEqual(["Is step 2 safe?"]);
+			expect(session.pendingAskCount).toBe(1);
+
+			release();
+			await round1;
+			await settle(session);
+			expect(followUps(calls).map(c => c.model.id)).toEqual([gpt.model.id]);
+			expect(turnPrompt(followUps(calls)[0].context)).toContain("Is step 2 safe?");
+			expect(session.pendingAskCount).toBe(0);
+		});
+
+		it("gives an @model message the next debate turn, so it needs no reply pass", async () => {
+			const { streamFn, calls, started, release } = gatedCouncil(isClaudeRound2);
+			const session = newSession(streamFn, [claude, gpt, gemini]);
+			await session.startInitialCritiques();
+			const round = session.runDebateRound();
+			await started;
+
+			expect(await session.askCouncil("@gemini Check the overlay")).toEqual({ status: "queued", target: gemini });
+			release();
+			await round;
+			await settle(session);
+
+			expect(debateTurns(session, 2).map(t => t.reviewerKey)).toEqual([claude.key, gemini.key, gpt.key]);
+			expect(promptOf(calls, gemini, "Council Debate: Round 2")).toContain(
+				`### Operator Guidance\n[To ${gemini.label}]: Check the overlay`,
+			);
+			expect(followUps(calls)).toEqual([]);
+			expect(session.pendingAskCount).toBe(0);
+		});
+
+		it("delivers a broadcast to later debate speakers and replies only for the speaker who missed it", async () => {
+			const { streamFn, calls, started, release } = gatedCouncil(isClaudeRound2);
+			const session = newSession(streamFn, [claude, gpt, gemini]);
+			await session.startInitialCritiques();
+			const round = session.runDebateRound();
+			await started;
+
+			expect(await session.askCouncil("Keep it small")).toEqual({ status: "queued" });
+			release();
+			await round;
+			await settle(session);
+
+			for (const reviewer of [gpt, gemini]) {
+				expect(promptOf(calls, reviewer, "Council Debate: Round 2")).toContain("### Operator Guidance\nKeep it small");
+			}
+			expect(followUps(calls).map(c => c.model.id)).toEqual([claude.model.id]);
+			expect(turnPrompt(followUps(calls)[0].context)).toContain("Keep it small");
+		});
+
+		it("drops queued messages when the round is stopped", async () => {
+			const { streamFn, calls, started, release } = gatedCouncil(isCritique);
+			const session = newSession(streamFn, [claude, gpt]);
+			const round1 = session.startInitialCritiques();
+			await started;
+
+			await session.askCouncil("@gpt Is step 2 safe?");
+			session.abortActiveRound();
+			expect(session.pendingAskCount).toBe(0);
+			release();
+			await round1;
+			await settle(session);
+			expect(followUps(calls)).toEqual([]);
+		});
+	});
+
+	it("answers a broadcast question one reviewer at a time, each building on the answers before it", async () => {
+		const { streamFn, calls } = makeMockStreamFn((model, context) =>
+			turnPrompt(context).startsWith("# Operator Follow-up")
+				? { text: `${model.id} answers` }
+				: { text: `${model.id} critique`, toolCalls: [reportPosition("APPROVE")] },
+		);
+		const session = newSession(streamFn, [claude, gpt, gemini]);
+		await session.startInitialCritiques();
+
+		expect(await session.askCouncil("How risky is step 3?")).toEqual({ status: "answered" });
+
+		const replies = calls.filter(c => turnPrompt(c.context).startsWith("# Operator Follow-up")).map(c => [c.model.id, turnPrompt(c.context)]);
+		expect(replies.map(([id]) => id)).toEqual([claude.model.id, gpt.model.id, gemini.model.id]);
+		const [, geminiPrompt] = replies[2];
+		expect(geminiPrompt).toContain("You are answering 3 of 3.");
+		expect(geminiPrompt).toContain("### Peers so far");
+		expect(geminiPrompt).toContain(`**${claude.label} · Round 1 reply**:\nclaude-3-7-sonnet answers\n`);
+		expect(geminiPrompt).toContain(`**${gpt.label} · Round 1 reply**:\ngpt-4o answers\n`);
+		// the first to answer has no peer answers yet
+		expect(replies[0][1]).not.toContain("· Round 1 reply**");
+	});
 });
 
 interface FakeReader {
@@ -1096,15 +1813,9 @@ describe("codebase reader", () => {
 
 		await session.startInitialCritiques();
 		const reviewerCalls = calls.length;
-		// operator notes count only when posted after the reviewer's last turn finished
-		setSystemTime(new Date(Date.now() + 60_000));
-		try {
-			await session.askCouncil("@reader Where is resolvePlanReview called?");
-			await session.askCouncil("@scout Which tests cover it?");
-			await session.askCouncil("And the overlay?", READER_TARGET_KEY);
-		} finally {
-			setSystemTime();
-		}
+		await session.askCouncil("@reader Where is resolvePlanReview called?");
+		await session.askCouncil("@scout Which tests cover it?");
+		await session.askCouncil("And the overlay?", READER_TARGET_KEY);
 
 		expect(calls).toHaveLength(reviewerCalls);
 		expect(session.entries.some(e => e.kind === "user")).toBe(false);
@@ -1135,5 +1846,39 @@ describe("codebase reader", () => {
 		await expect(session.askCouncil("Where is X?", READER_TARGET_KEY)).rejects.toThrow("Codebase reader is disabled or unavailable.");
 		expect(calls).toHaveLength(0);
 		expect(session.isBusy()).toBe(false);
+	});
+
+	it("stabilizes a report sent alongside ask_codebase when the final step does not report", async () => {
+		const { reader } = makeFakeReader();
+		const { streamFn } = makeMockStreamFn((model, context) => {
+			const round = debateRound(context) ?? 1;
+			if (model === claude.model) {
+				// claude keeps disputing so gpt speaks every round
+				const peerIds = [...turnPrompt(context).matchAll(/^- `([^`]+)`: /gm)].map(m => m[1]);
+				return { text: "Claude", toolCalls: [reportPosition("APPROVE", [], peerIds.map(id => ({ id, stance: "dispute", reason: "no" })))] };
+			}
+			if (round === 1) return { text: "R1", toolCalls: [reportPosition("NEEDS REVISION", ["Add retry", "Log errors"])] };
+			if (round === 3) return { text: "R3", toolCalls: [reportPosition("NEEDS REVISION", ["Add retry"])] };
+			// Round 2 reports beside a reader query; neither the final step nor the forced follow-up reports again
+			if (lastPrompt(context).startsWith(FORCED_REPORT_MARKER) || readerAnswered(context)) return { text: "" };
+			return {
+				text: "Checking",
+				toolCalls: [{ name: "ask_codebase", arguments: { question: "retry?" } }, reportPosition("NEEDS REVISION", ["Log errors", "Clamp timeout"])],
+			};
+		});
+		const session = newSession(streamFn, reader);
+		const gptRevisions = (round: number) =>
+			session.entries.find((e): e is ReviewerTurnEntry => isReviewerTurnEntry(e) && e.reviewerKey === gpt.key && e.round === round)?.position?.revisions;
+
+		await session.startInitialCritiques();
+		await session.runDebateRound();
+		expect(gptRevisions(2)).toEqual([
+			{ id: "openai/gpt-4o#2", summary: "Log errors" },
+			{ id: "openai/gpt-4o#3", summary: "Clamp timeout" },
+		]);
+
+		// the dropped "Add retry" comes back as a new item, numbered after the fallback's minted #3
+		await session.runDebateRound();
+		expect(gptRevisions(3)).toEqual([{ id: "openai/gpt-4o#4", summary: "Add retry" }]);
 	});
 });

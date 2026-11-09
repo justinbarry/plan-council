@@ -104,12 +104,35 @@ export type RenderCritiqueRound1Options = RenderCritiqueRoundOptions;
 export interface PeerCritiqueItem {
 	reviewerLabel: string;
 	critiqueText: string;
+	round?: number;
+	kind?: "critique" | "rebuttal" | "reply";
+}
+
+/** a peer's dispute of one of the prompted reviewer's own revisions */
+export interface OwnDisputeItem {
+	id: string;
+	summary: string;
+	by: string;
+	reason: string;
+}
+
+export interface PeerRevisionPromptItem extends RevisionItem {
+	/** disputes of this item by reviewers other than its owner and the prompted reviewer */
+	disputes?: readonly { by: string; reason: string }[];
+}
+
+/** the prompted reviewer's place in a sequential roundtable */
+export interface RoundtableFloor {
+	speaker: number;
+	peerHandles: readonly string[];
 }
 
 export interface RenderDebateRebuttalOptions {
 	round: number;
 	peerCritiques: readonly PeerCritiqueItem[];
-	peerItems?: readonly RevisionItem[];
+	peerItems?: readonly PeerRevisionPromptItem[];
+	ownDisputes?: readonly OwnDisputeItem[];
+	roundtable?: RoundtableFloor;
 	operatorNotes?: string;
 	hasCodeReader?: boolean;
 }
@@ -129,37 +152,74 @@ function mapPeerItems(
 }
 
 export function renderDebateRebuttal(options: RenderDebateRebuttalOptions): string {
-	const exactValues: string[] = options.peerCritiques.map(p => p.critiqueText);
-	if (options.operatorNotes) {
-		exactValues.push(options.operatorNotes);
+	const peerItems = options.peerItems ?? [];
+	const ownDisputes = options.ownDisputes ?? [];
+	const peerHandles = options.roundtable?.peerHandles ?? [];
+	const peerHandlesText = peerHandles.length > 0 ? peerHandles.join(", ") : undefined;
+
+	// every value is registered before any placeholder is minted, so no placeholder can occur inside a restored value
+	const exactValues: string[] = [];
+	for (const p of options.peerCritiques) {
+		exactValues.push(p.critiqueText, p.reviewerLabel);
 	}
-	for (const item of options.peerItems ?? []) {
+	if (options.operatorNotes) exactValues.push(options.operatorNotes);
+	if (peerHandlesText) exactValues.push(peerHandlesText);
+	for (const d of ownDisputes) {
+		exactValues.push(d.summary, d.by);
+		if (d.reason.trim()) exactValues.push(d.reason);
+	}
+	for (const item of peerItems) {
 		exactValues.push(item.summary);
+		for (const d of item.disputes ?? []) {
+			exactValues.push(d.by);
+			if (d.reason.trim()) exactValues.push(d.reason);
+		}
 	}
 
+	// one call-scoped counter keeps nested dispute placeholders distinct; restoration replaces each one once
 	const replacements: Array<readonly [string, string]> = [];
-	const mappedPeers = options.peerCritiques.map((p, idx) => {
-		const placeholder = exactPlaceholder(`PEER_${idx}`, idx, exactValues);
-		replacements.push([placeholder, p.critiqueText]);
+	let nextToken = 0;
+	const exact = (label: string, value: string): string => {
+		const placeholder = exactPlaceholder(label, nextToken++, exactValues);
+		replacements.push([placeholder, value]);
+		return placeholder;
+	};
+	const exactReason = (reason: string): string | undefined => (reason.trim() ? exact("REASON", reason) : undefined);
+
+	const mappedPeers = options.peerCritiques.map(p => ({
+		reviewerLabel: exact("LABEL", p.reviewerLabel),
+		critiqueText: exact("PEER", p.critiqueText),
+		isFollowupTurn: p.kind === "rebuttal" || p.kind === "reply",
+		turnRound: p.round ?? options.round,
+		turnKind: p.kind ?? "critique",
+	}));
+	const operatorNotes = options.operatorNotes ? exact("OP", options.operatorNotes) : undefined;
+	const roundtable = options.roundtable && {
+		speaker: options.roundtable.speaker,
+		peerHandlesText: peerHandlesText === undefined ? undefined : exact("HANDLES", peerHandlesText),
+	};
+	const mappedOwnDisputes = ownDisputes.map(d => ({
+		id: d.id,
+		summary: exact("OWNITEM", d.summary),
+		by: exact("BY", d.by),
+		reason: exactReason(d.reason),
+	}));
+	const mappedItems = peerItems.map(item => {
+		const disputes = (item.disputes ?? []).map(d => ({ by: exact("BY", d.by), reason: exactReason(d.reason) }));
 		return {
-			reviewerLabel: p.reviewerLabel,
-			critiqueText: placeholder,
+			id: item.id,
+			summary: exact("ITEM", item.summary),
+			disputes: disputes.length > 0 ? disputes : undefined,
 		};
 	});
 
-	let operatorNotesPlaceholder: string | undefined;
-	if (options.operatorNotes) {
-		operatorNotesPlaceholder = exactPlaceholder("OP", options.peerCritiques.length, exactValues);
-		replacements.push([operatorNotesPlaceholder, options.operatorNotes]);
-	}
-
-	const mappedItems = mapPeerItems(options.peerItems, exactValues, replacements);
-
 	const rendered = prompt.render(debateRebuttalTemplate, {
 		round: options.round,
-		peerCritiques: mappedPeers,
-		peerItems: mappedItems,
-		operatorNotes: operatorNotesPlaceholder,
+		roundtable,
+		peerCritiques: mappedPeers.length > 0 ? mappedPeers : undefined,
+		ownDisputes: mappedOwnDisputes.length > 0 ? mappedOwnDisputes : undefined,
+		peerItems: mappedItems.length > 0 ? mappedItems : undefined,
+		operatorNotes,
 		hasCodeReader: options.hasCodeReader === true,
 	});
 
@@ -175,6 +235,8 @@ export interface RenderUserFollowupOptions {
 	userMessage: string;
 	peerUpdates?: readonly PeerUpdateItem[];
 	peerItems?: readonly RevisionItem[];
+	/** the reviewer's place in a sequential broadcast Q&A pass */
+	roundtable?: { speaker: number; total: number };
 }
 
 export function renderUserFollowup(options: RenderUserFollowupOptions): string {
@@ -209,6 +271,7 @@ export function renderUserFollowup(options: RenderUserFollowupOptions): string {
 		userMessage: userMsgPlaceholder,
 		peerUpdates: mappedUpdates,
 		peerItems: mappedItems,
+		roundtable: options.roundtable,
 	});
 
 	return restoreExactValues(rendered, replacements);
